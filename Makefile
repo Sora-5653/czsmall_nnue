@@ -7,7 +7,8 @@ CXX      ?= g++
 CXXSTD   ?= -std=c++17
 WARN     ?= -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion
 OPT      ?= -O2
-CXXFLAGS ?= $(CXXSTD) $(WARN) $(OPT) -Iinclude
+DEPFLAGS := -MMD -MP
+CXXFLAGS ?= $(CXXSTD) $(WARN) $(OPT) -Iinclude $(DEPFLAGS)
 LDFLAGS  ?=
 
 BUILD := build
@@ -30,8 +31,13 @@ $(BUILD):
 $(BUILD)/%.o: src/%.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(TEST_BIN): $(TEST_SRC) $(OBJ) | $(BUILD)
-	$(CXX) $(CXXFLAGS) $(TEST_SRC) $(OBJ) -o $@ $(LDFLAGS)
+TEST_OBJ := $(patsubst tests/%.cpp,$(BUILD)/tests_%.o,$(TEST_SRC))
+
+$(BUILD)/tests_%.o: tests/%.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Itests -c $< -o $@
+
+$(TEST_BIN): $(TEST_OBJ) $(OBJ) | $(BUILD)
+	$(CXX) $(CXXFLAGS) $(TEST_OBJ) $(OBJ) -o $@ $(LDFLAGS)
 
 $(BUILD)/%: tools/%.cpp $(OBJ) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< $(OBJ) -o $@ $(LDFLAGS)
@@ -51,3 +57,6 @@ test-asan:
 
 clean:
 	@rm -rf $(BUILD)
+
+# Header dependency tracking, so editing a header rebuilds its dependents.
+-include $(wildcard $(BUILD)/*.d)

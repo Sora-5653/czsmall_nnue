@@ -87,12 +87,27 @@ struct PlacementAction {
 
 namespace detail {
 
-// Key for the BFS visited set: (x, y, rot) packed. x and y are biased so that
-// negative bounding-box origins (legal for I and for kicked pieces) still fit.
-inline std::uint32_t pack_state(int x, int y, Rot r) {
+// Key for the BFS visited set.
+//
+// Spec 8.2 requires the search state to carry more than the coordinates: two
+// paths that reach the same (x, y, rot) are NOT interchangeable if one arrived
+// by rotating and the other by moving, because only the former can register a
+// spin, and the kick index that was used further distinguishes mini from full
+// T-spins. Collapsing them on coordinates alone makes the result depend on BFS
+// visit order (and, observably, breaks left/right mirror invariance).
+//
+// Packed layout: x (6 bits) | y (7 bits) | rot (2 bits) | rotated (1 bit) |
+//                kick (4 bits)
+inline std::uint32_t pack_state(int x, int y, Rot r, bool arrived_by_rotation, int kick) {
     const std::uint32_t ux = static_cast<std::uint32_t>(x + 8) & 0x3F;
     const std::uint32_t uy = static_cast<std::uint32_t>(y + 8) & 0x7F;
-    return (ux << 9) | (uy << 2) | static_cast<std::uint32_t>(r);
+    const std::uint32_t rr = arrived_by_rotation ? 1u : 0u;
+    const std::uint32_t kk = static_cast<std::uint32_t>(arrived_by_rotation ? kick : 0) & 0xF;
+    return (ux << 14) | (uy << 7) | (static_cast<std::uint32_t>(r) << 5) | (rr << 4) | kk;
+}
+
+inline std::uint32_t pack_state(const ActivePiece& p) {
+    return pack_state(p.x, p.y, p.rot, p.last_action == LastAction::Rotate, p.last_kick);
 }
 
 struct BfsNode {
@@ -177,7 +192,7 @@ public:
         std::unordered_map<std::uint32_t, std::vector<Input>> visited;
         std::queue<detail::BfsNode> q;
 
-        visited.emplace(detail::pack_state(start.x, start.y, start.rot), std::vector<Input>{});
+        visited.emplace(detail::pack_state(start), std::vector<Input>{});
         q.push(detail::BfsNode{start, {}});
 
         std::vector<detail::BfsNode> landings;
@@ -280,7 +295,7 @@ private:
     void push_if_new(const Board& board, const ActivePiece& p, const std::vector<Input>& path,
                      Input step, std::unordered_map<std::uint32_t, std::vector<Input>>& visited,
                      std::queue<detail::BfsNode>& q) const {
-        const std::uint32_t key = detail::pack_state(p.x, p.y, p.rot);
+        const std::uint32_t key = detail::pack_state(p);
         auto it = visited.find(key);
         std::vector<Input> next_path = path;
         next_path.push_back(step);

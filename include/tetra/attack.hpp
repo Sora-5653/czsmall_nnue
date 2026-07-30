@@ -12,7 +12,9 @@ namespace tetra {
 
 // Mutable per-player attack state (spec 7.1: combo_state, b2b_or_charge_state).
 struct AttackState {
-    int combo = 0;        // -1 == no combo running; 0 == first clear of a chain
+    // -1 == no combo running. The first clear of a chain is combo 0 (which
+    // carries a 1.0x multiplier), the second is combo 1 (1.25x), and so on.
+    int combo = -1;
     int b2b_streak = 0;   // number of consecutive difficult clears - 1
     int surge = 0;        // charged Surge lines (B2B Charging)
     int pieces_placed = 0;
