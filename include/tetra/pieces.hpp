@@ -4,7 +4,9 @@
 
 #include "tetra/types.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <vector>
 
 namespace tetra {
@@ -26,6 +28,17 @@ struct Offset {
 struct PieceShape {
     std::array<Offset, 4> cells{};
     int box = 3;
+
+    // Row-major occupancy masks used by the collision fast path: rows[dy] is
+    // the set of columns the piece fills at vertical offset dy, relative to the
+    // bounding-box origin, as a bitmask starting at column 0.
+    // `min_dy`/`max_dy` bound the non-empty rows so the collision test only
+    // touches rows the piece actually occupies.
+    std::array<std::uint32_t, 4> rows{};
+    int min_dy = 0;
+    int max_dy = 0;
+    int min_dx = 0;
+    int max_dx = 0;
 };
 
 using ShapeTable = std::array<std::array<PieceShape, ROT_COUNT>, PIECE_COUNT>;
@@ -46,6 +59,20 @@ inline PieceShape make_shape(int box, const char* rows) {
                 s.cells[static_cast<size_t>(n++)] = Offset{c, box - 1 - r};
             }
         }
+    }
+
+    // Derive the bitmask form used by the collision fast path.
+    s.min_dy = 99;
+    s.max_dy = -99;
+    s.min_dx = 99;
+    s.max_dx = -99;
+    for (int i = 0; i < 4; ++i) {
+        const Offset& o = s.cells[static_cast<size_t>(i)];
+        s.rows[static_cast<size_t>(o.y)] |= (1u << o.x);
+        s.min_dy = std::min(s.min_dy, o.y);
+        s.max_dy = std::max(s.max_dy, o.y);
+        s.min_dx = std::min(s.min_dx, o.x);
+        s.max_dx = std::max(s.max_dx, o.x);
     }
     return s;
 }

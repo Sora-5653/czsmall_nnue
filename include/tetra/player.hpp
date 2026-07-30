@@ -110,6 +110,15 @@ public:
         LockResult r;
         if (!alive_ || !active_.valid()) return r;
 
+        // Reject illegal placements outright: a caller (movegen, replay, or a
+        // search that applied a stale action) must never be able to merge a
+        // piece that overlaps the stack. `ok` stays false so the mistake is
+        // visible instead of silently corrupting the field.
+        if (collides(board_, active_)) {
+            r.ok = false;
+            return r;
+        }
+
         // Detect the spin BEFORE the piece is merged into the field.
         const SpinType spin = detect_spin(board_, active_, cfg_);
 

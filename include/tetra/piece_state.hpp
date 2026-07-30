@@ -39,12 +39,31 @@ inline void piece_cells(const ActivePiece& p, Offset out[4]) {
     }
 }
 
+// Collision test using the precomputed row bitmasks. This is the single
+// hottest routine in the engine (the movegen BFS and the search both hammer
+// it), so it works on whole rows instead of individual cells.
 inline bool collides(const Board& b, const ActivePiece& p) {
     const PieceShape& s = shape_of(p.type, p.rot);
-    for (int i = 0; i < 4; ++i) {
-        const int cx = p.x + s.cells[static_cast<size_t>(i)].x;
-        const int cy = p.y + s.cells[static_cast<size_t>(i)].y;
-        if (b.is_solid(cx, cy)) return true;
+
+    // Horizontal bounds: anything outside the walls is solid. Checking this
+    // first also guarantees that p.x + min_dx >= 0, so the row masks below can
+    // be shifted left by p.x without ever shifting by a negative amount.
+    if (p.x + s.min_dx < 0) return true;
+    if (p.x + s.max_dx >= b.width()) return true;
+    // Below the floor is solid.
+    if (p.y + s.min_dy < 0) return true;
+
+    for (int dy = s.min_dy; dy <= s.max_dy; ++dy) {
+        const std::uint32_t m = s.rows[static_cast<size_t>(dy)];
+        if (!m) continue;
+        const int y = p.y + dy;
+        if (y >= b.height()) continue;  // above the ceiling is empty
+        // p.x may still be negative (the bounding box can hang off the left
+        // edge as long as no filled cell does), so shift the mask, not by a
+        // negative count: min_dx >= -p.x is guaranteed above.
+        const std::uint32_t placed =
+            (p.x >= 0) ? (m << p.x) : (m >> static_cast<unsigned>(-p.x));
+        if (b.row(y) & placed) return true;
     }
     return false;
 }

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <algorithm>
 #include <queue>
 #include <unordered_map>
 #include <vector>
@@ -110,10 +111,81 @@ inline std::uint32_t pack_state(const ActivePiece& p) {
     return pack_state(p.x, p.y, p.rot, p.last_action == LastAction::Rotate, p.last_kick);
 }
 
+// Flat, generation-stamped visited table.
+//
+// The packed movement state is 20 bits, so a direct-mapped array of ~1M slots
+// replaces the hash map entirely. Clearing it between calls would cost more
+// than the search itself, so each call bumps a generation counter and a slot
+// only counts as occupied when its stamp matches the current generation. The
+// buffer is reused across calls via a thread_local scratch object, which keeps
+// the generator allocation-free in the MCTS inner loop.
+struct VisitedTable {
+    static constexpr std::uint32_t SIZE = 1u << 20;
+    std::vector<std::uint32_t> stamp;
+    std::vector<std::int32_t> value;
+    std::uint32_t generation = 0;
+
+    VisitedTable() : stamp(SIZE, 0), value(SIZE, -1) {}
+
+    void begin() {
+        if (++generation == 0) {  // wrapped: clear once every 4 billion calls
+            std::fill(stamp.begin(), stamp.end(), 0);
+            generation = 1;
+        }
+    }
+    std::int32_t* find(std::uint32_t key) {
+        return (stamp[key] == generation) ? &value[key] : nullptr;
+    }
+    void insert(std::uint32_t key, std::int32_t v) {
+        stamp[key] = generation;
+        value[key] = v;
+    }
+};
+
+inline VisitedTable& scratch_visited() {
+    static thread_local VisitedTable t;
+    return t;
+}
+
+
+// BFS node with a parent link instead of an owned path. Copying a path per
+// expansion dominated the profile (the generator is the MCTS inner loop), so
+// the path is reconstructed only for the placements that are actually emitted.
 struct BfsNode {
     ActivePiece piece;
-    std::vector<Input> path;
+    std::int32_t parent = -1;  // index into the node arena, -1 for the root
+    Input step = Input::HardDrop;
+    std::uint16_t depth = 0;
 };
+
+// Walk the parent chain back to the root and return the inputs in order.
+inline std::vector<Input> reconstruct_path(const std::vector<BfsNode>& arena, std::int32_t idx) {
+    std::vector<Input> out;
+    if (idx < 0) return out;
+    out.reserve(arena[static_cast<size_t>(idx)].depth);
+    while (idx >= 0) {
+        const BfsNode& n = arena[static_cast<size_t>(idx)];
+        if (n.parent < 0) break;
+        out.push_back(n.step);
+        idx = n.parent;
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
+}
+
+// Reusable BFS working buffers, so a generate() call performs no heap
+// allocation once the buffers have grown to their steady-state size.
+struct BfsScratch {
+    std::vector<BfsNode> arena;
+    std::vector<std::int32_t> frontier;
+    std::vector<std::int32_t> next_frontier;
+    std::vector<std::int32_t> landings;
+};
+
+inline BfsScratch& scratch_bfs() {
+    static thread_local BfsScratch s;
+    return s;
+}
 
 // Hash of the locked-in board, used to merge input paths that produce the same
 // final position (spec 8.3).
@@ -188,52 +260,72 @@ public:
         ActivePiece start = spawn_piece(piece, cfg);
         if (collides(board, start)) return out;  // block out: no legal moves
 
-        // BFS over movement states.
-        std::unordered_map<std::uint32_t, std::vector<Input>> visited;
-        std::queue<detail::BfsNode> q;
+        // BFS over movement states. `arena` owns every node; `visited` maps a
+        // packed movement state to the index of the best (shortest) node that
+        // reached it, so paths never have to be copied during expansion.
+        detail::BfsScratch& scratch = detail::scratch_bfs();
+        std::vector<detail::BfsNode>& arena = scratch.arena;
+        std::vector<std::int32_t>& frontier = scratch.frontier;
+        std::vector<std::int32_t>& next_frontier = scratch.next_frontier;
+        std::vector<std::int32_t>& landings = scratch.landings;
+        arena.clear();
+        frontier.clear();
+        next_frontier.clear();
+        landings.clear();
 
-        visited.emplace(detail::pack_state(start), std::vector<Input>{});
-        q.push(detail::BfsNode{start, {}});
+        detail::VisitedTable& visited = detail::scratch_visited();
+        visited.begin();
 
-        std::vector<detail::BfsNode> landings;
+        arena.push_back(detail::BfsNode{start, -1, Input::HardDrop, 0});
+        visited.insert(detail::pack_state(start), 0);
+        frontier.push_back(0);
+
         int explored = 0;
+        const bool use_180 = opt_.allow_180 && cfg.movement.allow_180;
 
-        while (!q.empty() && explored < opt_.max_states) {
-            const detail::BfsNode node = q.front();
-            q.pop();
-            ++explored;
+        while (!frontier.empty() && explored < opt_.max_states) {
+            next_frontier.clear();
+            for (const std::int32_t idx : frontier) {
+                if (++explored > opt_.max_states) break;
+                const ActivePiece node_piece = arena[static_cast<size_t>(idx)].piece;
 
-            // If the piece can lock here, record it as a candidate landing.
-            if (grounded(board, node.piece)) landings.push_back(node);
+                // If the piece can lock here, record it as a candidate landing.
+                if (grounded(board, node_piece)) landings.push_back(idx);
 
-            // --- successors ---
-            tryMove(board, node, -1, Input::Left, visited, q);
-            tryMove(board, node, +1, Input::Right, visited, q);
-            tryDas(board, node, -1, Input::DasLeft, visited, q);
-            tryDas(board, node, +1, Input::DasRight, visited, q);
-            trySoftDrop(board, node, visited, q);
-            tryRotate(board, node, rot_cw(node.piece.rot), Input::Cw, cfg, visited, q);
-            tryRotate(board, node, rot_ccw(node.piece.rot), Input::Ccw, cfg, visited, q);
-            if (opt_.allow_180 && cfg.movement.allow_180)
-                tryRotate(board, node, rot_180(node.piece.rot), Input::Flip, cfg, visited, q);
+                // --- successors ---
+                tryMove(board, node_piece, idx, -1, Input::Left, arena, visited, next_frontier);
+                tryMove(board, node_piece, idx, +1, Input::Right, arena, visited, next_frontier);
+                tryDas(board, node_piece, idx, -1, Input::DasLeft, arena, visited, next_frontier);
+                tryDas(board, node_piece, idx, +1, Input::DasRight, arena, visited, next_frontier);
+                trySoftDrop(board, node_piece, idx, arena, visited, next_frontier);
+                tryRotate(board, node_piece, idx, rot_cw(node_piece.rot), Input::Cw, cfg, arena,
+                          visited, next_frontier);
+                tryRotate(board, node_piece, idx, rot_ccw(node_piece.rot), Input::Ccw, cfg, arena,
+                          visited, next_frontier);
+                if (use_180)
+                    tryRotate(board, node_piece, idx, rot_180(node_piece.rot), Input::Flip, cfg,
+                              arena, visited, next_frontier);
+            }
+            frontier.swap(next_frontier);
         }
 
         // Turn landings into actions, merging paths that are truly equivalent.
         std::unordered_map<std::uint64_t, size_t> by_outcome;
-        for (const auto& node : landings) {
+        for (const std::int32_t idx : landings) {
+            const ActivePiece& landed = arena[static_cast<size_t>(idx)].piece;
             PlacementAction a;
             a.use_hold = use_hold;
-            a.final_piece = node.piece.type;
-            a.final_x = node.piece.x;
-            a.final_y = node.piece.y;
-            a.final_rotation = node.piece.rot;
-            a.last_kick = node.piece.last_kick;
-            a.canonical_input_sequence = node.path;
+            a.final_piece = landed.type;
+            a.final_x = landed.x;
+            a.final_y = landed.y;
+            a.final_rotation = landed.rot;
+            a.last_kick = landed.last_kick;
+            a.canonical_input_sequence = detail::reconstruct_path(arena, idx);
             a.canonical_input_sequence.push_back(Input::HardDrop);
             if (use_hold)
                 a.canonical_input_sequence.insert(a.canonical_input_sequence.begin(), Input::Hold);
 
-            const PlacementOutcome oc = evaluate_placement(board, node.piece, cfg);
+            const PlacementOutcome oc = evaluate_placement(board, landed, cfg);
             a.spin = oc.spin;
             a.cleared_lines = oc.cleared_lines;
             a.cleared_garbage = oc.cleared_garbage;
@@ -292,39 +384,49 @@ private:
         return k;
     }
 
-    void push_if_new(const Board& board, const ActivePiece& p, const std::vector<Input>& path,
-                     Input step, std::unordered_map<std::uint32_t, std::vector<Input>>& visited,
-                     std::queue<detail::BfsNode>& q) const {
+    // Insert a successor if its movement state has not been reached before, or
+    // if this path reaches it in fewer inputs.
+    static void push_if_new(const ActivePiece& p, std::int32_t parent, Input step,
+                            std::vector<detail::BfsNode>& arena, detail::VisitedTable& visited,
+                            std::vector<std::int32_t>& frontier) {
         const std::uint32_t key = detail::pack_state(p);
-        auto it = visited.find(key);
-        std::vector<Input> next_path = path;
-        next_path.push_back(step);
-        if (it != visited.end()) {
+        const std::uint16_t depth =
+            static_cast<std::uint16_t>(arena[static_cast<size_t>(parent)].depth + 1);
+        if (std::int32_t* slot = visited.find(key)) {
             // Already reachable; keep the shorter path but do not re-expand.
-            if (next_path.size() < it->second.size()) it->second = next_path;
+            detail::BfsNode& existing = arena[static_cast<size_t>(*slot)];
+            if (depth < existing.depth) {
+                existing.parent = parent;
+                existing.step = step;
+                existing.depth = depth;
+            }
             return;
         }
-        visited.emplace(key, next_path);
-        q.push(detail::BfsNode{p, std::move(next_path)});
+        const std::int32_t idx = static_cast<std::int32_t>(arena.size());
+        arena.push_back(detail::BfsNode{p, parent, step, depth});
+        visited.insert(key, idx);
+        frontier.push_back(idx);
     }
 
-    void tryMove(const Board& board, const detail::BfsNode& node, int dx, Input step,
-                 std::unordered_map<std::uint32_t, std::vector<Input>>& visited,
-                 std::queue<detail::BfsNode>& q) const {
-        ActivePiece p = node.piece;
+    static void tryMove(const Board& board, const ActivePiece& from, std::int32_t idx, int dx,
+                        Input step, std::vector<detail::BfsNode>& arena,
+                        detail::VisitedTable& visited,
+                        std::vector<std::int32_t>& frontier) {
+        ActivePiece p = from;
         p.x += dx;
         if (collides(board, p)) return;
         p.last_action = LastAction::Move;
         p.last_kick = 0;
-        push_if_new(board, p, node.path, step, visited, q);
+        push_if_new(p, idx, step, arena, visited, frontier);
     }
 
     // DAS: slide as far as possible in one direction. Modelled as a single
     // input so that the canonical sequences stay short and human-playable.
-    void tryDas(const Board& board, const detail::BfsNode& node, int dx, Input step,
-                std::unordered_map<std::uint32_t, std::vector<Input>>& visited,
-                std::queue<detail::BfsNode>& q) const {
-        ActivePiece p = node.piece;
+    static void tryDas(const Board& board, const ActivePiece& from, std::int32_t idx, int dx,
+                       Input step, std::vector<detail::BfsNode>& arena,
+                       detail::VisitedTable& visited,
+                       std::vector<std::int32_t>& frontier) {
+        ActivePiece p = from;
         int moved = 0;
         while (true) {
             ActivePiece n = p;
@@ -336,29 +438,30 @@ private:
         if (moved == 0) return;
         p.last_action = LastAction::Move;
         p.last_kick = 0;
-        push_if_new(board, p, node.path, step, visited, q);
+        push_if_new(p, idx, step, arena, visited, frontier);
     }
 
-    void trySoftDrop(const Board& board, const detail::BfsNode& node,
-                     std::unordered_map<std::uint32_t, std::vector<Input>>& visited,
-                     std::queue<detail::BfsNode>& q) const {
-        const int d = hard_drop_distance(board, node.piece);
+    static void trySoftDrop(const Board& board, const ActivePiece& from, std::int32_t idx,
+                            std::vector<detail::BfsNode>& arena,
+                            detail::VisitedTable& visited,
+                            std::vector<std::int32_t>& frontier) {
+        const int d = hard_drop_distance(board, from);
         if (d <= 0) return;
-        ActivePiece p = node.piece;
+        ActivePiece p = from;
         p.y -= d;
         p.last_action = LastAction::Drop;
         p.last_kick = 0;
-        push_if_new(board, p, node.path, Input::SoftDrop, visited, q);
+        push_if_new(p, idx, Input::SoftDrop, arena, visited, frontier);
     }
 
-    void tryRotate(const Board& board, const detail::BfsNode& node, Rot to, Input step,
-                   const RulesetConfig& cfg,
-                   std::unordered_map<std::uint32_t, std::vector<Input>>& visited,
-                   std::queue<detail::BfsNode>& q) const {
-        ActivePiece p = node.piece;
-        const RotationResult rr = try_rotate(board, p, to, cfg);
-        if (!rr.success) return;
-        push_if_new(board, p, node.path, step, visited, q);
+    static void tryRotate(const Board& board, const ActivePiece& from, std::int32_t idx, Rot to,
+                          Input step, const RulesetConfig& cfg,
+                          std::vector<detail::BfsNode>& arena,
+                          detail::VisitedTable& visited,
+                          std::vector<std::int32_t>& frontier) {
+        ActivePiece p = from;
+        if (!try_rotate(board, p, to, cfg).success) return;
+        push_if_new(p, idx, step, arena, visited, frontier);
     }
 
     Options opt_{};
