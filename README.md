@@ -112,6 +112,18 @@ than the first working version, with byte-identical output):
 
 Measured on a 2-core sandbox with a messy 8-row board, averaged over 20k calls.
 
+## Continuous integration
+
+A ready-to-use workflow is provided at [`docs/ci.yml`](docs/ci.yml). It builds
+with both g++ and clang++, runs the suite under sanitizers, and enforces
+`-Werror` and determinism. It is not installed at `.github/workflows/` because
+the account that opened this branch cannot add workflow files; move it into
+place to enable it:
+
+```sh
+mkdir -p .github/workflows && git mv docs/ci.yml .github/workflows/ci.yml
+```
+
 ## Layout
 
 ```
