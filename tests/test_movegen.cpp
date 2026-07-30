@@ -218,16 +218,18 @@ TEST(movegen_distinguishes_spins_from_plain_placements) {
     // Same final cells reachable by rotation (spin) and by sliding (no spin)
     // must remain distinguishable, because they send different attacks.
     const RulesetConfig cfg = league();
+    // The overhang on row 2 is what makes the pocket a real spin slot.
     Board b = board_from({
+        "XXXX......",
         "XXX...XXXX",
         "XXXX.XXXXX",
     });
     MoveGenerator gen;
     const auto acts = gen.generate_for_piece(b, Piece::T, cfg, false);
-    bool found_spin = false;
+    bool found_tsd = false;
     for (const auto& a : acts)
-        if (a.spin != SpinType::None) found_spin = true;
-    CHECK_MSG(found_spin, "a TSD slot must yield at least one spin placement");
+        if (a.spin == SpinType::Full && a.cleared_lines == 2) found_tsd = true;
+    CHECK_MSG(found_tsd, "a TSD slot must yield a full-spin double placement");
 }
 
 TEST(movegen_finds_tuck_placements_under_overhangs) {

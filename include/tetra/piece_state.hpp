@@ -172,14 +172,20 @@ inline void t_corners(const ActivePiece& p, Offset front[2], Offset back[2]) {
 
 // A piece is "immobile" if it cannot move left, right or down. This is the
 // detection rule TETR.IO uses for All-Mini (non-T) and All-Mini+ (T as well).
+// A piece is "immobile" if it cannot move left, right, UP or down after the
+// rotation. The up-check ("overhang") is the decisive one in practice: without
+// it, any piece resting in a flat notch would score a spin. TETR.IO's own
+// documentation calls the up-check the key to performing All-Mini spins.
 inline bool is_immobile(const Board& b, const ActivePiece& p) {
     ActivePiece q = p;
     q.y -= 1;
-    if (!collides(b, q)) return false;
+    if (!collides(b, q)) return false;  // can drop
+    q = p; q.y += 1;
+    if (!collides(b, q)) return false;  // can rise: no overhang above it
     q = p; q.x -= 1;
-    if (!collides(b, q)) return false;
+    if (!collides(b, q)) return false;  // can slide left
     q = p; q.x += 1;
-    if (!collides(b, q)) return false;
+    if (!collides(b, q)) return false;  // can slide right
     return true;
 }
 

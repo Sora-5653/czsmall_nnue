@@ -358,37 +358,64 @@ TEST(t_spin_triple_kick_is_available) {
 }
 
 TEST(t_spin_double_is_detected_as_full_spin) {
-    // Standard TSD slot:
-    //   XXX...XXXX
-    //   XXXX.XXXXX   <- T drops in and rotates CW into the notch
+    // A real TSD slot needs an OVERHANG above the pocket -- without one the T
+    // could simply be moved up, so it is not immobile and (correctly) does not
+    // score a spin. The overhang here is the block at (3,2).
+    //
+    //   XXXX......   row 2  <- overhang
+    //   XXX...XXXX   row 1
+    //   XXXX.XXXXX   row 0
     const RulesetConfig cfg = league();
     Board b = board_from({
+        "XXXX......",
         "XXX...XXXX",
         "XXXX.XXXXX",
     });
-    // Place a T so that after a rotation it fills the notch at x=4,y=0.
-    ActivePiece p;
-    p.type = Piece::T;
-    p.rot = Rot::N;
-    p.x = 3;
-    p.y = 1;
-    // Rotate CW; the kick should drop it into the slot.
-    ActivePiece q = p;
-    if (!collides(b, q)) {
-        try_rotate(b, q, Rot::R, cfg);
-    }
-    // Regardless of the exact kick chosen, a T that ends up immobile with three
-    // filled corners must classify as a spin under All-Mini+.
     ActivePiece t;
     t.type = Piece::T;
     t.rot = Rot::S2;  // stem pointing down, sitting in the notch
     t.x = 3;
     t.y = 0;
-    if (!collides(b, t)) {
-        t.last_action = LastAction::Rotate;
-        const SpinType s = detect_spin(b, t, cfg);
-        CHECK_MSG(s != SpinType::None, "T in a TSD notch should register as a spin");
-    }
+    CHECK(!collides(b, t));
+    t.last_action = LastAction::Rotate;
+    CHECK_MSG(is_immobile(b, t), "a T under an overhang must be immobile");
+    CHECK_MSG(detect_spin(b, t, cfg) == SpinType::Full,
+              "a proper TSD must register as a full T-spin");
+
+    // The same pocket WITHOUT the overhang must not score a spin.
+    Board flat = board_from({
+        "XXX...XXXX",
+        "XXXX.XXXXX",
+    });
+    ActivePiece u = t;
+    CHECK(!collides(flat, u));
+    CHECK_MSG(!is_immobile(flat, u), "no overhang means the piece can rise");
+    CHECK_MSG(detect_spin(flat, u, cfg) == SpinType::None,
+              "a flat notch must not score a spin");
+}
+
+TEST(immobile_requires_all_four_directions_blocked) {
+    // Spec / TETR.IO: immobile means it cannot move left, right, up OR down.
+    // Each direction is load-bearing, so check that opening any single one
+    // disqualifies the spin.
+    const RulesetConfig cfg = league();
+    Board b = board_from({
+        "XXXX......",
+        "XXX...XXXX",
+        "XXXX.XXXXX",
+    });
+    ActivePiece t;
+    t.type = Piece::T;
+    t.rot = Rot::S2;
+    t.x = 3;
+    t.y = 0;
+    t.last_action = LastAction::Rotate;
+    CHECK(is_immobile(b, t));
+
+    // Removing the overhang lets it move up.
+    Board no_up = b;
+    no_up.set_row(2, 0u);
+    CHECK(!is_immobile(no_up, t));
 }
 
 TEST(spin_requires_rotation_as_last_action) {

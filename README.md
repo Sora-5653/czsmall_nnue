@@ -36,7 +36,7 @@ make test-asan   # run the suite under AddressSanitizer + UBSan
 | Playfield | Bitboard rows, separate occupancy and garbage planes |
 | Pieces | All 7 tetrominoes, 4 rotation states, precomputed collision masks |
 | Rotation | Guideline SRS, **TETR.IO SRS+** (symmetric I kicks), TETR.IO 180 table |
-| Spins | T-spin 3-corner, All-Mini, **All-Mini+** (immobile T), kick-aware mini/full |
+| Spins | T-spin 3-corner, All-Mini, **All-Mini+** (immobile T), 4-direction immobile check, kick-aware mini/full |
 | Attack | `floor((base + b2b) × combo_mult)` + flat bonuses, matching the published TETR.IO table |
 | Combo | Multiplier system, plus `floor(ln(1 + 1.25c))` for zero-base clears |
 | B2B | Charging (flat +1 with Surge) and Chaining (osk's step table) |
@@ -61,7 +61,7 @@ make test-asan   # run the suite under AddressSanitizer + UBSan
 
 ## Verification
 
-The test suite is the point of this milestone: **117 tests, ~518k assertions**,
+The test suite is the point of this milestone: **118 tests, ~499k assertions**,
 clean under `-Werror`, AddressSanitizer and UBSan.
 
 Highlights (spec §18):
@@ -86,7 +86,13 @@ data (spec §14):
 2. **Classic SRS is not.** Under guideline SRS the I piece's kick *order*
    differs between the two sides, so left/right mirroring is **not** a sound
    augmentation for I placements. Every other piece mirrors cleanly.
-3. **TETR.IO's 180 kick table is deliberately asymmetric** (it has downward
+3. **Immobile spin detection needs the up-check.** TETR.IO defines "immobile"
+   as unable to move left, right, **up** or down. Omitting the up-check makes
+   any piece sitting in a flat notch score a spin: in a 300-piece scripted
+   game that inflated the spin count from 16 to 198, which would have poisoned
+   both the attack values and the training reward. `is_immobile()` checks all
+   four directions and `immobile_requires_all_four_directions_blocked` pins it.
+4. **TETR.IO's 180 kick table is deliberately asymmetric** (it has downward
    R↔L kicks but no upward ones, which is also why it cannot be written as SRS
    offset data). With 180 enabled, a small number of positions are not
    mirror-equivalent. `movegen_mirror_asymmetry_comes_only_from_180` pins this
