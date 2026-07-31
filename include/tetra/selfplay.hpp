@@ -21,15 +21,6 @@
 
 namespace tetra {
 
-// Attack pattern used to pressure the bot (spec 13.3's list of garbage styles).
-enum class GarbageStyle : std::uint8_t {
-    None = 0,
-    Steady,     // a small attack at a fixed cadence
-    Burst,      // occasional large attacks
-    FastSmall,  // frequent single lines
-    SlowLarge,  // rare, heavy attacks
-};
-
 struct SelfPlayConfig {
     int max_pieces = 300;
     SearchConfig search{};
@@ -68,7 +59,10 @@ public:
 
         SearchConfig sc = cfg_.search;
         Searcher searcher(eval_, sc);
-        GameRecorder recorder(cfg_.model_version);
+        GameRecorder recorder(
+            cfg_.model_version, seed, static_cast<std::uint8_t>(cfg_.garbage_style),
+            static_cast<std::uint8_t>(cfg_.garbage_period),
+            static_cast<std::uint8_t>(cfg_.garbage_lines));
         Tokenizer tokenizer;
         Rng garbage_rng(seed ^ 0x5EEDFACEull);
 

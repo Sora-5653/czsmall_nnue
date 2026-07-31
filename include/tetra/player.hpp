@@ -252,9 +252,17 @@ public:
         if (cfg_.garbage.hole_change_rule != GarbageHoleRule::PerLine) {
             e.hole_column =
                 static_cast<int>(garbage_rng_.below(static_cast<std::uint32_t>(cfg_.geometry.width)));
+            if (mirror_board_ && cfg_.geometry.width > 0) {
+                e.hole_column = cfg_.geometry.width - 1 - e.hole_column;
+            }
         }
         garbage_.push(e);
         log(EventType::GarbageArrived, Piece::None, SpinType::None, lines, 0);
+    }
+
+    void set_mirror(bool m) {
+        mirror_board_ = m;
+        queue_.set_mirror(m);
     }
 
     // Resample hidden state so a search cannot read the future (spec 11.3).
@@ -328,6 +336,7 @@ private:
     std::int64_t lines_sent_ = 0;
     std::int64_t lines_received_ = 0;
     std::int64_t lines_cleared_ = 0;
+    bool mirror_board_ = false;
 };
 
 }  // namespace tetra

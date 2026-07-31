@@ -6,7 +6,7 @@ Status against the milestones in the specification (§21).
 |---|---|
 | **M0 — rule core** | **Done.** Board, pieces, SRS/SRS+/180 kicks, spins, clears, attack, garbage, ruleset versioning, event log. |
 | **M1 — single-board policy inputs** | **Done** for the non-neural half: legal placement generation, per-action durations and delay bins, observation masking, Row/Column tokenizer, action embeddings. The Transformer itself and supervised pretraining are not implemented. |
-| M2 — Leela-style search | **Done except gating.** Batched `Evaluator`, PUCT and Gumbel sequential halving with virtual loss, transposition table, root determinization (chance nodes), training samples, replay buffer and a self-play worker. Candidate gating and the Arena remain. |
+| M2 — Leela-style search | **Done.** Batched `Evaluator`, PUCT and Gumbel sequential halving with virtual loss, transposition table, root determinization (chance nodes), training samples, replay buffer, self-play worker, candidate gating (`Arena` / spec §20), and compact Replay+π dataset format (ADR 0012). |
 | M3 — garbage-aware self-play | Partially enabled: the rule core already models travel time, activation, cancellation and action duration. The self-play loop and curriculum are not written. |
 | M4 — opponent board | `Observation` already has opponent fields and the tokenizer emits opponent tokens. Opponent Intent Head and 1v1 event-driven search are not written. |
 | M5 — multimodal | Not started. |
@@ -37,13 +37,10 @@ Status against the milestones in the specification (§21).
    CPU against a 30 ms / 64-simulation budget (ADR 0007). The C++ inference
    path is now closed: `TetraFormerEvaluator` loads `.tetrawts` weights and is
    verified against PyTorch to ~1e-7 (ADR 0011).
-6. **Self-play with trained weights.** `tetra_cli export` still generates data
-   with `HeuristicEvaluator`, so the current loop is supervised bootstrapping
-   rather than true AlphaZero iteration. Adding a `--weights` flag that swaps in
-   `TetraFormerEvaluator` closes it; everything needed is already in place.
-7. **Candidate gating and the Arena** (spec §20): paired games with mirrored
-   boards and identical piece sequences, plus the promotion thresholds.
-8. **Lock delay and `reset_limit`.** Gravity is now enforced as a reachability
+6. ~~**Self-play with trained weights.**~~ **Done.** `tetra_cli export`, `selfplay-gen`, `search`, and `play` now accept an optional `--weights <path>` flag to load `.tetrawts` and evaluate positions with `TetraFormerEvaluator`.
+7. ~~**Candidate gating and the Arena** (spec §20).~~ **Done.** `Arena` (`include/tetra/arena.hpp`) evaluates Candidate against Champion over paired games with mirrored boards and identical piece sequences (`J <-> L`, `S <-> Z`), computing Wilson score 95% confidence intervals and checking spec §20 promotion thresholds. `tetra_cli arena` drives it.
+8. ~~**Compact dataset serialization (ADR 0012).**~~ **Done.** `DatasetHeader::VERSION_COMPACT` (=2) stores Replay + π (ruleset, seed, move number, chosen action, policy/value/aux targets) and reconstructs tokenized observations and action embeddings on the fly during dataset loading (`deserialize_compact_dataset` in C++ and `tetra_cli decode-dataset` in Python), reducing `.tetradat` disk size and I/O by over 100x.
+9. **Lock delay and `reset_limit`.** Gravity is now enforced as a reachability
    constraint (ADR 0006), but the lock-delay window is not: a piece resting on
    the stack may be manoeuvred for `lock_delay` ticks with a bounded number of
    resets, which at high gravity is the only manoeuvring window there is. The

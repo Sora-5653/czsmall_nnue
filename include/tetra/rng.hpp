@@ -155,6 +155,8 @@ public:
         refill(cfg_.preview_count + 2);
     }
 
+    void set_mirror(bool m) { mirror_ = m; }
+
     // True when the queue holds pieces beyond what the player may see, which is
     // exactly the state a search must not exploit.
     bool has_hidden_lookahead() const {
@@ -168,9 +170,12 @@ private:
 
     void generate_one() {
         switch (cfg_.type) {
-            case RandomizerType::Uniform:
-                queue_.push_back(static_cast<Piece>(rng_.below(PIECE_COUNT)));
+            case RandomizerType::Uniform: {
+                Piece p = static_cast<Piece>(rng_.below(PIECE_COUNT));
+                if (mirror_) p = mirror_piece(p);
+                queue_.push_back(p);
                 break;
+            }
             case RandomizerType::OnePiece:
                 queue_.push_back(Piece::I);
                 break;
@@ -199,8 +204,10 @@ private:
     }
 
     void take_from_bag() {
-        queue_.push_back(bag_.back());
+        Piece p = bag_.back();
         bag_.pop_back();
+        if (mirror_) p = mirror_piece(p);
+        queue_.push_back(p);
     }
 
     RandomizerCfg cfg_{};
@@ -208,6 +215,7 @@ private:
     std::deque<Piece> queue_;
     std::vector<Piece> bag_;
     std::uint64_t pieces_generated_ = 0;
+    bool mirror_ = false;
 };
 
 }  // namespace tetra

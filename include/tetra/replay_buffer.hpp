@@ -51,9 +51,13 @@ struct TrainingSample {
 
     // Provenance.
     std::uint64_t ruleset_hash = 0;
+    std::uint64_t game_seed = 0;
     std::uint32_t model_version = 0;
     std::uint32_t move_number = 0;
     int chosen_action = -1;
+    std::uint8_t garbage_style = 1;
+    std::uint8_t garbage_period = 8;
+    std::uint8_t garbage_lines = 2;
 
     size_t action_count() const { return action_embeddings.size(); }
 };
@@ -64,7 +68,11 @@ inline TrainingSample make_sample(const Observation& obs,
                                   const std::vector<PlacementAction>& actions,
                                   const SearchResult& result, const Tokenizer& tok,
                                   std::uint32_t model_version = 0,
-                                  std::uint32_t move_number = 0) {
+                                  std::uint32_t move_number = 0,
+                                  std::uint64_t game_seed = 0,
+                                  std::uint8_t garbage_style = 1,
+                                  std::uint8_t garbage_period = 8,
+                                  std::uint8_t garbage_lines = 2) {
     TrainingSample s;
     const TokenizedObservation t = tok.encode(obs, obs.ruleset);
     s.tokens = t.tokens;
@@ -74,8 +82,12 @@ inline TrainingSample make_sample(const Observation& obs,
     s.search_value = result.value.scalar();
     s.chosen_action = result.best_action;
     s.ruleset_hash = obs.ruleset_hash;
+    s.game_seed = game_seed;
     s.model_version = model_version;
     s.move_number = move_number;
+    s.garbage_style = garbage_style;
+    s.garbage_period = garbage_period;
+    s.garbage_lines = garbage_lines;
     return s;
 }
 
@@ -88,12 +100,21 @@ inline TrainingSample make_sample(const Observation& obs,
 // auxiliary members.
 class GameRecorder {
 public:
-    explicit GameRecorder(std::uint32_t model_version = 0) : model_version_(model_version) {}
+    explicit GameRecorder(std::uint32_t model_version = 0, std::uint64_t game_seed = 0,
+                          std::uint8_t garbage_style = 1, std::uint8_t garbage_period = 8,
+                          std::uint8_t garbage_lines = 2)
+        : model_version_(model_version),
+          game_seed_(game_seed),
+          garbage_style_(garbage_style),
+          garbage_period_(garbage_period),
+          garbage_lines_(garbage_lines) {}
 
     void add(const Observation& obs, const std::vector<PlacementAction>& actions,
              const SearchResult& result, const Tokenizer& tok) {
         samples_.push_back(make_sample(obs, actions, result, tok, model_version_,
-                                       static_cast<std::uint32_t>(samples_.size())));
+                                       static_cast<std::uint32_t>(samples_.size()),
+                                       game_seed_, garbage_style_, garbage_period_,
+                                       garbage_lines_));
         attack_at_.push_back(0.0f);
         garbage_at_.push_back(0.0f);
     }
@@ -150,6 +171,10 @@ private:
     std::vector<float> attack_at_;
     std::vector<float> garbage_at_;
     std::uint32_t model_version_ = 0;
+    std::uint64_t game_seed_ = 0;
+    std::uint8_t garbage_style_ = 1;
+    std::uint8_t garbage_period_ = 8;
+    std::uint8_t garbage_lines_ = 2;
 };
 
 // ---------------------------------------------------------------------------
