@@ -38,6 +38,19 @@ inline const char* piece_name(Piece p) {
     }
 }
 
+// Return the left-right mirrored twin of a piece (spec 14, 20):
+//   * J <-> L, S <-> Z
+//   * I, O, T are self-symmetric
+inline Piece mirror_piece(Piece p) {
+    switch (p) {
+        case Piece::J: return Piece::L;
+        case Piece::L: return Piece::J;
+        case Piece::S: return Piece::Z;
+        case Piece::Z: return Piece::S;
+        default: return p;
+    }
+}
+
 inline bool piece_from_char(char c, Piece& out) {
     switch (c) {
         case 'I': out = Piece::I; return true;
@@ -129,5 +142,14 @@ inline const char* topout_name(TopoutReason r) {
     }
     return "?";
 }
+
+// Attack pattern used to pressure the bot (spec 13.3's list of garbage styles).
+enum class GarbageStyle : std::uint8_t {
+    None = 0,
+    Steady,     // a small attack at a fixed cadence
+    Burst,      // occasional large attacks
+    FastSmall,  // frequent single lines
+    SlowLarge,  // rare, heavy attacks
+};
 
 }  // namespace tetra

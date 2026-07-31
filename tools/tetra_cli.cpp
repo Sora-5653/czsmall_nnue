@@ -17,16 +17,54 @@
 #include "tetra/dataset.hpp"
 #include "tetra/nnue.hpp"
 #include "tetra/selfplay.hpp"
+#include "tetra/arena.hpp"
 
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
+#include <memory>
 #include <string>
 
 using namespace tetra;
 
 namespace {
+
+std::unique_ptr<Evaluator> load_evaluator_from_name(const std::string& name) {
+    if (name.empty() || name == "heuristic") {
+        return std::make_unique<HeuristicEvaluator>();
+    }
+    if (name == "uniform") {
+        return std::make_unique<UniformEvaluator>();
+    }
+    NnueWeights weights;
+    std::string err;
+    if (!weights.load(name, &err)) {
+        std::fprintf(stderr, "cannot load weights %s: %s\n", name.c_str(), err.c_str());
+        return nullptr;
+    }
+    std::printf("loaded weights %s (width %u, %u layers)\n",
+                name.c_str(), weights.config().width, weights.config().layers);
+    return std::make_unique<TetraFormerEvaluator>(std::move(weights));
+}
+
+std::unique_ptr<Evaluator> parse_cli_evaluator(int argc, char** argv,
+                                               std::vector<std::string>* pos_args = nullptr,
+                                               std::string* weights_path_out = nullptr) {
+    std::string wpath;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--weights" && i + 1 < argc) {
+            wpath = argv[++i];
+        } else if (arg.rfind("--weights=", 0) == 0) {
+            wpath = arg.substr(10);
+        } else if (arg != "--v1" && arg != "--compact" && pos_args) {
+            pos_args->push_back(arg);
+        }
+    }
+    if (weights_path_out) *weights_path_out = wpath;
+    return load_evaluator_from_name(wpath);
+}
 
 RulesetConfig preset(const std::string& name) {
     if (name == "quickplay") return RulesetConfig::quick_play();
@@ -435,12 +473,14 @@ int cmd_search(int argc, char** argv) {
 
 int cmd_selfplay_gen(int argc, char** argv) {
     // Run the self-play loop and report what the trainer would receive.
-    const int games = (argc > 2) ? std::atoi(argv[2]) : 5;
-    const int pieces = (argc > 3) ? std::atoi(argv[3]) : 100;
-    const int sims = (argc > 4) ? std::atoi(argv[4]) : 16;
+    std::vector<std::string> args;
+    auto ev = parse_cli_evaluator(argc, argv, &args);
+    if (!ev) return 1;
+    const int games = (args.size() > 0) ? std::atoi(args[0].c_str()) : 5;
+    const int pieces = (args.size() > 1) ? std::atoi(args[1].c_str()) : 100;
+    const int sims = (args.size() > 2) ? std::atoi(args[2].c_str()) : 16;
     const RulesetConfig rules = RulesetConfig::tetra_league();
 
-    HeuristicEvaluator ev;
     SelfPlayConfig cfg;
     cfg.max_pieces = pieces;
     cfg.search.simulations = sims;
@@ -451,7 +491,7 @@ int cmd_selfplay_gen(int argc, char** argv) {
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
 
-    SelfPlayWorker worker(ev, cfg);
+    SelfPlayWorker worker(*ev, cfg);
     ReplayBuffer buffer(200000);
 
     std::printf("ruleset %s (%s), %d games x %d pieces, %d sims\n\n", rules.id.c_str(),
@@ -501,13 +541,20 @@ int cmd_selfplay_gen(int argc, char** argv) {
 
 int cmd_export(int argc, char** argv) {
     // Self-play straight into a .tetradat file for the Python trainer.
-    const std::string path = (argc > 2) ? argv[2] : "train.tetradat";
-    const int games = (argc > 3) ? std::atoi(argv[3]) : 10;
-    const int pieces = (argc > 4) ? std::atoi(argv[4]) : 100;
-    const int sims = (argc > 5) ? std::atoi(argv[5]) : 16;
+    std::vector<std::string> args;
+    auto ev = parse_cli_evaluator(argc, argv, &args);
+    if (!ev) return 1;
+    bool compact = true;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) == "--v1" || std::string(argv[i]) == "--compact=0")
+            compact = false;
+    }
+    const std::string path = (args.size() > 0) ? args[0] : "train.tetradat";
+    const int games = (args.size() > 1) ? std::atoi(args[1].c_str()) : 10;
+    const int pieces = (args.size() > 2) ? std::atoi(args[2].c_str()) : 100;
+    const int sims = (args.size() > 3) ? std::atoi(args[3].c_str()) : 16;
     const RulesetConfig rules = RulesetConfig::tetra_league();
 
-    HeuristicEvaluator ev;
     SelfPlayConfig cfg;
     cfg.max_pieces = pieces;
     cfg.search.simulations = sims;
@@ -518,7 +565,7 @@ int cmd_export(int argc, char** argv) {
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
 
-    SelfPlayWorker worker(ev, cfg);
+    SelfPlayWorker worker(*ev, cfg);
     ReplayBuffer buffer(1000000);
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -531,7 +578,7 @@ int cmd_export(int argc, char** argv) {
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-    if (!export_buffer(path, buffer, /*model_version=*/0)) {
+    if (!export_buffer(path, buffer, /*model_version=*/0, 0, 0, compact)) {
         std::printf("export failed\n");
         return 1;
     }
@@ -599,6 +646,101 @@ int cmd_play(int argc, char** argv) {
     return 0;
 }
 
+int cmd_arena(int argc, char** argv) {
+    if (argc < 3) {
+        std::printf(
+            "usage: tetra_cli arena <candidate> [champion=heuristic] [pairs=10] [sims=16] "
+            "[pieces=300]\n");
+        return 1;
+    }
+    const std::string cand_name = argv[2];
+    const std::string champ_name = (argc > 3) ? argv[3] : "heuristic";
+    const int pairs = (argc > 4) ? std::atoi(argv[4]) : 10;
+    const int sims = (argc > 5) ? std::atoi(argv[5]) : 16;
+    const int pieces = (argc > 6) ? std::atoi(argv[6]) : 300;
+
+    auto cand = load_evaluator_from_name(cand_name);
+    auto champ = load_evaluator_from_name(champ_name);
+    if (!cand || !champ) return 1;
+
+    ArenaConfig cfg;
+    cfg.pairs = pairs;
+    cfg.max_pieces = pieces;
+    cfg.search.simulations = sims;
+    cfg.search.max_depth = 6;
+    cfg.search.use_gumbel = true;
+    cfg.search.batch_size = 16;
+
+    std::printf("Arena: Candidate (%s) vs Champion (%s)\n", cand_name.c_str(),
+                champ_name.c_str());
+    std::printf("Running %d paired games (%d games total, sims=%d, max_pieces=%d)...\n\n",
+                pairs, pairs * 2, sims, pieces);
+
+    Arena arena(*cand, *champ, cfg);
+    const auto t0 = std::chrono::steady_clock::now();
+    const ArenaResult r = arena.evaluate(RulesetConfig::tetra_league(), 42);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    std::printf("%4s  %8s  %7s  %7s  %8s  %7s  %7s  %5s\n", "pair", "seed", "c_pcs", "c_sent",
+                "h_pcs", "h_sent", "mirror", "score");
+    for (size_t i = 0; i < r.games.size(); ++i) {
+        const auto& g = r.games[i];
+        std::printf("%4d  %016llx  %7d  %7lld  %7d  %7lld  %7s  %5.1f\n", g.pair_index,
+                    static_cast<unsigned long long>(g.seed), g.candidate_pieces,
+                    static_cast<long long>(g.candidate_sent), g.champion_pieces,
+                    static_cast<long long>(g.champion_sent), g.is_mirrored ? "yes" : "no",
+                    static_cast<double>(g.candidate_score));
+    }
+
+    std::printf("\nResult over %d games in %.1f s:\n", r.games_played, secs);
+    std::printf("  Candidate wins : %d\n", r.candidate_wins);
+    std::printf("  Champion wins  : %d\n", r.champion_wins);
+    std::printf("  Draws          : %d\n", r.draws);
+    std::printf("  Win Rate       : %.1f%% (95%% CI: %.1f%% - %.1f%%)\n", r.win_rate * 100.0f,
+                r.ci_lower * 100.0f, r.ci_upper * 100.0f);
+    std::printf("  Threshold      : %.1f%%\n", cfg.promotion_threshold * 100.0f);
+    std::printf(
+        "  Status         : %s\n",
+        r.promoted ? "\033[32mPROMOTED\033[0m" : "\033[33mRETAINED (no promotion)\033[0m");
+    return 0;
+}
+
+int cmd_decode_dataset(int argc, char** argv) {
+    if (argc < 3) {
+        std::printf(
+            "usage: tetra_cli decode-dataset <input.tetradat> [output.tetradat]\n");
+        return 1;
+    }
+    const std::string in_path = argv[2];
+    const DatasetReadResult r = read_dataset_file(in_path);
+    if (!r.ok) {
+        std::fprintf(stderr, "cannot decode %s: %s\n", in_path.c_str(), r.error.c_str());
+        return 1;
+    }
+    const std::vector<std::uint8_t> v1_bytes =
+        serialize_dataset(r.batch, r.header.ruleset_hash, r.header.model_version);
+
+    if (argc > 3) {
+        const std::string out_path = argv[3];
+        std::FILE* f = std::fopen(out_path.c_str(), "wb");
+        if (!f) {
+            std::fprintf(stderr, "cannot open %s for write\n", out_path.c_str());
+            return 1;
+        }
+        std::fwrite(v1_bytes.data(), 1, v1_bytes.size(), f);
+        std::fclose(f);
+        std::printf("decoded %s -> %s (%u samples, %zu bytes)\n", in_path.c_str(),
+                    out_path.c_str(), r.header.samples, v1_bytes.size());
+        return 0;
+    }
+
+    const size_t nw = std::fwrite(v1_bytes.data(), 1, v1_bytes.size(), stdout);
+    std::fflush(stdout);
+    if (nw != v1_bytes.size()) return 1;
+    return 0;
+}
+
 void usage() {
     std::printf(
         "tetra_cli -- TetraFormer M0/M1 developer tool (local simulator only)\n\n"
@@ -610,8 +752,10 @@ void usage() {
         "  verify <file>\n"
         "  search [sims] [gumbel:0|1] [seed]\n"
         "  selfplay-gen [games] [pieces] [sims]\n"
-        "  export <file> [games] [pieces] [sims]\n"
-        "  play <weights.tetrawts> [pieces] [sims]\n"
+        "  export <file> [games] [pieces] [sims] [--weights ...]\n"
+        "  play <weights.tetrawts|--weights=...> [pieces] [sims]\n"
+        "  arena <candidate> [champion=heuristic] [pairs] [sims] [pieces]\n"
+        "  decode-dataset <input.tetradat> [output.tetradat]\n"
         "  bench [iterations]\n"
         "  determinism [seed]\n");
 }
@@ -634,6 +778,8 @@ int main(int argc, char** argv) {
     if (cmd == "selfplay-gen") return cmd_selfplay_gen(argc, argv);
     if (cmd == "export") return cmd_export(argc, argv);
     if (cmd == "play") return cmd_play(argc, argv);
+    if (cmd == "arena") return cmd_arena(argc, argv);
+    if (cmd == "decode-dataset") return cmd_decode_dataset(argc, argv);
     if (cmd == "bench") return cmd_bench(argc, argv);
     if (cmd == "determinism") return cmd_determinism(argc, argv);
     usage();

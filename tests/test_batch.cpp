@@ -396,3 +396,52 @@ TEST(batch_construction_is_deterministic) {
     CHECK(a.policy_target == b.policy_target);
     CHECK(a.value_target == b.value_target);
 }
+
+TEST(compact_dataset_version2_round_trips_and_reconstructs_exact_tokens) {
+    HeuristicEvaluator ev;
+    SelfPlayConfig cfg;
+    cfg.max_pieces = 30;
+    cfg.search.simulations = 8;
+    cfg.search.max_depth = 3;
+    SelfPlayWorker w(ev, cfg);
+    ReplayBuffer buf(1000);
+    buf.push_game(w.play(league(), 42));
+    CHECK(buf.size() > 5);
+
+    const std::string v1_path = "build/test_v1.tetradat";
+    const std::string v2_path = "build/test_v2.tetradat";
+    CHECK(export_buffer(v1_path, buf, 3, 0, 0, /*compact=*/false));
+    CHECK(export_buffer(v2_path, buf, 3, 0, 0, /*compact=*/true));
+
+    const DatasetReadResult r1 = read_dataset_file(v1_path);
+    const DatasetReadResult r2 = read_dataset_file(v2_path);
+    CHECK_MSG(r1.ok, "read v1 failed: " + r1.error);
+    CHECK_MSG(r2.ok, "read v2 failed: " + r2.error);
+
+    CHECK_EQ(static_cast<int>(r2.header.samples), static_cast<int>(r1.header.samples));
+    CHECK_EQ(static_cast<int>(r2.header.version), static_cast<int>(DatasetHeader::VERSION_COMPACT));
+    CHECK_EQ(r2.header.ruleset_hash, r1.header.ruleset_hash);
+
+    CHECK(r2.batch.tokens == r1.batch.tokens);
+    CHECK(r2.batch.token_mask == r1.batch.token_mask);
+    CHECK(r2.batch.actions == r1.batch.actions);
+    CHECK(r2.batch.action_mask == r1.batch.action_mask);
+    CHECK(r2.batch.policy_target == r1.batch.policy_target);
+    CHECK(r2.batch.value_target == r1.batch.value_target);
+    CHECK(r2.batch.aux_target == r1.batch.aux_target);
+
+    std::FILE* f1 = std::fopen(v1_path.c_str(), "rb");
+    std::fseek(f1, 0, SEEK_END);
+    const long sz1 = std::ftell(f1);
+    std::fclose(f1);
+
+    std::FILE* f2 = std::fopen(v2_path.c_str(), "rb");
+    std::fseek(f2, 0, SEEK_END);
+    const long sz2 = std::ftell(f2);
+    std::fclose(f2);
+
+    CHECK(sz2 * 20 < sz1);
+
+    std::remove(v1_path.c_str());
+    std::remove(v2_path.c_str());
+}

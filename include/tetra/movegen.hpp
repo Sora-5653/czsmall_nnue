@@ -162,11 +162,6 @@ inline VisitedTable& scratch_landing_table() {
     return t;
 }
 
-inline NodeQueue& scratch_queue() {
-    static thread_local NodeQueue q;
-    return q;
-}
-
 // BFS node with a parent link instead of an owned path. Copying a path per
 // expansion dominated the profile (the generator is the MCTS inner loop), so
 // the path is reconstructed only for the placements that are actually emitted.
@@ -245,6 +240,11 @@ private:
     size_t head_ = 0;
     size_t size_ = 0;
 };
+
+inline NodeQueue& scratch_queue() {
+    static thread_local NodeQueue q;
+    return q;
+}
 
 inline BfsScratch& scratch_bfs() {
     static thread_local BfsScratch s;

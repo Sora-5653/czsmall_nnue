@@ -123,10 +123,43 @@ class Dataset:
 
 def load(path: str) -> Dataset:
     with open(path, "rb") as fh:
-        blob = fh.read()
+        magic = fh.read(8)
+        ver_bytes = fh.read(4)
 
-    if len(blob) < 8 or blob[:8] != MAGIC:
+    if len(magic) < 8 or magic != MAGIC:
         raise ValueError("not a .tetradat file")
+    (ver,) = struct.unpack("<I", ver_bytes)
+
+    if ver == 1:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    elif ver == 2:
+        # Compact Replay + π format (spec 13.5, 17, ADR 0012):
+        # Decode on-the-fly via the C++ engine to eliminate padded tensor disk I/O.
+        import os
+        import subprocess
+
+        cli_candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "tetra_cli"),
+            os.path.join(os.getcwd(), "build", "tetra_cli"),
+        ]
+        cli_path = None
+        for cand in cli_candidates:
+            if os.path.exists(cand):
+                cli_path = cand
+                break
+        if not cli_path:
+            raise RuntimeError("build/tetra_cli not found; run 'make tools' first to read v2 dataset")
+
+        proc = subprocess.run(
+            [cli_path, "decode-dataset", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        blob = proc.stdout
+    else:
+        raise ValueError(f"unsupported dataset version {ver}")
 
     off = 8
     fields = struct.unpack_from("<7I", blob, off)
@@ -137,7 +170,7 @@ def load(path: str) -> Dataset:
     off += 4
 
     header = Header(
-        version=fields[0],
+        version=1,  # in-memory unpadded structure uses version 1 layout
         samples=fields[1],
         max_tokens=fields[2],
         max_actions=fields[3],
@@ -147,8 +180,6 @@ def load(path: str) -> Dataset:
         ruleset_hash=ruleset_hash,
         model_version=model_version,
     )
-    if header.version != VERSION:
-        raise ValueError(f"unsupported dataset version {header.version}")
 
     n, t, a = header.samples, header.max_tokens, header.max_actions
     ftok, fact, faux = header.token_features, header.action_features, header.aux_targets

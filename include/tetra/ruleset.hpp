@@ -169,4 +169,19 @@ struct RulesetConfig {
     static RulesetConfig guideline();
 };
 
+inline RulesetConfig ruleset_from_hash(std::uint64_t hash, bool* found = nullptr) {
+    if (found) *found = true;
+    if (hash == 0 || hash == RulesetConfig::tetra_league().hash()) {
+        return RulesetConfig::tetra_league();
+    }
+    if (hash == RulesetConfig::quick_play().hash()) {
+        return RulesetConfig::quick_play();
+    }
+    if (hash == RulesetConfig::guideline().hash()) {
+        return RulesetConfig::guideline();
+    }
+    if (found) *found = false;
+    return RulesetConfig::tetra_league();
+}
+
 }  // namespace tetra
