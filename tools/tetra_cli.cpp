@@ -12,9 +12,15 @@
 // cannot connect to TETR.IO (see docs/POLICY.md).
 #include "tetra/movegen.hpp"
 #include "tetra/player.hpp"
+#include "tetra/replay.hpp"
+#include "tetra/search.hpp"
+#include "tetra/dataset.hpp"
+#include "tetra/nnue.hpp"
+#include "tetra/selfplay.hpp"
 
 #include <chrono>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <string>
 
@@ -138,7 +144,8 @@ int cmd_selfplay(int argc, char** argv) {
         if (acts[pick].use_hold && !p.do_hold()) continue;
         p.set_active(acts[pick].piece_state());
         int out = 0;
-        const LockResult r = p.lock_piece(20, &out);
+        // Spec 8.4: charge the action's real execution cost, not a constant.
+        const LockResult r = p.lock_piece(acts[pick].total_duration(), &out);
         ++placed;
         if (r.clear.lines >= 4) ++quads;
         if (r.clear.spin != SpinType::None) ++spins;
@@ -153,6 +160,12 @@ int cmd_selfplay(int argc, char** argv) {
     std::printf("quads / spins    %d / %d\n", quads, spins);
     std::printf("attack per piece %.3f\n",
                 placed ? static_cast<double>(p.lines_sent()) / placed : 0.0);
+    const double seconds = static_cast<double>(p.now()) / static_cast<double>(cfg.tick_rate);
+    std::printf("elapsed          %.2f s (%lld ticks)\n", seconds,
+                static_cast<long long>(p.now()));
+    std::printf("pieces / second  %.2f\n", seconds > 0 ? placed / seconds : 0.0);
+    std::printf("attack / second  %.3f\n",
+                seconds > 0 ? static_cast<double>(p.lines_sent()) / seconds : 0.0);
     std::printf("alive            %d (%s)\n", p.alive() ? 1 : 0, topout_name(p.topout_reason()));
     std::printf("final board:\n%s\n", p.board().to_string().c_str());
     return 0;
@@ -196,7 +209,7 @@ int cmd_determinism(int argc, char** argv) {
             const size_t pick = greedy_pick(acts, p.board(), cfg);
             p.set_active(acts[pick].piece_state());
             int out = 0;
-            const LockResult r = p.lock_piece(20, &out);
+            const LockResult r = p.lock_piece(acts[pick].total_duration(), &out);
             h ^= static_cast<std::uint64_t>(out + 1);
             h *= 1099511628211ull;
             h ^= detail::board_hash(p.board());
@@ -217,12 +230,388 @@ int cmd_determinism(int argc, char** argv) {
     return 1;
 }
 
+int cmd_timing(int argc, char** argv) {
+    // Show how action cost and the delay bins behave for one position.
+    const RulesetConfig cfg = RulesetConfig::tetra_league();
+    Piece piece = Piece::T;
+    if (argc > 2) piece_from_char(static_cast<char>(std::toupper(argv[2][0])), piece);
+
+    Board b(cfg.geometry.width, cfg.geometry.internal_height);
+    MoveGenerator gen;
+    const auto acts = gen.generate_for_piece(b, piece, cfg, false);
+
+    const HandlingModel h = HandlingModel::from(cfg);
+    std::printf("handling: tap=%lld das=%lld arr=%lld sdf=%lld are=%lld lock_delay=%lld\n\n",
+                static_cast<long long>(h.tap), static_cast<long long>(h.das),
+                static_cast<long long>(h.arr), static_cast<long long>(h.sdf),
+                static_cast<long long>(h.are), static_cast<long long>(h.lock_delay));
+
+    Tick cheapest = TICK_NEVER, dearest = 0;
+    for (const auto& a : acts) {
+        cheapest = std::min(cheapest, a.base_duration);
+        dearest = std::max(dearest, a.base_duration);
+    }
+    std::printf("piece %s: %zu placements, cost %lld..%lld ticks\n\n", piece_name(piece),
+                acts.size(), static_cast<long long>(cheapest),
+                static_cast<long long>(dearest));
+
+    for (size_t i = 0; i < acts.size() && i < 12; ++i) {
+        const auto& a = acts[i];
+        std::printf("  x=%2d rot=%s cost=%2lld  inputs:", a.final_x, rot_name(a.final_rotation),
+                    static_cast<long long>(a.base_duration));
+        for (Input in : a.canonical_input_sequence) std::printf(" %s", input_name(in));
+        std::printf("\n");
+    }
+
+    // Delay bins against a pending garbage activation 45 ticks away.
+    std::printf("\ndelay bins for the first placement (garbage activates at t=45):\n");
+    const std::vector<PlacementAction> one{acts.front()};
+    for (const auto& a : MoveGenerator::expand_delay_bins(one, cfg, /*now=*/0,
+                                                          /*next_garbage=*/45)) {
+        std::printf("  %-15s wait=%2lld total=%2lld\n", delay_bin_name(a.delay_bin),
+                    static_cast<long long>(a.delay_ticks),
+                    static_cast<long long>(a.total_duration()));
+    }
+    return 0;
+}
+
+int cmd_record(int argc, char** argv) {
+    // Play a scripted game and write it to disk.
+    const std::string path = (argc > 2) ? argv[2] : "game.tetrarep";
+    const std::uint64_t seed = (argc > 3) ? std::strtoull(argv[3], nullptr, 10) : 1;
+    const int pieces = (argc > 4) ? std::atoi(argv[4]) : 300;
+    const RulesetConfig cfg = RulesetConfig::tetra_league();
+
+    Player p;
+    p.reset(cfg, seed, 0);
+    MoveGenerator gen;
+    ReplayRecorder rec(cfg, seed, 0, /*checkpoint_interval=*/16);
+    rec.note("tetra_cli record");
+
+    for (int i = 0; i < pieces && p.alive(); ++i) {
+        const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
+                                       p.visible_next().empty() ? Piece::None
+                                                                : p.visible_next()[0],
+                                       cfg);
+        if (acts.empty()) break;
+        const size_t pick = greedy_pick(acts, p.board(), cfg);
+        if (acts[pick].use_hold && !p.do_hold()) continue;
+        p.set_active(acts[pick].piece_state());
+        int out = 0;
+        const LockResult r = p.lock_piece(acts[pick].total_duration(), &out);
+        rec.record(acts[pick], p);
+        if (!r.ok) break;
+    }
+
+    const Replay replay = rec.finish(p);
+    if (!write_replay_file(path, replay)) {
+        std::printf("failed to write %s\n", path.c_str());
+        return 1;
+    }
+    const size_t bytes = serialize(replay).size();
+    std::printf("wrote %s\n", path.c_str());
+    std::printf("  ruleset      %s (%s)\n", replay.ruleset_id.c_str(),
+                cfg.hash_hex().c_str());
+    std::printf("  seed         %llu\n", static_cast<unsigned long long>(replay.seed));
+    std::printf("  placements   %zu\n", replay.placements.size());
+    std::printf("  size         %zu bytes (%.1f per placement)\n", bytes,
+                replay.placements.empty()
+                    ? 0.0
+                    : static_cast<double>(bytes) /
+                          static_cast<double>(replay.placements.size()));
+    std::printf("  lines sent   %lld\n", static_cast<long long>(replay.final_lines_sent));
+    std::printf("  result       %s\n",
+                replay.final_alive ? "survived" : topout_name(replay.final_topout));
+    return 0;
+}
+
+int cmd_verify(int argc, char** argv) {
+    // Re-simulate a replay and report the first divergence, if any.
+    if (argc < 3) {
+        std::printf("usage: tetra_cli verify <file.tetrarep>\n");
+        return 1;
+    }
+    const DeserializeResult rd = read_replay_file(argv[2]);
+    if (!rd.ok) {
+        std::printf("cannot read replay: %s\n", rd.error.c_str());
+        return 1;
+    }
+    const Replay& r = rd.replay;
+
+    // Pick the preset whose hash matches the replay.
+    const RulesetConfig presets[] = {RulesetConfig::tetra_league(), RulesetConfig::quick_play(),
+                                     RulesetConfig::guideline()};
+    const RulesetConfig* cfg = nullptr;
+    for (const auto& c : presets)
+        if (c.hash() == r.ruleset_hash) cfg = &c;
+    if (!cfg) {
+        std::printf("no known ruleset matches hash %016llx (replay says \"%s\")\n",
+                    static_cast<unsigned long long>(r.ruleset_hash), r.ruleset_id.c_str());
+        return 1;
+    }
+
+    const VerifyResult v = verify_replay(r, *cfg);
+    std::printf("replay       %s\n", argv[2]);
+    std::printf("ruleset      %s (%s)\n", r.ruleset_id.c_str(), cfg->hash_hex().c_str());
+    std::printf("placements   %zu\n", r.placements.size());
+    if (v.ok) {
+        std::printf("RESULT       OK: %d placements re-simulated exactly\n",
+                    v.placements_applied);
+        return 0;
+    }
+    std::printf("RESULT       DIVERGED at placement %d\n", v.first_divergence);
+    std::printf("  %s\n", v.error.c_str());
+    if (v.expected_hash || v.actual_hash)
+        std::printf("  expected board %016llx, got %016llx\n",
+                    static_cast<unsigned long long>(v.expected_hash),
+                    static_cast<unsigned long long>(v.actual_hash));
+    return 1;
+}
+
+int cmd_search(int argc, char** argv) {
+    // Inspect one search: candidates, timing and batch efficiency.
+    const int sims = (argc > 2) ? std::atoi(argv[2]) : 64;
+    const bool gumbel = (argc > 3) ? (std::atoi(argv[3]) != 0) : true;
+    const std::uint64_t seed = (argc > 4) ? std::strtoull(argv[4], nullptr, 10) : 42;
+    const RulesetConfig cfg = RulesetConfig::tetra_league();
+
+    Player p;
+    p.reset(cfg, seed, 0);
+    MoveGenerator gen;
+    for (int i = 0; i < 25 && p.alive(); ++i) {
+        const auto a = gen.generate_for_piece(p.board(), p.active().type, cfg, false);
+        if (a.empty()) break;
+        size_t best = 0;
+        for (size_t k = 1; k < a.size(); ++k)
+            if (a[k].final_y < a[best].final_y) best = k;
+        p.set_active(a[best].piece_state());
+        int out = 0;
+        if (!p.lock_piece(a[best].total_duration(), &out).ok) break;
+    }
+
+    std::printf("board:\n%s\n", p.board().to_string(14).c_str());
+    std::printf("active %s   hold %s\n\n", piece_name(p.active().type), piece_name(p.hold()));
+
+    HeuristicEvaluator ev;
+    SearchConfig sc;
+    sc.simulations = sims;
+    sc.max_depth = 8;
+    sc.use_gumbel = gumbel;
+    sc.batch_size = 16;
+    sc.seed = 1;
+    Searcher s(ev, sc);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const SearchResult r = s.search(p);
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+
+    const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
+                                   p.visible_next().empty() ? Piece::None : p.visible_next()[0],
+                                   cfg);
+    std::printf("mode            %s\n", gumbel ? "gumbel" : "puct");
+    std::printf("simulations     %d (ran %d)\n", sims, r.simulations_run);
+    std::printf("elapsed         %.1f ms\n", ms);
+    std::printf("nodes           %d\n", r.nodes_created);
+    std::printf("evaluator calls %d for %d positions (mean batch %.1f)\n", r.evaluator_calls,
+                r.positions_evaluated, r.mean_batch_size);
+    std::printf("transposition   %d hits\n", r.transposition_hits);
+    std::printf("value (WDL)     %.3f / %.3f / %.3f\n", r.value.win, r.value.draw, r.value.loss);
+
+    std::vector<SearchCandidate> top = r.candidates;
+    std::sort(top.begin(), top.end(),
+              [](const SearchCandidate& a, const SearchCandidate& b) { return a.visits > b.visits; });
+    std::printf("\ntop candidates:\n");
+    for (size_t i = 0; i < top.size() && i < 8; ++i) {
+        const PlacementAction& a = acts[static_cast<size_t>(top[i].action_index)];
+        std::printf("  %s x=%2d rot=%s clears=%d spin=%-4s  visits=%3d  q=%+.3f  prior=%.3f%s\n",
+                    piece_name(a.final_piece), a.final_x, rot_name(a.final_rotation),
+                    a.cleared_lines, spin_name(a.spin), top[i].visits, top[i].q_value,
+                    top[i].prior,
+                    top[i].action_index == r.best_action ? "  <- chosen" : "");
+    }
+    return 0;
+}
+
+int cmd_selfplay_gen(int argc, char** argv) {
+    // Run the self-play loop and report what the trainer would receive.
+    const int games = (argc > 2) ? std::atoi(argv[2]) : 5;
+    const int pieces = (argc > 3) ? std::atoi(argv[3]) : 100;
+    const int sims = (argc > 4) ? std::atoi(argv[4]) : 16;
+    const RulesetConfig rules = RulesetConfig::tetra_league();
+
+    HeuristicEvaluator ev;
+    SelfPlayConfig cfg;
+    cfg.max_pieces = pieces;
+    cfg.search.simulations = sims;
+    cfg.search.max_depth = 6;
+    cfg.search.use_gumbel = true;
+    cfg.search.batch_size = 16;
+    cfg.garbage_style = GarbageStyle::Steady;
+    cfg.garbage_period = 8;
+    cfg.garbage_lines = 2;
+
+    SelfPlayWorker worker(ev, cfg);
+    ReplayBuffer buffer(200000);
+
+    std::printf("ruleset %s (%s), %d games x %d pieces, %d sims\n\n", rules.id.c_str(),
+                rules.hash_hex().c_str(), games, pieces, sims);
+    std::printf("%5s %8s %8s %7s %7s %8s %s\n", "game", "pieces", "cleared", "sent", "recv",
+                "outcome", "result");
+
+    int total_pieces = 0, survived = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int g = 0; g < games; ++g) {
+        SelfPlayStats st;
+        auto samples = worker.play(rules, static_cast<std::uint64_t>(g), &st);
+        total_pieces += st.pieces;
+        if (st.survived) ++survived;
+        std::printf("%5d %8d %8d %7d %7d %+8.0f %s\n", g, st.pieces, st.lines_cleared,
+                    st.lines_sent, st.lines_received, static_cast<double>(st.outcome),
+                    st.survived ? "truncated" : topout_name(st.topout));
+        buffer.push_game(std::move(samples));
+    }
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    std::printf("\nbuffer     %zu samples (capacity %zu)\n", buffer.size(), buffer.capacity());
+    std::printf("rulesets   %zu distinct\n", buffer.ruleset_hashes().size());
+    std::printf("survived   %d/%d\n", survived, games);
+    std::printf("throughput %.1f placements/s over %.1f s\n",
+                secs > 0 ? total_pieces / secs : 0.0, secs);
+
+    Rng rng(1);
+    const auto batch = buffer.sample(32, rng);
+    if (!batch.empty()) {
+        size_t tokens = 0, actions = 0;
+        for (const auto* s : batch) {
+            tokens += s->tokens.size();
+            actions += s->action_embeddings.size();
+        }
+        std::printf("\ntraining batch of %zu:\n", batch.size());
+        std::printf("  mean tokens/sample  %.1f\n",
+                    static_cast<double>(tokens) / static_cast<double>(batch.size()));
+        std::printf("  mean actions/sample %.1f\n",
+                    static_cast<double>(actions) / static_cast<double>(batch.size()));
+        std::printf("  token features      %d\n", TOKEN_FEATURES);
+        std::printf("  action features     %d\n", ACTION_FEATURES);
+    }
+    return 0;
+}
+
+int cmd_export(int argc, char** argv) {
+    // Self-play straight into a .tetradat file for the Python trainer.
+    const std::string path = (argc > 2) ? argv[2] : "train.tetradat";
+    const int games = (argc > 3) ? std::atoi(argv[3]) : 10;
+    const int pieces = (argc > 4) ? std::atoi(argv[4]) : 100;
+    const int sims = (argc > 5) ? std::atoi(argv[5]) : 16;
+    const RulesetConfig rules = RulesetConfig::tetra_league();
+
+    HeuristicEvaluator ev;
+    SelfPlayConfig cfg;
+    cfg.max_pieces = pieces;
+    cfg.search.simulations = sims;
+    cfg.search.max_depth = 6;
+    cfg.search.use_gumbel = true;
+    cfg.search.batch_size = 16;
+    cfg.garbage_style = GarbageStyle::Steady;
+    cfg.garbage_period = 8;
+    cfg.garbage_lines = 2;
+
+    SelfPlayWorker worker(ev, cfg);
+    ReplayBuffer buffer(1000000);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    int survived = 0;
+    for (int g = 0; g < games; ++g) {
+        SelfPlayStats st;
+        buffer.push_game(worker.play(rules, static_cast<std::uint64_t>(g), &st));
+        if (st.survived) ++survived;
+    }
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    if (!export_buffer(path, buffer, /*model_version=*/0)) {
+        std::printf("export failed\n");
+        return 1;
+    }
+    const DatasetReadResult back = read_dataset_file(path);
+    if (!back.ok) {
+        std::printf("wrote %s but could not read it back: %s\n", path.c_str(),
+                    back.error.c_str());
+        return 1;
+    }
+
+    std::printf("wrote %s\n", path.c_str());
+    std::printf("  samples       %u\n", back.header.samples);
+    std::printf("  tokens        [%u, %u]\n", back.header.max_tokens,
+                back.header.token_features);
+    std::printf("  actions       [%u, %u]\n", back.header.max_actions,
+                back.header.action_features);
+    std::printf("  ruleset_hash  %016llx\n",
+                static_cast<unsigned long long>(back.header.ruleset_hash));
+    std::printf("  games         %d (%d survived) in %.1f s\n", games, survived, secs);
+    std::printf("\ntrain with:\n  python trainer/train.py %s --steps 300\n", path.c_str());
+    return 0;
+}
+
+int cmd_play(int argc, char** argv) {
+    // Play with trained weights inside the C++ search: the closed loop.
+    if (argc < 3) {
+        std::printf("usage: tetra_cli play <weights.tetrawts> [pieces] [sims]\n");
+        return 1;
+    }
+    const int pieces = (argc > 3) ? std::atoi(argv[3]) : 100;
+    const int sims = (argc > 4) ? std::atoi(argv[4]) : 16;
+
+    NnueWeights weights;
+    std::string err;
+    if (!weights.load(argv[2], &err)) {
+        std::printf("cannot load weights: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("weights    %s (width %u, %u layers, %u heads)\n", argv[2],
+                weights.config().width, weights.config().layers, weights.config().heads);
+
+    TetraFormerEvaluator ev(std::move(weights));
+    const RulesetConfig rules = RulesetConfig::tetra_league();
+
+    SelfPlayConfig cfg;
+    cfg.max_pieces = pieces;
+    cfg.search.simulations = sims;
+    cfg.search.max_depth = 4;
+    cfg.search.use_gumbel = true;
+    cfg.search.batch_size = 16;
+    cfg.garbage_style = GarbageStyle::Steady;
+
+    SelfPlayWorker worker(ev, cfg);
+    SelfPlayStats st;
+    const auto t0 = std::chrono::steady_clock::now();
+    worker.play(rules, 1, &st);
+    const double secs =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    std::printf("pieces     %d\n", st.pieces);
+    std::printf("cleared    %d\n", st.lines_cleared);
+    std::printf("sent       %d\n", st.lines_sent);
+    std::printf("result     %s\n", st.survived ? "survived" : topout_name(st.topout));
+    std::printf("speed      %.1f placements/s\n", secs > 0 ? st.pieces / secs : 0.0);
+    return 0;
+}
+
 void usage() {
     std::printf(
         "tetra_cli -- TetraFormer M0/M1 developer tool (local simulator only)\n\n"
         "  ruleset [league|quickplay|guideline]\n"
         "  moves <piece> [seed]\n"
         "  selfplay [seed] [pieces]\n"
+        "  timing <piece>\n"
+        "  record [file] [seed] [pieces]\n"
+        "  verify <file>\n"
+        "  search [sims] [gumbel:0|1] [seed]\n"
+        "  selfplay-gen [games] [pieces] [sims]\n"
+        "  export <file> [games] [pieces] [sims]\n"
+        "  play <weights.tetrawts> [pieces] [sims]\n"
         "  bench [iterations]\n"
         "  determinism [seed]\n");
 }
@@ -238,6 +627,13 @@ int main(int argc, char** argv) {
     if (cmd == "ruleset") return cmd_ruleset(argc, argv);
     if (cmd == "moves") return cmd_moves(argc, argv);
     if (cmd == "selfplay") return cmd_selfplay(argc, argv);
+    if (cmd == "timing") return cmd_timing(argc, argv);
+    if (cmd == "record") return cmd_record(argc, argv);
+    if (cmd == "verify") return cmd_verify(argc, argv);
+    if (cmd == "search") return cmd_search(argc, argv);
+    if (cmd == "selfplay-gen") return cmd_selfplay_gen(argc, argv);
+    if (cmd == "export") return cmd_export(argc, argv);
+    if (cmd == "play") return cmd_play(argc, argv);
     if (cmd == "bench") return cmd_bench(argc, argv);
     if (cmd == "determinism") return cmd_determinism(argc, argv);
     usage();

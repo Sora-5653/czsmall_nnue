@@ -29,6 +29,12 @@ struct ObservedGarbage {
 // Everything one player may legally condition on.
 struct Observation {
     std::uint64_t ruleset_hash = 0;
+    // The rules this observation was taken under. Carried by value so that an
+    // evaluator or a search node is self-contained: nothing downstream has to
+    // be handed a matching RulesetConfig out of band and risk pairing an
+    // observation with the wrong rules (spec 6 requires the two to travel
+    // together, which is also why `ruleset_hash` is recorded alongside).
+    RulesetConfig ruleset;
     Tick timestamp = 0;
 
     // --- self ---
@@ -68,6 +74,7 @@ inline Observation observe(const Player& p, const Player* opponent = nullptr) {
     const RulesetConfig& cfg = p.ruleset();
 
     o.ruleset_hash = cfg.hash();
+    o.ruleset = cfg;
     o.timestamp = p.now();
     o.board = p.board();
     o.active = p.active();

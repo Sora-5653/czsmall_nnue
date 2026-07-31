@@ -120,6 +120,47 @@ public:
     Rng& rng() { return rng_; }
     const Rng& rng() const { return rng_; }
 
+    // Resample everything the player cannot legitimately see (spec 11.3).
+    //
+    // A search that copies the true queue would be reading the future: beyond
+    // `preview_count` the sequence is hidden information, and using it inflates
+    // the value of setups that only work because the engine knows what is
+    // coming. This discards the unseen tail and regenerates it from a fresh
+    // seed, keeping:
+    //
+    //   * the visible preview exactly as it is, and
+    //   * the bag state, so 7-bag counting constraints still hold -- a resample
+    //     that ignored the bag would be *less* informed than a human player.
+    //
+    // The result is one sample from the set of futures consistent with the
+    // observation, which is what a chance node needs.
+    void resample_hidden(std::uint64_t seed) {
+        const int keep = std::max(0, cfg_.preview_count);
+        // Discard the pieces the player cannot see, returning each one to the
+        // bag it came from. Without this the bag is left short by however many
+        // lookahead pieces the queue had buffered, and regeneration draws from
+        // a depleted bag -- observably breaking the 7-bag guarantee (measured:
+        // three O and one L in a 14-piece window).
+        while (static_cast<int>(queue_.size()) > keep) {
+            bag_.push_back(queue_.back());
+            queue_.pop_back();
+        }
+        rng_.reseed(seed);
+        // Reshuffle what is left of the bag so the returned pieces are not
+        // simply drawn back in the order they were removed.
+        for (int i = static_cast<int>(bag_.size()) - 1; i > 0; --i) {
+            const int j = static_cast<int>(rng_.below(static_cast<std::uint32_t>(i + 1)));
+            std::swap(bag_[static_cast<size_t>(i)], bag_[static_cast<size_t>(j)]);
+        }
+        refill(cfg_.preview_count + 2);
+    }
+
+    // True when the queue holds pieces beyond what the player may see, which is
+    // exactly the state a search must not exploit.
+    bool has_hidden_lookahead() const {
+        return static_cast<int>(queue_.size()) > std::max(0, cfg_.preview_count);
+    }
+
 private:
     void refill(int want) {
         while (static_cast<int>(queue_.size()) < want) generate_one();

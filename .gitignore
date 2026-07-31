@@ -1,7 +1,21 @@
+# Build output
 build/
 *.o
 *.d
-*.bin
+
+# Generated artefacts: training sets, checkpoints, exported weights, replays.
+# tests/data/ is deliberately exempt -- those fixtures pin the C++/PyTorch
+# parity check and must travel with the repository.
+*.tetradat
+*.tetrawts
+*.pt
 *.replay
-data/
-checkpoints/
+/data/
+/models/
+/checkpoints/
+!tests/data/**
+
+# Python
+.venv/
+__pycache__/
+trainer/__pycache__/

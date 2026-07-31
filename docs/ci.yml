@@ -53,13 +53,3 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build with -Werror
         run: make test WARN="-Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion -Werror"
-
-# ---------------------------------------------------------------------------
-# NOTE: this file lives at docs/ci.yml rather than .github/workflows/ci.yml
-# because the automation account that created this branch is not permitted to
-# add GitHub Actions workflows. To enable CI, move it into place:
-#
-#   mkdir -p .github/workflows && git mv docs/ci.yml .github/workflows/ci.yml
-#
-# It needs no secrets and no third-party actions beyond actions/checkout.
-# ---------------------------------------------------------------------------

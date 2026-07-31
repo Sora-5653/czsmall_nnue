@@ -1,0 +1,12 @@
+# Python dependencies for the trainer.
+#
+# IMPORTANT: do NOT `pip install torch` from this file if you are on an AMD GPU.
+# Install the ROCm build first, from AMD's index, then install the rest:
+#
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
+#   pip install -r trainer/requirements.txt
+#
+# See docs/SETUP.md for the full RX 9070 XT (gfx1201) walkthrough.
+
+numpy>=1.24

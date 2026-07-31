@@ -257,6 +257,17 @@ public:
         log(EventType::GarbageArrived, Piece::None, SpinType::None, lines, 0);
     }
 
+    // Resample hidden state so a search cannot read the future (spec 11.3).
+    //
+    // Called on a *copy* of the player at the search root: the visible preview
+    // and the bag are preserved, everything beyond them is redrawn. The garbage
+    // RNG is reseeded too, so undetermined hole columns are sampled rather than
+    // known in advance.
+    void determinize(std::uint64_t seed) {
+        queue_.resample_hidden(seed);
+        garbage_rng_.reseed(seed ^ 0xD1CED1CED1CED1CEull);
+    }
+
     // Directly set the active piece (used by movegen when applying an action).
     void set_active(const ActivePiece& p) { active_ = p; }
 

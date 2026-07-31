@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace tetra_test {
@@ -20,6 +21,20 @@ extern const char* g_current;
 struct Registrar {
     Registrar(const char* name, void (*fn)()) { registry().push_back(TestCase{name, fn}); }
 };
+
+// Best-effort stringification: numeric types print their value, anything else
+// (std::string, enums, structs) falls back to a placeholder so CHECK_EQ works
+// uniformly without every call site needing an overload.
+template <typename T>
+inline std::string describe(const T& v) {
+    if constexpr (std::is_arithmetic_v<T>) return std::to_string(v);
+    else if constexpr (std::is_enum_v<T>)
+        return std::to_string(static_cast<long long>(v));
+    else if constexpr (std::is_convertible_v<T, std::string>)
+        return std::string(v);
+    else
+        return "<value>";
+}
 
 inline void report_failure(const char* file, int line, const std::string& msg) {
     ++g_failures;
@@ -50,7 +65,8 @@ inline void report_failure(const char* file, int line, const std::string& msg) {
             ::tetra_test::report_failure(                                 \
                 __FILE__, __LINE__,                                       \
                 std::string("CHECK_EQ failed: " #a " == " #b " (got ") +  \
-                    std::to_string(_va) + " vs " + std::to_string(_vb) + ")"); \
+                    ::tetra_test::describe(_va) + " vs " +                \
+                    ::tetra_test::describe(_vb) + ")");                   \
         }                                                                 \
     } while (0)
 
