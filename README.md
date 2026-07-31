@@ -23,6 +23,16 @@ make tools        # the developer CLI
 make test-asan    # the suite under AddressSanitizer + UBSan
 ```
 
+On Windows the Makefile recipes assume a POSIX shell, so either build inside
+WSL2 (recommended — see docs/SETUP.md), or invoke a native g++ (MinGW-w64 /
+MSYS2) directly. The trainer finds both `build/tetra_cli` and
+`build/tetra_cli.exe`:
+
+```powershell
+mkdir build -Force
+g++ -std=c++17 -O2 -Wall -Wextra -Iinclude tools\tetra_cli.cpp src\ruleset.cpp -o build\tetra_cli.exe
+```
+
 The whole training pipeline, end to end:
 
 ```sh

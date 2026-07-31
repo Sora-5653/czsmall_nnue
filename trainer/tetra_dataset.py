@@ -139,17 +139,22 @@ def load(path: str) -> Dataset:
         import os
         import subprocess
 
-        cli_candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "tetra_cli"),
-            os.path.join(os.getcwd(), "build", "tetra_cli"),
-        ]
-        cli_path = None
-        for cand in cli_candidates:
-            if os.path.exists(cand):
-                cli_path = cand
-                break
+        # The Makefile builds literally `build/tetra_cli`, but native Windows
+        # toolchains (MinGW/MSYS2/MSVC) emit `tetra_cli.exe`, so probe both.
+        names = ("tetra_cli.exe", "tetra_cli") if os.name == "nt" else ("tetra_cli", "tetra_cli.exe")
+        roots = (
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build"),
+            os.path.join(os.getcwd(), "build"),
+        )
+        cli_candidates = [os.path.join(root, name) for root in roots for name in names]
+        cli_path = next((cand for cand in cli_candidates if os.path.exists(cand)), None)
         if not cli_path:
-            raise RuntimeError("build/tetra_cli not found; run 'make tools' first to read v2 dataset")
+            raise RuntimeError(
+                "build/tetra_cli not found; run 'make tools' first to read v2 dataset "
+                "(on native Windows there is no make by default: mkdir build, then "
+                "g++ -std=c++17 -O2 -Iinclude tools/tetra_cli.cpp src/ruleset.cpp "
+                "-o build/tetra_cli.exe, or use WSL2)"
+            )
 
         proc = subprocess.run(
             [cli_path, "decode-dataset", path],
