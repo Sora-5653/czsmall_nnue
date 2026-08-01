@@ -27,7 +27,7 @@ import torch.nn.functional as F
 @dataclass
 class TetraFormerConfig:
     token_features: int = 24
-    action_features: int = 28
+    action_features: int = 24
     width: int = 256
     layers: int = 8
     heads: int = 8
