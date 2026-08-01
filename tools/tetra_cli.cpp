@@ -490,6 +490,7 @@ int cmd_selfplay_gen(int argc, char** argv) {
     cfg.garbage_style = GarbageStyle::Steady;
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
+    cfg.truncation_is_draw = false;
 
     SelfPlayWorker worker(*ev, cfg);
     ReplayBuffer buffer(200000);
@@ -544,10 +545,10 @@ int cmd_export(int argc, char** argv) {
     std::vector<std::string> args;
     auto ev = parse_cli_evaluator(argc, argv, &args);
     if (!ev) return 1;
-    bool compact = true;
+    bool compact = false;
     for (int i = 2; i < argc; ++i) {
-        if (std::string(argv[i]) == "--v1" || std::string(argv[i]) == "--compact=0")
-            compact = false;
+        if (std::string(argv[i]) == "--compact=1" || std::string(argv[i]) == "--compact")
+            compact = true;
     }
     const std::string path = (args.size() > 0) ? args[0] : "train.tetradat";
     const int games = (args.size() > 1) ? std::atoi(args[1].c_str()) : 10;
@@ -564,6 +565,7 @@ int cmd_export(int argc, char** argv) {
     cfg.garbage_style = GarbageStyle::Steady;
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
+    cfg.truncation_is_draw = false;
 
     SelfPlayWorker worker(*ev, cfg);
     ReplayBuffer buffer(1000000);

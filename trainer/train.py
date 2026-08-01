@@ -75,7 +75,7 @@ def main() -> int:
             return None
         model.eval()
         with torch.no_grad():
-            _, parts = losses(model, batch_at(val_idx))
+            _, parts = losses(model, batch_at(val_idx), weights={"policy": 1.0, "value": 0.0, "aux": 0.1})
         model.train()
         return parts
 
@@ -90,7 +90,7 @@ def main() -> int:
             torch.randint(0, len(train_idx), (min(args.batch, len(train_idx)),),
                           generator=gen).to(device)
         ]
-        total, parts = losses(model, batch_at(pick))
+        total, parts = losses(model, batch_at(pick), weights={"policy": 1.0, "value": 0.0, "aux": 0.1})
         opt.zero_grad(set_to_none=True)
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
