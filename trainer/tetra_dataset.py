@@ -139,10 +139,18 @@ def load(path: str) -> Dataset:
         import os
         import subprocess
 
-        cli_candidates = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "tetra_cli"),
-            os.path.join(os.getcwd(), "build", "tetra_cli"),
-        ]
+        cli_base = "tetra_cli"
+        # On Windows, g++ produces tetra_cli.exe; add the extension if present.
+        if os.name == "nt":
+            cli_candidates = [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", f"{cli_base}.exe"),
+                os.path.join(os.getcwd(), "build", f"{cli_base}.exe"),
+            ]
+        else:
+            cli_candidates = [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", cli_base),
+                os.path.join(os.getcwd(), "build", cli_base),
+            ]
         cli_path = None
         for cand in cli_candidates:
             if os.path.exists(cand):
