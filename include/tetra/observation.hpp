@@ -56,7 +56,7 @@ struct Observation {
 
     bool alive = true;
 
-    // --- opponent (M4; empty until then) ---
+    // --- opponent (M4; present in two-board search/self-play) ---
     bool has_opponent = false;
     Board opponent_board;
     int opponent_pending_lines = 0;

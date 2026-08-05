@@ -65,12 +65,88 @@ class Dataset:
         """Number of legal actions per sample."""
         return self.action_mask.sum(axis=1).astype(np.int64)
 
+    @staticmethod
+    def concatenate(datasets: list["Dataset"]) -> "Dataset":
+        """Merge replay generations, padding them to one rectangular layout.
+
+        Generations can have different maximum token/action counts.  Padding
+        here preserves each sample's masks and keeps the trainer's model input
+        contract identical to a single exported dataset.  All inputs must use
+        the same ruleset and feature widths; mixing rulesets would make the
+        value target and action semantics invalid.
+        """
+        if not datasets:
+            raise ValueError("cannot concatenate an empty dataset list")
+        for ds in datasets:
+            ds.sanity_check()
+
+        first = datasets[0]
+        h0 = first.header
+        for ds in datasets[1:]:
+            h = ds.header
+            if h.ruleset_hash != h0.ruleset_hash:
+                raise ValueError(
+                    "cannot mix datasets with different ruleset hashes: "
+                    f"{h0.ruleset_hash:016x} vs {h.ruleset_hash:016x}"
+                )
+            if (h.token_features != h0.token_features or
+                    h.action_features != h0.action_features or
+                    h.aux_targets != h0.aux_targets):
+                raise ValueError("cannot mix datasets with different feature widths")
+
+        total = sum(len(ds) for ds in datasets)
+        max_tokens = max(ds.tokens.shape[1] for ds in datasets)
+        max_actions = max(ds.actions.shape[1] for ds in datasets)
+        ftok = h0.token_features
+        fact = h0.action_features
+        faux = h0.aux_targets
+
+        tokens = np.zeros((total, max_tokens, ftok), dtype=np.float32)
+        token_mask = np.zeros((total, max_tokens), dtype=np.float32)
+        actions = np.zeros((total, max_actions, fact), dtype=np.float32)
+        action_mask = np.zeros((total, max_actions), dtype=np.float32)
+        policy_target = np.zeros((total, max_actions), dtype=np.float32)
+        value_target = np.zeros((total,), dtype=np.float32)
+        aux_target = np.zeros((total, faux), dtype=np.float32)
+
+        at = 0
+        for ds in datasets:
+            n = len(ds)
+            t = ds.tokens.shape[1]
+            a = ds.actions.shape[1]
+            sl = slice(at, at + n)
+            tokens[sl, :t] = ds.tokens
+            token_mask[sl, :t] = ds.token_mask
+            actions[sl, :a] = ds.actions
+            action_mask[sl, :a] = ds.action_mask
+            policy_target[sl, :a] = ds.policy_target
+            value_target[sl] = ds.value_target
+            aux_target[sl] = ds.aux_target
+            at += n
+
+        header = Header(
+            version=1,
+            samples=total,
+            max_tokens=max_tokens,
+            max_actions=max_actions,
+            token_features=ftok,
+            action_features=fact,
+            aux_targets=faux,
+            ruleset_hash=h0.ruleset_hash,
+            model_version=max(ds.header.model_version for ds in datasets),
+        )
+        return Dataset(header, tokens, token_mask, actions, action_mask,
+                       policy_target, value_target, aux_target)
+
     def torch(self, device: Optional[str] = None):
         """Return the arrays as torch tensors, moved to `device` if given."""
         import torch  # imported lazily so numpy-only use needs no torch
 
         def t(a):
-            x = torch.from_numpy(np.ascontiguousarray(a))
+            # Version-1 datasets are memory-mapped views over an immutable
+            # bytes object.  Make a writable contiguous copy before handing it
+            # to torch so accelerator backends never see an unsafe tensor view.
+            x = torch.from_numpy(np.array(a, copy=True, order="C"))
             return x.to(device) if device else x
 
         return {

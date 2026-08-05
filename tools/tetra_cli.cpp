@@ -18,6 +18,8 @@
 #include "tetra/nnue.hpp"
 #include "tetra/selfplay.hpp"
 #include "tetra/arena.hpp"
+#include "tetra/stats.hpp"
+#include "tetra/gpu_evaluator.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -204,6 +206,10 @@ int cmd_selfplay(int argc, char** argv) {
     std::printf("pieces / second  %.2f\n", seconds > 0 ? placed / seconds : 0.0);
     std::printf("attack / second  %.3f\n",
                 seconds > 0 ? static_cast<double>(p.lines_sent()) / seconds : 0.0);
+    std::printf("APM              %.2f\n",
+                attacks_per_minute(p.lines_sent(), p.now(), cfg));
+    std::printf("APP              %.3f\n",
+                attacks_per_piece(p.lines_sent(), placed));
     std::printf("alive            %d (%s)\n", p.alive() ? 1 : 0, topout_name(p.topout_reason()));
     std::printf("final board:\n%s\n", p.board().to_string().c_str());
     return 0;
@@ -487,6 +493,9 @@ int cmd_selfplay_gen(int argc, char** argv) {
     cfg.search.max_depth = 6;
     cfg.search.use_gumbel = true;
     cfg.search.batch_size = 16;
+    cfg.search.root_noise_fraction = 0.25f;
+    cfg.search.root_noise_alpha = 0.3f;
+    cfg.search.determinizations = 2;
     cfg.garbage_style = GarbageStyle::Steady;
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
@@ -497,8 +506,8 @@ int cmd_selfplay_gen(int argc, char** argv) {
 
     std::printf("ruleset %s (%s), %d games x %d pieces, %d sims\n\n", rules.id.c_str(),
                 rules.hash_hex().c_str(), games, pieces, sims);
-    std::printf("%5s %8s %8s %7s %7s %8s %s\n", "game", "pieces", "cleared", "sent", "recv",
-                "outcome", "result");
+    std::printf("%5s %8s %8s %7s %7s %7s %6s %8s %s\n", "game", "pieces", "cleared",
+                "sent", "recv", "APM", "APP", "outcome", "result");
 
     int total_pieces = 0, survived = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -507,9 +516,14 @@ int cmd_selfplay_gen(int argc, char** argv) {
         auto samples = worker.play(rules, static_cast<std::uint64_t>(g), &st);
         total_pieces += st.pieces;
         if (st.survived) ++survived;
-        std::printf("%5d %8d %8d %7d %7d %+8.0f %s\n", g, st.pieces, st.lines_cleared,
-                    st.lines_sent, st.lines_received, static_cast<double>(st.outcome),
-                    st.survived ? "truncated" : topout_name(st.topout));
+        const char* result = st.outcome > 0.5f ? "win" :
+                             (st.outcome < -0.5f ? "loss" : "draw/truncated");
+        std::printf("%5d %8d %8d %7d %7d %7.1f %6.3f %+8.0f %s\n", g, st.pieces,
+                    st.lines_cleared, st.lines_sent, st.lines_received,
+                    attacks_per_minute(st.lines_sent, st.duration, rules),
+                    attacks_per_piece(st.lines_sent, st.pieces),
+                    static_cast<double>(st.outcome),
+                    result);
         buffer.push_game(std::move(samples));
     }
     const double secs =
@@ -562,10 +576,13 @@ int cmd_export(int argc, char** argv) {
     cfg.search.max_depth = 6;
     cfg.search.use_gumbel = true;
     cfg.search.batch_size = 16;
+    cfg.search.root_noise_fraction = 0.25f;
+    cfg.search.root_noise_alpha = 0.3f;
+    cfg.search.determinizations = 2;
     cfg.garbage_style = GarbageStyle::Steady;
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
-    cfg.truncation_is_draw = false;
+    cfg.truncation_is_draw = true;
 
     SelfPlayWorker worker(*ev, cfg);
     ReplayBuffer buffer(1000000);
@@ -643,8 +660,148 @@ int cmd_play(int argc, char** argv) {
     std::printf("pieces     %d\n", st.pieces);
     std::printf("cleared    %d\n", st.lines_cleared);
     std::printf("sent       %d\n", st.lines_sent);
+    std::printf("received   %d\n", st.lines_received);
     std::printf("result     %s\n", st.survived ? "survived" : topout_name(st.topout));
+    std::printf("APM        %.2f\n",
+                attacks_per_minute(st.lines_sent, st.duration, rules));
+    std::printf("APP        %.3f\n", attacks_per_piece(st.lines_sent, st.pieces));
     std::printf("speed      %.1f placements/s\n", secs > 0 ? st.pieces / secs : 0.0);
+    return 0;
+}
+
+// Binary child process used by trainer/gpu_match.py.  stdout is reserved for
+// the protocol; diagnostics must stay off the stream or the parent cannot
+// decode the next frame.
+int cmd_gpu_play_protocol(int argc, char** argv) {
+    const int pieces = (argc > 2) ? std::atoi(argv[2]) : 100;
+    const int sims = (argc > 3) ? std::atoi(argv[3]) : 16;
+    const int batch = (argc > 4) ? std::atoi(argv[4]) : 16;
+    const std::uint64_t seed = (argc > 5) ? std::strtoull(argv[5], nullptr, 10) : 1;
+    const int determinizations = (argc > 6) ? std::atoi(argv[6]) : 1;
+    const bool use_gumbel = (argc > 7) ? std::atoi(argv[7]) != 0 : false;
+    enable_gpu_protocol_stdio();
+
+    const RulesetConfig rules = RulesetConfig::tetra_league();
+    SelfPlayConfig cfg;
+    cfg.max_pieces = std::max(1, pieces);
+    cfg.search.simulations = std::max(1, sims);
+    cfg.search.max_depth = 6;
+    cfg.search.use_gumbel = use_gumbel;
+    cfg.search.batch_size = std::max(1, batch);
+    cfg.search.root_noise_fraction = 0.25f;
+    cfg.search.root_noise_alpha = 0.3f;
+    cfg.search.determinizations = std::max(1, determinizations);
+    cfg.garbage_style = GarbageStyle::Steady;
+    cfg.garbage_period = 8;
+    cfg.garbage_lines = 2;
+    cfg.truncation_is_draw = true;
+
+    RemoteGpuEvaluator ev(stdin, stdout, cfg.search.batch_size, 0);
+    SelfPlayWorker worker(ev, cfg);
+    SelfPlayStats st;
+    worker.play(rules, seed, &st);
+    write_gpu_game_result(stdout, st.pieces, st.lines_cleared, st.lines_sent,
+                          st.lines_received, st.survived, static_cast<int>(st.topout),
+                          rules.tick_rate, st.outcome, st.duration, ev.positions_evaluated(),
+                          ev.batches_issued());
+    return 0;
+}
+
+// GPU-backed self-play data generation.  The child owns the rules, search and
+// compact dataset; trainer/gpu_selfplay.py only serves batched network calls.
+int cmd_gpu_export_protocol(int argc, char** argv) {
+    const std::string path = (argc > 2) ? argv[2] : "train.tetradat";
+    const int games = (argc > 3) ? std::atoi(argv[3]) : 10;
+    const int pieces = (argc > 4) ? std::atoi(argv[4]) : 100;
+    const int sims = (argc > 5) ? std::atoi(argv[5]) : 32;
+    const int batch = (argc > 6) ? std::atoi(argv[6]) : 16;
+    const std::uint64_t seed =
+        (argc > 7) ? std::strtoull(argv[7], nullptr, 10) : 1;
+    const std::uint32_t model_version =
+        (argc > 8) ? static_cast<std::uint32_t>(std::strtoul(argv[8], nullptr, 10)) : 1;
+    const int determinizations = (argc > 9) ? std::atoi(argv[9]) : 2;
+    const bool use_gumbel = (argc > 10) ? std::atoi(argv[10]) != 0 : true;
+    enable_gpu_protocol_stdio();
+
+    const RulesetConfig rules = RulesetConfig::tetra_league();
+    SelfPlayConfig cfg;
+    cfg.max_pieces = std::max(1, pieces);
+    cfg.model_version = model_version;
+    cfg.search.simulations = std::max(1, sims);
+    cfg.search.max_depth = 6;
+    cfg.search.use_gumbel = use_gumbel;
+    cfg.search.batch_size = std::max(1, batch);
+    cfg.search.root_noise_fraction = 0.25f;
+    cfg.search.root_noise_alpha = 0.3f;
+    cfg.search.determinizations = std::max(1, determinizations);
+    cfg.garbage_style = GarbageStyle::Steady;
+    cfg.garbage_period = 8;
+    cfg.garbage_lines = 2;
+    cfg.truncation_is_draw = true;
+
+    RemoteGpuEvaluator ev(stdin, stdout, cfg.search.batch_size, 0);
+    SelfPlayWorker worker(ev, cfg);
+    ReplayBuffer buffer(static_cast<size_t>(std::max(1, games)) *
+                        static_cast<size_t>(std::max(1, pieces)));
+    for (int g = 0; g < std::max(1, games); ++g) {
+        SelfPlayStats st;
+        buffer.push_game(worker.play(rules, seed + static_cast<std::uint64_t>(g), &st));
+        write_gpu_game_result(stdout, st.pieces, st.lines_cleared, st.lines_sent,
+                              st.lines_received, st.survived,
+                              static_cast<int>(st.topout), rules.tick_rate, st.outcome,
+                              st.duration, ev.positions_evaluated(), ev.batches_issued());
+    }
+
+    // GPU self-play records only player 0's samples while player 1 still
+    // changes the incoming-garbage state.  Compact Replay+ metadata does not
+    // contain that opponent event stream, so its standalone reconstruction
+    // cannot reproduce these observations reliably.  Keep the already
+    // tokenized samples in the rectangular v1 format for this path.
+    if (!export_buffer(path, buffer, model_version, 0, 0, false))
+        throw std::runtime_error("GPU self-play dataset export failed");
+    gpu_protocol::write_exact(stdout, gpu_protocol::EXPORT_MAGIC,
+                              sizeof(gpu_protocol::EXPORT_MAGIC));
+    gpu_protocol::write_u32(stdout, static_cast<std::uint32_t>(std::max(1, games)));
+    gpu_protocol::write_u32(stdout, static_cast<std::uint32_t>(buffer.size()));
+    gpu_protocol::write_u64(stdout, ev.positions_evaluated());
+    gpu_protocol::write_u64(stdout, ev.batches_issued());
+    if (std::fflush(stdout) != 0) throw std::runtime_error("GPU export flush failed");
+    return 0;
+}
+
+// GPU-backed Arena.  The C++ side still owns the paired-game protocol and
+// simulator; Python only supplies candidate (model 0) and champion (model 1)
+// evaluations through the same GPU bridge.
+int cmd_gpu_arena_protocol(int argc, char** argv) {
+    const int pairs = (argc > 2) ? std::atoi(argv[2]) : 10;
+    const int sims = (argc > 3) ? std::atoi(argv[3]) : 16;
+    const int pieces = (argc > 4) ? std::atoi(argv[4]) : 300;
+    const int batch = (argc > 5) ? std::atoi(argv[5]) : 16;
+    const int determinizations = (argc > 6) ? std::atoi(argv[6]) : 1;
+    const bool use_gumbel = (argc > 7) ? std::atoi(argv[7]) != 0 : false;
+    const std::uint64_t base_seed =
+        (argc > 8) ? std::strtoull(argv[8], nullptr, 10) : 42;
+    enable_gpu_protocol_stdio();
+
+    RemoteGpuEvaluator candidate(stdin, stdout, std::max(1, batch), 0);
+    RemoteGpuEvaluator champion(stdin, stdout, std::max(1, batch), 1);
+
+    ArenaConfig cfg;
+    cfg.pairs = std::max(1, pairs);
+    cfg.max_pieces = std::max(1, pieces);
+    cfg.search.simulations = std::max(1, sims);
+    cfg.search.max_depth = 6;
+    cfg.search.use_gumbel = use_gumbel;
+    cfg.search.batch_size = std::max(1, batch);
+    cfg.search.determinizations = std::max(1, determinizations);
+
+    Arena arena(candidate, champion, cfg);
+    const ArenaResult r = arena.evaluate(RulesetConfig::tetra_league(), base_seed);
+    write_gpu_arena_result(
+        stdout, static_cast<std::uint32_t>(r.games_played),
+        static_cast<std::uint32_t>(r.candidate_wins),
+        static_cast<std::uint32_t>(r.champion_wins), static_cast<std::uint32_t>(r.draws),
+        r.win_rate, r.ci_lower, r.ci_upper, r.promoted);
     return 0;
 }
 
@@ -672,6 +829,7 @@ int cmd_arena(int argc, char** argv) {
     cfg.search.max_depth = 6;
     cfg.search.use_gumbel = true;
     cfg.search.batch_size = 16;
+    cfg.search.determinizations = 2;
 
     std::printf("Arena: Candidate (%s) vs Champion (%s)\n", cand_name.c_str(),
                 champ_name.c_str());
@@ -684,15 +842,21 @@ int cmd_arena(int argc, char** argv) {
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-    std::printf("%4s  %8s  %7s  %7s  %8s  %7s  %7s  %5s\n", "pair", "seed", "c_pcs", "c_sent",
-                "h_pcs", "h_sent", "mirror", "score");
+    std::printf("%4s  %8s  %7s  %7s  %6s  %6s  %7s  %7s  %6s  %6s  %7s  %5s\n",
+                "pair", "seed", "c_pcs", "c_sent", "c_apm", "c_app", "h_pcs", "h_sent",
+                "h_apm", "h_app", "mirror", "score");
     for (size_t i = 0; i < r.games.size(); ++i) {
         const auto& g = r.games[i];
-        std::printf("%4d  %016llx  %7d  %7lld  %7d  %7lld  %7s  %5.1f\n", g.pair_index,
-                    static_cast<unsigned long long>(g.seed), g.candidate_pieces,
-                    static_cast<long long>(g.candidate_sent), g.champion_pieces,
-                    static_cast<long long>(g.champion_sent), g.is_mirrored ? "yes" : "no",
-                    static_cast<double>(g.candidate_score));
+        const RulesetConfig stats_rules = RulesetConfig::tetra_league();
+        std::printf("%4d  %016llx  %7d  %7lld  %6.1f  %6.3f  %7d  %7lld  %6.1f  %6.3f  %7s  %5.1f\n",
+                    g.pair_index, static_cast<unsigned long long>(g.seed), g.candidate_pieces,
+                    static_cast<long long>(g.candidate_sent),
+                    attacks_per_minute(g.candidate_sent, g.candidate_duration, stats_rules),
+                    attacks_per_piece(g.candidate_sent, g.candidate_pieces),
+                    g.champion_pieces, static_cast<long long>(g.champion_sent),
+                    attacks_per_minute(g.champion_sent, g.champion_duration, stats_rules),
+                    attacks_per_piece(g.champion_sent, g.champion_pieces),
+                    g.is_mirrored ? "yes" : "no", static_cast<double>(g.candidate_score));
     }
 
     std::printf("\nResult over %d games in %.1f s:\n", r.games_played, secs);
@@ -737,6 +901,9 @@ int cmd_decode_dataset(int argc, char** argv) {
         return 0;
     }
 
+    // Python consumes this branch as a binary pipe.  Windows otherwise
+    // translates every 0x0a byte to CRLF and silently corrupts the tensors.
+    enable_gpu_protocol_stdio();
     const size_t nw = std::fwrite(v1_bytes.data(), 1, v1_bytes.size(), stdout);
     std::fflush(stdout);
     if (nw != v1_bytes.size()) return 1;
@@ -756,6 +923,10 @@ void usage() {
         "  selfplay-gen [games] [pieces] [sims]\n"
         "  export <file> [games] [pieces] [sims] [--weights ...]\n"
         "  play <weights.tetrawts|--weights=...> [pieces] [sims]\n"
+        "  gpu-play-protocol [pieces] [sims] [batch] [seed] [determinizations] [gumbel]\n"
+        "  gpu-export-protocol <file> [games] [pieces] [sims] [batch] [seed] [model_version] "
+        "[determinizations] [gumbel]\n"
+        "  gpu-arena-protocol [pairs] [sims] [pieces] [batch] [determinizations] [gumbel] [seed]\n"
         "  arena <candidate> [champion=heuristic] [pairs] [sims] [pieces]\n"
         "  decode-dataset <input.tetradat> [output.tetradat]\n"
         "  bench [iterations]\n"
@@ -780,6 +951,9 @@ int main(int argc, char** argv) {
     if (cmd == "selfplay-gen") return cmd_selfplay_gen(argc, argv);
     if (cmd == "export") return cmd_export(argc, argv);
     if (cmd == "play") return cmd_play(argc, argv);
+    if (cmd == "gpu-play-protocol") return cmd_gpu_play_protocol(argc, argv);
+    if (cmd == "gpu-export-protocol") return cmd_gpu_export_protocol(argc, argv);
+    if (cmd == "gpu-arena-protocol") return cmd_gpu_arena_protocol(argc, argv);
     if (cmd == "arena") return cmd_arena(argc, argv);
     if (cmd == "decode-dataset") return cmd_decode_dataset(argc, argv);
     if (cmd == "bench") return cmd_bench(argc, argv);

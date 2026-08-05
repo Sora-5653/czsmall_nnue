@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <unordered_map>
 #include <vector>
 
@@ -116,6 +117,11 @@ struct SearchNode {
     // Game state at this node. Copying a Player costs ~0.24 us, which is
     // negligible beside evaluation, and it keeps the tree free of undo logic.
     Player state;
+    // In a 1v1 search this is the other board at the same event time. The
+    // active player is kept in `state`; children swap the two clocks when the
+    // opponent is next to act.
+    Player opponent;
+    bool has_opponent = false;
     std::vector<PlacementAction> actions;
 
     std::vector<float> prior;
@@ -153,9 +159,16 @@ public:
     // requested, the search is repeated over independently sampled futures and
     // the visit distributions are averaged -- the particle form of the chance
     // node in spec 11.3.
-    SearchResult search(const Player& root_state) {
+    SearchResult search(const Player& root_state, const Player* opponent_state = nullptr,
+                        Evaluator* opponent_evaluator = nullptr,
+                        bool deliver_attacks = true) {
+        root_player_index_ = root_state.index();
+        has_opponent_ = opponent_state != nullptr;
+        opponent_eval_ = opponent_evaluator ? opponent_evaluator : &eval_;
+        deliver_attacks_ = has_opponent_ && deliver_attacks;
+
         if (!cfg_.determinize_root || cfg_.determinizations <= 1)
-            return search_once(root_state, cfg_.seed);
+            return search_once(root_state, opponent_state, cfg_.seed);
 
         SearchResult combined;
         std::vector<double> policy_sum;
@@ -163,8 +176,9 @@ public:
         int runs = 0;
 
         for (int d = 0; d < cfg_.determinizations; ++d) {
-            const SearchResult r =
-                search_once(root_state, cfg_.seed + static_cast<std::uint64_t>(d) * 0x9E3779B9ull);
+            const SearchResult r = search_once(
+                root_state, opponent_state,
+                cfg_.seed + static_cast<std::uint64_t>(d) * 0x9E3779B9ull);
             if (r.best_action < 0) continue;
             if (policy_sum.empty()) {
                 policy_sum.assign(r.search_policy.size(), 0.0);
@@ -176,7 +190,7 @@ public:
             value_sum += r.value.scalar();
             ++runs;
         }
-        if (runs == 0) return search_once(root_state, cfg_.seed);
+        if (runs == 0) return search_once(root_state, opponent_state, cfg_.seed);
 
         combined.search_policy.assign(policy_sum.size(), 0.0f);
         int best = 0;
@@ -191,7 +205,8 @@ public:
     }
 
 private:
-    SearchResult search_once(const Player& root_state, std::uint64_t seed) {
+    SearchResult search_once(const Player& root_state, const Player* opponent_state,
+                             std::uint64_t seed) {
         nodes_.clear();
         tt_.clear();
         rng_.reseed(seed);
@@ -199,9 +214,18 @@ private:
 
         // Determinize: never let the tree read pieces the player cannot see.
         Player rooted = root_state;
-        if (cfg_.determinize_root) rooted.determinize(seed ^ 0xC0FFEEull);
+        Player rooted_opponent;
+        const Player* opponent = nullptr;
+        if (opponent_state) {
+            rooted_opponent = *opponent_state;
+            opponent = &rooted_opponent;
+        }
+        if (cfg_.determinize_root) {
+            rooted.determinize(seed ^ 0xC0FFEEull);
+            if (opponent) rooted_opponent.determinize(seed ^ 0xA11CEull);
+        }
 
-        const std::int32_t root = create_node(rooted);
+        const std::int32_t root = create_node(rooted, opponent);
         if (nodes_[root].terminal || nodes_[root].actions.empty()) {
             result.value = ValueWDL::from_scalar(nodes_[root].terminal_value);
             return result;
@@ -227,15 +251,50 @@ public:
 
 private:
     // --- node construction -------------------------------------------------
-    std::int32_t create_node(const Player& state) {
+    float terminal_value_for(const Player& state, const Player* opponent,
+                             bool current_player_lost = false) const {
+        if (!opponent) return -1.0f;
+        if (current_player_lost)
+            return state.index() == root_player_index_ ? -1.0f : 1.0f;
+
+        const bool root_alive = state.index() == root_player_index_ ? state.alive()
+                                                                      : opponent->alive();
+        const bool other_alive = state.index() == root_player_index_ ? opponent->alive()
+                                                                       : state.alive();
+        if (root_alive && !other_alive) return 1.0f;
+        if (!root_alive && other_alive) return -1.0f;
+        return 0.0f;
+    }
+
+    std::int32_t make_terminal(const Player& state, const Player* opponent,
+                               bool current_player_lost) {
         const std::int32_t idx = static_cast<std::int32_t>(nodes_.size());
         nodes_.emplace_back();
         detail::SearchNode& n = nodes_.back();
         n.state = state;
+        if (opponent) {
+            n.has_opponent = true;
+            n.opponent = *opponent;
+        }
+        n.terminal = true;
+        n.terminal_value = terminal_value_for(state, opponent, current_player_lost);
+        return idx;
+    }
 
-        if (!state.alive()) {
+    std::int32_t create_node(const Player& state, const Player* opponent = nullptr) {
+        const std::int32_t idx = static_cast<std::int32_t>(nodes_.size());
+        nodes_.emplace_back();
+        detail::SearchNode& n = nodes_.back();
+        n.state = state;
+        if (opponent) {
+            n.has_opponent = true;
+            n.opponent = *opponent;
+        }
+
+        const Player* other = n.has_opponent ? &n.opponent : nullptr;
+        if (!state.alive() || (other && !other->alive())) {
             n.terminal = true;
-            n.terminal_value = -1.0f;  // topping out is a loss
+            n.terminal_value = terminal_value_for(state, other);
             return idx;
         }
 
@@ -246,7 +305,8 @@ private:
                                       cfg);
         if (n.actions.empty()) {
             n.terminal = true;
-            n.terminal_value = -1.0f;  // nowhere to put the piece
+            n.terminal_value = terminal_value_for(state, other,
+                                                  /*current_player_lost=*/true);
         }
         return idx;
     }
@@ -255,11 +315,23 @@ private:
         detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
         if (n.expanded || n.terminal) return;
 
-        const Observation obs = observe(n.state);
-        const Evaluation ev = eval_.evaluate_one(obs, n.actions);
+        const Observation obs = n.has_opponent ? observe(n.state, &n.opponent)
+                                                : observe(n.state);
+        const Evaluation ev = evaluator_for(n)->evaluate_one(obs, n.actions);
         ++eval_calls_;
         positions_evaluated_ += 1;
         apply_evaluation(idx, ev);
+    }
+
+    Evaluator* evaluator_for(const detail::SearchNode& n) {
+        if (n.has_opponent && n.state.index() != root_player_index_)
+            return opponent_eval_ ? opponent_eval_ : &eval_;
+        return &eval_;
+    }
+
+    float root_perspective_value(const detail::SearchNode& n, float value) const {
+        if (n.has_opponent && n.state.index() != root_player_index_) return -value;
+        return value;
     }
 
     void apply_evaluation(std::int32_t idx, const Evaluation& ev) {
@@ -310,6 +382,7 @@ private:
         std::int32_t leaf = -1;
         std::vector<std::pair<std::int32_t, int>> path;  // (node, action)
         Observation obs;
+        Evaluator* evaluator = nullptr;
     };
 
     // Walk from the root to a leaf, applying virtual loss along the way.
@@ -327,11 +400,13 @@ private:
             }
             if (!n.expanded) {
                 out.leaf = idx;
-                out.obs = observe(n.state);
+                out.obs = n.has_opponent ? observe(n.state, &n.opponent)
+                                         : observe(n.state);
+                out.evaluator = evaluator_for(n);
                 return true;
             }
             if (depth >= cfg_.max_depth) {
-                backup(out.path, n.leaf_value);
+                backup(out.path, root_perspective_value(n, n.leaf_value));
                 return false;
             }
 
@@ -349,48 +424,67 @@ private:
         }
     }
 
+    std::int32_t intern_node(const Player& state, const Player* opponent) {
+        if (!cfg_.use_transposition_table) return create_node(state, opponent);
+
+        const std::uint64_t key = position_key(state, opponent);
+        auto it = tt_.find(key);
+        if (it != tt_.end()) {
+            ++tt_hits_;
+            return it->second;
+        }
+        const std::int32_t idx = create_node(state, opponent);
+        tt_.emplace(key, idx);
+        return idx;
+    }
+
     // Apply an action to a copy of the node's state, producing a child node.
     std::int32_t apply_action(std::int32_t parent, int action) {
-        Player next = nodes_[static_cast<size_t>(parent)].state;
-        const PlacementAction& a = nodes_[static_cast<size_t>(parent)].actions[
+        const detail::SearchNode& parent_node = nodes_[static_cast<size_t>(parent)];
+        Player next = parent_node.state;
+        Player other;
+        const bool has_opponent = parent_node.has_opponent;
+        if (has_opponent) other = parent_node.opponent;
+        const PlacementAction& a = parent_node.actions[
             static_cast<size_t>(action)];
 
         if (a.use_hold && !next.do_hold()) {
             // Hold was refused: treat as a dead end rather than silently
             // playing a different move.
-            const std::int32_t idx = static_cast<std::int32_t>(nodes_.size());
-            nodes_.emplace_back();
-            nodes_.back().state = next;
-            nodes_.back().terminal = true;
-            nodes_.back().terminal_value = -1.0f;
-            return idx;
+            return make_terminal(next, has_opponent ? &other : nullptr,
+                                 /*current_player_lost=*/true);
         }
         next.set_active(a.piece_state());
         int outgoing = 0;
-        next.lock_piece(a.total_duration(), &outgoing);
+        const LockResult locked = next.lock_piece(a.total_duration(), &outgoing);
+        if (!locked.ok && !locked.topped_out)
+            return make_terminal(next, has_opponent ? &other : nullptr,
+                                 /*current_player_lost=*/true);
 
-        // Transposition table (spec 11.1): the key must include the ruleset and
-        // the clock, because the same board at a different time is a different
-        // position once garbage timing matters.
-        if (cfg_.use_transposition_table) {
-            const std::uint64_t key = position_key(next);
-            auto it = tt_.find(key);
-            if (it != tt_.end()) {
-                ++tt_hits_;
-                return it->second;
-            }
-            const std::int32_t idx = create_node(next);
-            tt_.emplace(key, idx);
-            return idx;
+        // Search must use the same event protocol as Arena/self-play: an
+        // attack is delivered to the other board, then the next actor is the
+        // board whose clock is earlier. The caller can disable delivery for
+        // the explicit single-board/no-garbage curriculum.
+        if (has_opponent && deliver_attacks_ && outgoing > 0 && other.alive())
+            other.receive_attack(outgoing, next.now(), next.index());
+
+        if (has_opponent) {
+            const bool other_next =
+                other.now() < next.now() ||
+                (other.now() == next.now() && other.index() < next.index());
+            if (other.alive() && next.alive() && other_next)
+                return intern_node(other, &next);
+            return intern_node(next, &other);
         }
-        return create_node(next);
+        return intern_node(next, nullptr);
     }
 
-    static std::uint64_t position_key(const Player& p) {
-        std::uint64_t h = detail::board_hash(p.board());
+    static void mix_player_key(std::uint64_t& h, const Player& p) {
         auto mix = [&h](std::uint64_t v) {
             h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
         };
+        mix(static_cast<std::uint64_t>(p.index()));
+        mix(detail::board_hash(p.board()));
         mix(p.ruleset().hash());
         mix(static_cast<std::uint64_t>(p.now()));
         mix(static_cast<std::uint64_t>(p.active().type));
@@ -398,13 +492,29 @@ private:
         mix(static_cast<std::uint64_t>(p.attack_state().combo + 1));
         mix(static_cast<std::uint64_t>(p.attack_state().b2b_streak));
         mix(static_cast<std::uint64_t>(p.garbage().total_lines()));
+        for (const auto& g : p.garbage().entries()) {
+            mix(static_cast<std::uint64_t>(g.lines));
+            mix(static_cast<std::uint64_t>(g.arrival_at));
+            mix(static_cast<std::uint64_t>(g.activation_at));
+        }
         for (Piece n : p.visible_next()) mix(static_cast<std::uint64_t>(n));
+    }
+
+    static std::uint64_t position_key(const Player& p, const Player* opponent) {
+        std::uint64_t h = 0xCBF29CE484222325ull;
+        mix_player_key(h, p);
+        if (opponent) {
+            h ^= 0xD6E8FEB86659FD93ull;
+            mix_player_key(h, *opponent);
+        }
         return h;
     }
 
     void backup(const std::vector<std::pair<std::int32_t, int>>& path, float value) {
-        // The value is from the mover's point of view at the leaf. This is a
-        // single-board search (spec 11.1), so there is no sign flip per ply.
+        // Values have already been converted to the root player's point of
+        // view before reaching this function. In a two-board tree this is
+        // what makes an opponent leaf a minimizing node without changing the
+        // single-board path representation.
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             detail::SearchNode& n = nodes_[static_cast<size_t>(it->first)];
             const size_t a = static_cast<size_t>(it->second);
@@ -454,26 +564,49 @@ private:
 
     // Evaluate a batch of leaves and back the results up.
     void flush(std::vector<Pending>& batch) {
-        std::vector<EvalRequest> requests;
-        requests.reserve(batch.size());
-        for (const auto& p : batch)
-            requests.push_back(
-                EvalRequest{&p.obs, &nodes_[static_cast<size_t>(p.leaf)].actions});
-
-        std::vector<Evaluation> out;
-        eval_.evaluate(requests, out);
-        ++eval_calls_;
-        positions_evaluated_ += static_cast<int>(batch.size());
-
+        struct Group {
+            Evaluator* evaluator = nullptr;
+            std::vector<size_t> items;
+        };
+        std::vector<Group> groups;
         for (size_t i = 0; i < batch.size(); ++i) {
-            const std::int32_t leaf = batch[i].leaf;
-            // The same leaf can appear twice in one batch via a transposition;
-            // applying the evaluation twice is harmless but wasteful, so skip.
-            if (!nodes_[static_cast<size_t>(leaf)].expanded && i < out.size())
-                apply_evaluation(leaf, out[i]);
-            const float v = (i < out.size()) ? out[i].value.scalar()
-                                             : nodes_[static_cast<size_t>(leaf)].leaf_value;
-            backup(batch[i].path, v);
+            Evaluator* evaluator = batch[i].evaluator ? batch[i].evaluator : &eval_;
+            auto it = std::find_if(groups.begin(), groups.end(),
+                                   [&](const Group& g) { return g.evaluator == evaluator; });
+            if (it == groups.end()) {
+                groups.push_back(Group{evaluator, {}});
+                it = std::prev(groups.end());
+            }
+            it->items.push_back(i);
+        }
+
+        for (auto& group : groups) {
+            std::vector<EvalRequest> requests;
+            requests.reserve(group.items.size());
+            for (size_t item : group.items) {
+                const Pending& p = batch[item];
+                requests.push_back(
+                    EvalRequest{&p.obs, &nodes_[static_cast<size_t>(p.leaf)].actions});
+            }
+
+            std::vector<Evaluation> out;
+            group.evaluator->evaluate(requests, out);
+            ++eval_calls_;
+            positions_evaluated_ += static_cast<int>(group.items.size());
+
+            for (size_t j = 0; j < group.items.size(); ++j) {
+                const size_t item = group.items[j];
+                const std::int32_t leaf = batch[item].leaf;
+                // The same leaf can appear twice in one batch via a
+                // transposition; applying the evaluation twice is harmless but
+                // wasteful, so skip.
+                if (!nodes_[static_cast<size_t>(leaf)].expanded && j < out.size())
+                    apply_evaluation(leaf, out[j]);
+                const float v = (j < out.size()) ? out[j].value.scalar()
+                                                 : nodes_[static_cast<size_t>(leaf)].leaf_value;
+                backup(batch[item].path,
+                       root_perspective_value(nodes_[static_cast<size_t>(leaf)], v));
+            }
         }
     }
 
@@ -582,11 +715,13 @@ private:
             }
             if (!n.expanded) {
                 out.leaf = idx;
-                out.obs = observe(n.state);
+                out.obs = n.has_opponent ? observe(n.state, &n.opponent)
+                                         : observe(n.state);
+                out.evaluator = evaluator_for(n);
                 return true;
             }
             if (depth >= cfg_.max_depth) {
-                backup(out.path, n.leaf_value);
+                backup(out.path, root_perspective_value(n, n.leaf_value));
                 return false;
             }
             const int a = select_puct(n);
@@ -742,6 +877,10 @@ private:
     int eval_calls_ = 0;
     int positions_evaluated_ = 0;
     int tt_hits_ = 0;
+    int root_player_index_ = 0;
+    bool has_opponent_ = false;
+    bool deliver_attacks_ = false;
+    Evaluator* opponent_eval_ = nullptr;
 };
 
 }  // namespace tetra

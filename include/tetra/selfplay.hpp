@@ -6,10 +6,11 @@
 // can be attached: with it, "swap in a TetraFormer" is an Evaluator change and
 // nothing else has to move.
 //
-// Garbage handling follows spec 13.3: rather than requiring a second player,
-// the opponent is modelled as a stochastic attack process. That is deliberate
-// -- it lets the single-board curriculum run before M4 exists, and it exercises
-// the pending-garbage and timing state the bot must learn to reason about.
+// Self-play is a real two-board event-driven game. The board whose clock is
+// earlier acts, outgoing attacks are delivered to the other board, and the
+// same pair of states is handed to the search and the observation layer. The
+// garbage style flag remains as the explicit switch for no-attack curriculum
+// runs and as replay provenance; it is no longer a hidden third opponent.
 #pragma once
 
 #include "tetra/replay_buffer.hpp"
@@ -66,8 +67,6 @@ public:
             static_cast<std::uint8_t>(cfg_.garbage_period),
             static_cast<std::uint8_t>(cfg_.garbage_lines));
         Tokenizer tokenizer;
-        Rng garbage_rng(seed ^ 0x5EEDFACEull);
-
         SelfPlayStats stats;
         int p0_pieces = 0;
         int p1_pieces = 0;
@@ -77,8 +76,6 @@ public:
             Player& p_active = p0_turn ? p0 : p1;
             Player& p_inactive = p0_turn ? p1 : p0;
             int& active_pieces = p0_turn ? p0_pieces : p1_pieces;
-
-            maybe_send_garbage(p_active, active_pieces, garbage_rng);
 
             const auto actions =
                 movegen_.generate(p_active.board(), p_active.active().type, p_active.hold(),
@@ -94,8 +91,10 @@ public:
             sc.seed = seed * 0x9E3779B97F4A7C15ull + static_cast<std::uint64_t>(p0_pieces + p1_pieces);
             searcher.set_config(sc);
 
-            const Observation obs = observe(p_active);
-            const SearchResult r = searcher.search(p_active);
+            const Observation obs = observe(p_active, &p_inactive);
+            const SearchResult r = searcher.search(
+                p_active, &p_inactive, &eval_,
+                /*deliver_attacks=*/cfg_.garbage_style != GarbageStyle::None);
             if (r.best_action < 0 ||
                 r.best_action >= static_cast<int>(actions.size())) {
                 p_active.die(TopoutReason::BlockOut);
@@ -184,33 +183,6 @@ public:
 
     const SelfPlayConfig& config() const { return cfg_; }
     void set_config(const SelfPlayConfig& c) { cfg_ = c; }
-
-private:
-    void maybe_send_garbage(Player& p, int move, Rng& rng) {
-        if (cfg_.garbage_style == GarbageStyle::None || move == 0) return;
-        switch (cfg_.garbage_style) {
-            case GarbageStyle::Steady:
-                if (move % cfg_.garbage_period == 0)
-                    p.receive_attack(cfg_.garbage_lines, p.now(), 1);
-                break;
-            case GarbageStyle::FastSmall:
-                if (move % std::max(1, cfg_.garbage_period / 3) == 0)
-                    p.receive_attack(1, p.now(), 1);
-                break;
-            case GarbageStyle::SlowLarge:
-                if (move % (cfg_.garbage_period * 3) == 0)
-                    p.receive_attack(cfg_.garbage_lines * 3, p.now(), 1);
-                break;
-            case GarbageStyle::Burst:
-                // Poisson-ish: a burst with small probability each placement.
-                if (rng.chance(1, std::max(2, cfg_.garbage_period)))
-                    p.receive_attack(
-                        cfg_.garbage_lines + static_cast<int>(rng.below(4)), p.now(), 1);
-                break;
-            case GarbageStyle::None:
-                break;
-        }
-    }
 
     Evaluator& eval_;
     SelfPlayConfig cfg_;

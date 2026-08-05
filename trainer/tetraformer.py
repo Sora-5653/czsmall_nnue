@@ -170,6 +170,16 @@ def losses(model, batch, weights=None):
 
     aux_loss = F.mse_loss(aux, batch["aux_target"])
 
+    # Diagnostics are kept separate from the optimised value loss.  In
+    # particular, value_accuracy makes it obvious when the WDL head is still
+    # at chance even if the policy loss is decreasing.
+    with torch.no_grad():
+        value_prob = torch.softmax(wdl, dim=-1)
+        value_class = value_target.argmax(dim=-1)
+        value_accuracy = (value_prob.argmax(dim=-1) == value_class).float().mean()
+        value_scalar = value_prob[:, 0] - value_prob[:, 2]
+        value_scalar_mse = F.mse_loss(value_scalar, z)
+
     total = (
         weights["policy"] * policy_loss
         + weights["value"] * value_loss
@@ -178,6 +188,8 @@ def losses(model, batch, weights=None):
     return total, {
         "policy": policy_loss.item(),
         "value": value_loss.item(),
+        "value_accuracy": value_accuracy.item(),
+        "value_scalar_mse": value_scalar_mse.item(),
         "aux": aux_loss.item(),
         "total": total.item(),
     }

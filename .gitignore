@@ -17,5 +17,6 @@ build/
 
 # Python
 .venv/
+.venv-rocm713/
 __pycache__/
 trainer/__pycache__/

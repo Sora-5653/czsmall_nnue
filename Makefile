@@ -20,6 +20,7 @@ TEST_BIN := $(BUILD)/tetra_tests
 
 TOOL_SRC := $(wildcard tools/*.cpp)
 TOOL_BIN := $(patsubst tools/%.cpp,$(BUILD)/%,$(TOOL_SRC))
+TOOL_HDR := $(wildcard include/tetra/*.hpp)
 
 .PHONY: all test tools clean fmt
 
@@ -39,7 +40,7 @@ $(BUILD)/tests_%.o: tests/%.cpp | $(BUILD)
 $(TEST_BIN): $(TEST_OBJ) $(OBJ) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(TEST_OBJ) $(OBJ) -o $@ $(LDFLAGS)
 
-$(BUILD)/%: tools/%.cpp $(OBJ) | $(BUILD)
+$(BUILD)/%: tools/%.cpp $(OBJ) $(TOOL_HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< $(OBJ) -o $@ $(LDFLAGS)
 
 tools: $(TOOL_BIN)

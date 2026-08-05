@@ -70,7 +70,7 @@ TEST(arena_promotion_threshold_check) {
     cfg.promotion_threshold = 0.55f;
     Arena arena(ev1, ev2, cfg);
     const ArenaResult r = arena.evaluate(league(), 1);
-    CHECK(r.promoted == (r.win_rate >= cfg.promotion_threshold));
+    CHECK(r.promoted == (r.win_rate >= cfg.promotion_threshold && r.ci_lower > 0.5f));
 }
 
 TEST(arena_is_deterministic) {

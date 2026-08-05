@@ -58,6 +58,34 @@ std::vector<PlacementAction> actions_of(const Player& p) {
                         p.ruleset());
 }
 
+class ObservationSpy final : public Evaluator {
+public:
+    void evaluate(const std::vector<EvalRequest>& batch,
+                  std::vector<Evaluation>& out) override {
+        account(batch.size());
+        for (const auto& req : batch) {
+            if (!req.observation) continue;
+            saw_any = true;
+            saw_opponent = saw_opponent || req.observation->has_opponent;
+            if (req.observation->has_opponent)
+                max_opponent_pending =
+                    std::max(max_opponent_pending, req.observation->opponent_pending_lines);
+        }
+        out.assign(batch.size(), Evaluation{});
+        for (size_t i = 0; i < batch.size(); ++i) {
+            const size_t n = batch[i].actions ? batch[i].actions->size() : 0;
+            out[i].policy.assign(n, n ? 1.0f / static_cast<float>(n) : 0.0f);
+            out[i].value.draw = 1.0f;
+        }
+    }
+
+    std::string name() const override { return "observation-spy"; }
+
+    bool saw_any = false;
+    bool saw_opponent = false;
+    int max_opponent_pending = 0;
+};
+
 }  // namespace
 
 TEST(search_returns_a_legal_action) {
@@ -814,4 +842,29 @@ TEST(queue_reports_hidden_lookahead) {
     q.resample_hidden(9);
     // Still buffered, but now from a resampled future rather than the real one.
     CHECK_EQ(static_cast<int>(q.visible_next().size()), 5);
+}
+
+TEST(two_player_search_passes_the_opponent_to_both_evaluators) {
+    Player p0;
+    Player p1;
+    p0.reset(league(), 1, 0);
+    p1.reset(league(), 2, 1);
+
+    ObservationSpy root_evaluator;
+    ObservationSpy opponent_evaluator;
+    SearchConfig cfg;
+    cfg.simulations = 32;
+    cfg.max_depth = 3;
+    cfg.batch_size = 8;
+    cfg.use_gumbel = false;
+    cfg.determinize_root = false;
+
+    Searcher searcher(root_evaluator, cfg);
+    const SearchResult r = searcher.search(p0, &p1, &opponent_evaluator);
+
+    CHECK(r.best_action >= 0);
+    CHECK(root_evaluator.saw_any);
+    CHECK(root_evaluator.saw_opponent);
+    CHECK(opponent_evaluator.saw_any);
+    CHECK(opponent_evaluator.saw_opponent);
 }

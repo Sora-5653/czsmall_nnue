@@ -198,16 +198,16 @@ TEST(explicit_padding_produces_a_static_shape) {
     // call regardless of what the position happens to contain.
     const auto samples = make_samples(2, 20);
     const auto ptrs = pointers(samples);
-    const TensorBatch b = make_training_batch(ptrs, /*pad_tokens=*/80, /*pad_actions=*/96);
-    CHECK_EQ(b.max_tokens, 80);
+    const TensorBatch b = make_training_batch(ptrs, /*pad_tokens=*/128, /*pad_actions=*/96);
+    CHECK_EQ(b.max_tokens, 128);
     CHECK_EQ(b.max_actions, 96);
     CHECK_EQ(b.tokens.size(),
-             static_cast<size_t>(b.batch) * 80 * TOKEN_FEATURES);
+             static_cast<size_t>(b.batch) * 128 * TOKEN_FEATURES);
     // Content is unchanged; only the trailing padding grew.
     for (int i = 0; i < b.batch; ++i) {
         const size_t n = ptrs[static_cast<size_t>(i)]->tokens.size();
-        CHECK(b.token_mask[static_cast<size_t>(i) * 80] == (n > 0 ? 1.0f : 0.0f));
-        CHECK_EQ(b.token_mask[static_cast<size_t>(i) * 80 + 79], 0.0f);
+        CHECK(b.token_mask[static_cast<size_t>(i) * 128] == (n > 0 ? 1.0f : 0.0f));
+        CHECK_EQ(b.token_mask[static_cast<size_t>(i) * 128 + 127], 0.0f);
     }
 }
 
@@ -397,7 +397,7 @@ TEST(batch_construction_is_deterministic) {
     CHECK(a.value_target == b.value_target);
 }
 
-TEST(compact_dataset_version2_round_trips_and_reconstructs_exact_tokens) {
+TEST(two_player_dataset_preserves_opponent_tokens_in_rectangular_format) {
     HeuristicEvaluator ev;
     SelfPlayConfig cfg;
     cfg.max_pieces = 30;
@@ -419,7 +419,10 @@ TEST(compact_dataset_version2_round_trips_and_reconstructs_exact_tokens) {
     CHECK_MSG(r2.ok, "read v2 failed: " + r2.error);
 
     CHECK_EQ(static_cast<int>(r2.header.samples), static_cast<int>(r1.header.samples));
-    CHECK_EQ(static_cast<int>(r2.header.version), static_cast<int>(DatasetHeader::VERSION_COMPACT));
+    // Compact Replay+ cannot reconstruct the opponent's board/event stream;
+    // requesting compact therefore falls back to rectangular v1 so the
+    // already-masked observation is kept exactly.
+    CHECK_EQ(static_cast<int>(r2.header.version), static_cast<int>(DatasetHeader::VERSION));
     CHECK_EQ(r2.header.ruleset_hash, r1.header.ruleset_hash);
 
     CHECK(r2.batch.tokens == r1.batch.tokens);
@@ -440,7 +443,7 @@ TEST(compact_dataset_version2_round_trips_and_reconstructs_exact_tokens) {
     const long sz2 = std::ftell(f2);
     std::fclose(f2);
 
-    CHECK(sz2 * 20 < sz1);
+    CHECK(sz2 == sz1);
 
     std::remove(v1_path.c_str());
     std::remove(v2_path.c_str());

@@ -113,6 +113,17 @@ inline bool can_export_compact(const std::vector<const TrainingSample*>& samples
     for (const auto* s : samples) {
         if (!s || s->ruleset_hash == 0 || s->chosen_action < 0)
             return false;
+        // Compact Replay+ reconstruction only contains player 0's replay
+        // stream. A two-board sample also contains the opponent board token
+        // stream, which cannot be recovered from that metadata without
+        // replaying the opponent. Keep those samples in rectangular v1,
+        // where the already-masked observation is preserved exactly.
+        for (const auto& token : s->tokens) {
+            if (token.kind == TokenKind::OpponentRow ||
+                token.kind == TokenKind::OpponentColumn ||
+                token.kind == TokenKind::OpponentSummary)
+                return false;
+        }
         seen.push_back({s->game_seed, s->move_number});
     }
     std::sort(seen.begin(), seen.end());
