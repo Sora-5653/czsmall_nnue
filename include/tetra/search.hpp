@@ -432,10 +432,8 @@ private:
 
         while (done < cfg_.simulations) {
             batch.clear();
-            const int want =
-                std::min(cfg_.batch_size, cfg_.simulations - done);
-
-            while (static_cast<int>(batch.size()) < want) {
+            while (static_cast<int>(batch.size()) < cfg_.batch_size &&
+                   done + static_cast<int>(batch.size()) < cfg_.simulations) {
                 Pending p;
                 if (descend(root, p)) {
                     batch.push_back(std::move(p));

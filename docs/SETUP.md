@@ -75,7 +75,7 @@ export HSA_OVERRIDE_GFX_VERSION=12.0.1   # only if detection still fails
 
 ## 2. What is already done
 
-- The engine builds and its 263 tests pass with no dependencies at all.
+- The engine builds and its 270 tests pass with no dependencies at all.
 - Self-play, search, the replay buffer and dataset export are complete.
 - `trainer/` contains the network, the dataset reader and a training loop.
 - The C++ inference path is **numerically verified against PyTorch** to ~1e-7
@@ -93,7 +93,7 @@ in `tests/data/` will be missing. They are fully reproducible from seeds:
 python scripts/make_fixtures.py   # needs torch; regenerates them byte-for-byte
 ```
 
-Without them, `make test` skips the two PyTorch-parity tests and the other 261
+Without them, `make test` skips the two PyTorch-parity tests and the other 268
 still run.
 
 ```sh

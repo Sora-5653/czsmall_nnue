@@ -1,7 +1,8 @@
 # ADR 0003: Movegen is optimised as the MCTS inner loop
 
 ## Status
-Accepted.
+Superseded by the pure-Cobra movegen integration. The measurements below are
+the historical optimization record for the removed project-side generator.
 
 ## Context
 Spec §19.4 sets inference targets of 5 ms for policy-only and 30–50 ms for
@@ -37,3 +38,13 @@ differentially tested against the naive implementation over 5.9M cases.
   left edge (negative `x`) while no filled cell does, so the shift direction
   must be chosen accordingly. This was caught by the differential test and is
   commented at the call site.
+
+## Current implementation
+
+`MoveGenerator` now uses Cobra's fixed standard 10x40 board directly. Cobra's
+`MoveList` enumerates legal targets and an all-target `PathFinder` traversal
+supplies canonical input paths in one pass per piece and input model; the
+removed legacy generator is not used as a fallback. On the same CLI benchmark,
+the pure-Cobra implementation measured **99.0 µs/call**, versus **132.4
+µs/call** for the pre-switch hybrid adapter (20,000 calls, standard 10x40
+field).

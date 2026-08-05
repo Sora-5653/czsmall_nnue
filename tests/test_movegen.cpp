@@ -77,9 +77,13 @@ bool replay(const Board& b, Piece piece, const std::vector<Input>& seq, const Ru
             case Input::Ccw: try_rotate(b, p, rot_ccw(p.rot), cfg); break;
             case Input::Flip: try_rotate(b, p, rot_180(p.rot), cfg); break;
             case Input::SoftDrop: {
-                const int d = hard_drop_distance(b, p);
-                p.y -= d;
-                if (d > 0) { p.last_action = LastAction::Drop; p.last_kick = 0; }
+                ActivePiece q = p;
+                q.y -= 1;
+                if (!collides(b, q)) {
+                    q.last_action = LastAction::Drop;
+                    q.last_kick = 0;
+                    p = q;
+                }
                 break;
             }
             case Input::HardDrop: {
@@ -304,6 +308,22 @@ TEST(movegen_returns_nothing_when_spawn_is_blocked) {
     for (int pi = 0; pi < PIECE_COUNT; ++pi) {
         const auto acts = gen.generate_for_piece(b, static_cast<Piece>(pi), cfg, false);
         CHECK_MSG(acts.empty(), "blocked spawn must yield no legal placements");
+    }
+}
+
+TEST(movegen_rejects_custom_board_geometry) {
+    // Cobra owns the complete move-generation backend, so there is no legacy
+    // generator to fall back to for custom rooms. Unsupported dimensions are
+    // therefore explicitly empty rather than silently using another model.
+    MoveGenerator gen;
+    for (const auto& [width, height, visible] :
+         {std::tuple{6, 40, 20}, std::tuple{10, 24, 12}, std::tuple{10, 40, 10}}) {
+        RulesetConfig cfg = league();
+        cfg.geometry.width = width;
+        cfg.geometry.internal_height = height;
+        cfg.geometry.visible_height = visible;
+        Board b(width, height);
+        CHECK(gen.generate_for_piece(b, Piece::T, cfg, false).empty());
     }
 }
 

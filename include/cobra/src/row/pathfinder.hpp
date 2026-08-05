@@ -27,16 +27,20 @@ using Inputs = std::vector<Input>;
 
 template <typename RulesT, Piece p>
 requires Ruleset<RulesT>
-Inputs get_input(const Board<>& b, const Move& target, const bool useFinesse, const int force = 0) {
+std::vector<std::pair<Move, Inputs>> get_all_input(const Board<>& b, const bool useFinesse,
+                                                   const int force = 0) {
     static_assert(p.is_ok());
     constexpr bool checkTspin = (p == Piece::T) && (RulesT::SPINS == Policy::SpinRule::TSPIN);
     constexpr auto spinMul = checkTspin ? SpinType::size : 1;
     constexpr int SPAWN_Y = RulesT::SPAWN_Y;
-    constexpr auto cSize = Gen::canonical_size<p>();
-    constexpr auto sSize = Gen::search_size<p>();
-
-    if constexpr (!checkTspin)
-        assert(target.spin == SpinType::NONE);
+    // Spell these sizes out locally.  GCC 15 ICEs while substituting the
+    // consteval helper calls here when this pathfinder is instantiated from a
+    // templated move-list callback, even though the same helpers compile in
+    // the move generator.
+    constexpr size_t cSize = (p.value == Piece::O) ? 1 :
+                              ((p.value == Piece::I || p.value == Piece::S ||
+                                p.value == Piece::Z) ? 2 : 4);
+    constexpr size_t sSize = (p.value == Piece::O) ? 1 : 4;
 
     const Gen::SmearedBoard<Board<>, cSize> usable = Gen::usable_map<Board<>, p>(b);
 
@@ -72,6 +76,11 @@ Inputs get_input(const Board<>& b, const Move& target, const bool useFinesse, co
     std::deque<GhostMove> leaf;
     std::vector<PathNode> internal;
     internal.reserve(256);
+    std::vector<std::pair<Move, Inputs>> result;
+    result.reserve(128);
+    std::array<std::array<std::array<std::array<bool, Board<>::H>, Board<>::W>,
+                            Rotation::size>, spinMul>
+        emitted{};
 
     const auto spin_index = [&](const SpinType s) {
         if constexpr (checkTspin)
@@ -112,13 +121,17 @@ Inputs get_input(const Board<>& b, const Move& target, const bool useFinesse, co
                 if (l.y != m.y)
                     l.s = SpinType::NONE;
 
-            if (Gen::canonical_r<p>(l.r) == target.rotation && l.x == target.x && l.y == target.y && l.s == target.spin) {
-                Inputs result;
+            const Rotation canonical = Gen::canonical_r<p>(l.r);
+            const size_t si = spin_index(l.s);
+            const size_t ri = static_cast<size_t>(canonical);
+            if (!emitted[si][ri][static_cast<size_t>(l.x)][static_cast<size_t>(l.y)]) {
+                emitted[si][ri][static_cast<size_t>(l.x)][static_cast<size_t>(l.y)] = true;
+                Inputs path;
                 for (uint16_t i = l.prev; i != GhostMove::root(); i = internal[i].prev)
-                    result.push_back(internal[i].input);
-                std::ranges::reverse(result);
-                result.push_back(Input::HARD_DROP);
-                return result;
+                    path.push_back(internal[i].input);
+                std::ranges::reverse(path);
+                path.push_back(Input::HARD_DROP);
+                result.emplace_back(Move{p, canonical, l.x, l.y, l.s}, std::move(path));
             }
         }
 
@@ -221,10 +234,21 @@ Inputs get_input(const Board<>& b, const Move& target, const bool useFinesse, co
         }
     }
 
+    return result;
+}
+
+template <typename RulesT, Piece p>
+requires Ruleset<RulesT>
+Inputs get_input(const Board<>& b, const Move& target, const bool useFinesse,
+                 const int force = 0) {
+    for (auto& [move, inputs] : get_all_input<RulesT, p>(b, useFinesse, force)) {
+        if (move.rotation == target.rotation && move.x == target.x && move.y == target.y &&
+            move.spin == target.spin)
+            return std::move(inputs);
+    }
     return {};
 }
 
 } // namespace PathFinder
 
 } // namespace Cobra
-
