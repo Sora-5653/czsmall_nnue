@@ -1,10 +1,10 @@
 # TetraFormer / TetraZero -- M0 (rule core) + M1 (movegen/tokenizer) build.
 #
-# Deliberately dependency-free: a stock g++/clang++ with C++17 is all that is
-# required, so the simulator consistency tests (spec 18) can run anywhere.
+# Deliberately dependency-free: a stock g++/clang++ with C++23 is all that is
+# required. The vendored Cobra movegen backend requires C++23.
 
 CXX      ?= g++
-CXXSTD   ?= -std=c++17
+CXXSTD   ?= -std=c++23
 WARN     ?= -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wno-sign-conversion
 OPT      ?= -O2
 DEPFLAGS := -MMD -MP
