@@ -79,6 +79,9 @@ public:
     std::int64_t lines_sent() const { return lines_sent_; }
     std::int64_t lines_received() const { return lines_received_; }
     std::int64_t lines_cleared() const { return lines_cleared_; }
+    std::array<std::uint64_t, 4> garbage_rng_state() const { return garbage_rng_.state(); }
+    std::array<std::uint64_t, 4> attack_rng_state() const { return attack_rng_.state(); }
+    bool mirrored() const { return mirror_board_; }
     std::vector<Piece> visible_next() const { return queue_.visible_next(); }
 
     // --- hold --------------------------------------------------------------

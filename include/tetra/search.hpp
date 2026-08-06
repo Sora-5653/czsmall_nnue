@@ -143,6 +143,97 @@ struct SearchNode {
     size_t size() const { return actions.size(); }
 };
 
+// Full simulator-state key used by the transposition table. This is kept in
+// `detail` so the key contract can be tested without making it part of the
+// public search API. In particular, the board hash used by replay records does
+// not include every piece of scheduling state needed by search.
+inline void mix_search_player_key(std::uint64_t& h, const Player& p) {
+    auto mix = [&h](std::uint64_t v) {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    };
+    mix(static_cast<std::uint64_t>(p.index()));
+    mix(static_cast<std::uint64_t>(p.board().width()));
+    mix(static_cast<std::uint64_t>(p.board().height()));
+    for (int y = 0; y < p.board().height(); ++y) {
+        mix(static_cast<std::uint64_t>(p.board().row(y)));
+        mix(static_cast<std::uint64_t>(p.board().garbage_row(y)));
+    }
+    mix(p.ruleset().hash());
+    mix(static_cast<std::uint64_t>(p.now()));
+
+    const ActivePiece& active = p.active();
+    mix(static_cast<std::uint64_t>(active.type));
+    mix(static_cast<std::uint64_t>(active.rot));
+    mix(static_cast<std::uint64_t>(active.x));
+    mix(static_cast<std::uint64_t>(active.y));
+    mix(static_cast<std::uint64_t>(active.last_action));
+    mix(static_cast<std::uint64_t>(active.last_kick));
+    mix(static_cast<std::uint64_t>(p.hold()));
+    mix(static_cast<std::uint64_t>(p.hold_used()));
+
+    const AttackState& attack = p.attack_state();
+    mix(static_cast<std::uint64_t>(attack.combo + 1));
+    mix(static_cast<std::uint64_t>(attack.b2b_streak));
+    mix(static_cast<std::uint64_t>(attack.surge));
+    mix(static_cast<std::uint64_t>(attack.pieces_placed));
+
+    const auto& garbage = p.garbage().entries();
+    mix(static_cast<std::uint64_t>(garbage.size()));
+    for (const auto& g : garbage) {
+        mix(static_cast<std::uint64_t>(g.lines));
+        mix(static_cast<std::uint64_t>(g.sent_at));
+        mix(static_cast<std::uint64_t>(g.arrival_at));
+        mix(static_cast<std::uint64_t>(g.activation_at));
+        mix(static_cast<std::uint64_t>(g.cancellable));
+        mix(static_cast<std::uint64_t>(g.tankable));
+        mix(static_cast<std::uint64_t>(g.hole_column + 1));
+        mix(static_cast<std::uint64_t>(g.source_player + 1));
+        mix(static_cast<std::uint64_t>(g.rule_metadata));
+    }
+
+    const auto buffered = p.queue().buffered_pieces();
+    mix(static_cast<std::uint64_t>(buffered.size()));
+    for (Piece piece : buffered) mix(static_cast<std::uint64_t>(piece));
+    const auto bag = p.queue().bag_remaining();
+    mix(static_cast<std::uint64_t>(bag.size()));
+    for (Piece piece : bag) mix(static_cast<std::uint64_t>(piece));
+    mix(p.queue().pieces_generated());
+    mix(static_cast<std::uint64_t>(p.queue().mirrored()));
+    for (std::uint64_t word : p.queue().rng().state()) mix(word);
+    for (std::uint64_t word : p.garbage_rng_state()) mix(word);
+    for (std::uint64_t word : p.attack_rng_state()) mix(word);
+    mix(static_cast<std::uint64_t>(p.mirrored()));
+
+    mix(static_cast<std::uint64_t>(p.alive()));
+    mix(static_cast<std::uint64_t>(p.topout_reason()));
+    mix(static_cast<std::uint64_t>(p.lines_sent()));
+    mix(static_cast<std::uint64_t>(p.lines_received()));
+    mix(static_cast<std::uint64_t>(p.lines_cleared()));
+
+    const auto& events = p.events().events();
+    mix(static_cast<std::uint64_t>(events.size()));
+    for (const auto& e : events) {
+        mix(static_cast<std::uint64_t>(e.timestamp));
+        mix(static_cast<std::uint64_t>(e.timestamp_delta));
+        mix(static_cast<std::uint64_t>(e.actor));
+        mix(static_cast<std::uint64_t>(e.type));
+        mix(static_cast<std::uint64_t>(e.piece));
+        mix(static_cast<std::uint64_t>(e.spin));
+        mix(static_cast<std::uint64_t>(e.lines));
+        mix(static_cast<std::uint64_t>(e.duration));
+    }
+}
+
+inline std::uint64_t search_position_key(const Player& p, const Player* opponent) {
+    std::uint64_t h = 0xCBF29CE484222325ull;
+    mix_search_player_key(h, p);
+    if (opponent) {
+        h ^= 0xD6E8FEB86659FD93ull;
+        mix_search_player_key(h, *opponent);
+    }
+    return h;
+}
+
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
@@ -427,7 +518,7 @@ private:
     std::int32_t intern_node(const Player& state, const Player* opponent) {
         if (!cfg_.use_transposition_table) return create_node(state, opponent);
 
-        const std::uint64_t key = position_key(state, opponent);
+        const std::uint64_t key = detail::search_position_key(state, opponent);
         auto it = tt_.find(key);
         if (it != tt_.end()) {
             ++tt_hits_;
@@ -477,37 +568,6 @@ private:
             return intern_node(next, &other);
         }
         return intern_node(next, nullptr);
-    }
-
-    static void mix_player_key(std::uint64_t& h, const Player& p) {
-        auto mix = [&h](std::uint64_t v) {
-            h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-        };
-        mix(static_cast<std::uint64_t>(p.index()));
-        mix(detail::board_hash(p.board()));
-        mix(p.ruleset().hash());
-        mix(static_cast<std::uint64_t>(p.now()));
-        mix(static_cast<std::uint64_t>(p.active().type));
-        mix(static_cast<std::uint64_t>(p.hold()));
-        mix(static_cast<std::uint64_t>(p.attack_state().combo + 1));
-        mix(static_cast<std::uint64_t>(p.attack_state().b2b_streak));
-        mix(static_cast<std::uint64_t>(p.garbage().total_lines()));
-        for (const auto& g : p.garbage().entries()) {
-            mix(static_cast<std::uint64_t>(g.lines));
-            mix(static_cast<std::uint64_t>(g.arrival_at));
-            mix(static_cast<std::uint64_t>(g.activation_at));
-        }
-        for (Piece n : p.visible_next()) mix(static_cast<std::uint64_t>(n));
-    }
-
-    static std::uint64_t position_key(const Player& p, const Player* opponent) {
-        std::uint64_t h = 0xCBF29CE484222325ull;
-        mix_player_key(h, p);
-        if (opponent) {
-            h ^= 0xD6E8FEB86659FD93ull;
-            mix_player_key(h, *opponent);
-        }
-        return h;
     }
 
     void backup(const std::vector<std::pair<std::int32_t, int>>& path, float value) {

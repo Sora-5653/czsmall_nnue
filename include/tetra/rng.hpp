@@ -116,7 +116,15 @@ public:
     // 7-bag game, and the basis for `bag_belief` in the observation.
     std::vector<Piece> bag_remaining() const { return bag_; }
 
+    // Full buffered queue, including the preview and the hidden lookahead.
+    // Search transposition keys use this only to distinguish simulator states;
+    // observations must continue to expose `visible_next()` only.
+    std::vector<Piece> buffered_pieces() const {
+        return std::vector<Piece>(queue_.begin(), queue_.end());
+    }
+
     std::uint64_t pieces_generated() const { return pieces_generated_; }
+    bool mirrored() const { return mirror_; }
     Rng& rng() { return rng_; }
     const Rng& rng() const { return rng_; }
 
