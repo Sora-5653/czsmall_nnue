@@ -174,10 +174,39 @@ TETR.IO.
 
 For larger generations, `trainer/gpu_selfplay.py` keeps the same C++ rules and
 search but serves network evaluations from PyTorch/ROCm. It writes a
-rectangular v1 dataset from the C++ side: two-board self-play records player 0
-while player 1 can change incoming garbage, so compact replay metadata would
-not be sufficient to reconstruct the observations. The script also reports
-the number of GPU-evaluated positions.
+rectangular v1 dataset from the C++ side: two-board self-play records both
+players in chronological order, with each value outcome converted to the
+recorded player's perspective. Because either player's observation includes
+the opponent event stream, compact replay metadata would not be sufficient to
+reconstruct these observations. The script also reports the number of
+GPU-evaluated positions.
+
+### Colab position-generation plan
+
+Colab is reserved for generating additional self-play positions. The local
+machine remains the authority for checkpoint promotion and Arena comparison.
+The planned workflow is:
+
+1. Every Colab instance checks out the same commit and loads the same
+   checkpoint.
+2. Instance `shard_id` runs `trainer/gpu_selfplay.py` with
+   `--seed base_seed + shard_id * games_per_shard`; its games then consume the
+   consecutive seeds in that shard only.
+3. The instance returns its `.tetradat` file and a manifest containing the
+   commit, checkpoint hash, ruleset/model/search settings, seed interval and
+   sample count.
+4. The local trainer validates the manifests and supplies the shard files as
+   separate inputs, for example:
+
+```sh
+python trainer/train.py data/colab-shard-0.tetradat \
+    data/colab-shard-1.tetradat data/local.tetradat \
+    --resume models/champion.pt --device cuda --require-gpu \
+    --value-weight 1.0 --steps 5000 --save models/candidate.pt
+```
+
+The notebook and manifest validator are intentionally a later stage; the
+existing GPU self-play bridge is the execution core.
 
 `trainer/train.py` accepts multiple dataset paths. The last path is the new
 generation. Keep `--new-data-repeat` at 1 for an unbiased first trial; higher

@@ -101,9 +101,7 @@ public:
                 break;
             }
 
-            if (p0_turn) {
-                recorder.add(obs, actions, r, tokenizer);
-            }
+            recorder.add(obs, actions, r, tokenizer, p0_turn ? 1 : -1);
 
             const PlacementAction& chosen = actions[static_cast<size_t>(r.best_action)];
             if (chosen.use_hold && !p_active.do_hold()) {
@@ -114,9 +112,7 @@ public:
             int sent = 0;
             const LockResult lr = p_active.lock_piece(chosen.total_duration(), &sent);
             
-            if (p0_turn) {
-                recorder.note_outcome_of_last(sent, lr.garbage_received);
-            }
+            recorder.note_outcome_of_last(sent, lr.garbage_received);
 
             if (!lr.ok && !lr.topped_out) {
                 p_active.die(TopoutReason::BlockOut);

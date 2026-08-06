@@ -144,8 +144,9 @@ official `gfx1201` / RDNA 4 support. See [`docs/SETUP.md`](docs/SETUP.md).
   arithmetic on supported accelerators.
 - **GPU-backed self-play export** (`trainer/gpu_selfplay.py`): the same bridge
   generates a rectangular v1 `.tetradat` dataset with the current checkpoint,
-  including root exploration noise and hidden-queue determinizations. The
-  two-board self-play path keeps the already-tokenized samples because compact
+  including root exploration noise and hidden-queue determinizations. It
+  records both player perspectives. The two-board self-play path keeps the
+  already-tokenized samples because compact
   replay metadata cannot reconstruct the opponent's attack event stream.
 - **GPU-backed Arena** (`trainer/gpu_arena.py`): C++ still owns paired games,
   mirrored seeds, two-board attack delivery and promotion arithmetic while

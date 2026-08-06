@@ -111,12 +111,23 @@ public:
 
     void add(const Observation& obs, const std::vector<PlacementAction>& actions,
              const SearchResult& result, const Tokenizer& tok) {
+        add(obs, actions, result, tok, /*value_perspective=*/1);
+    }
+
+    // `value_perspective` identifies the player for whom the sample's value
+    // target must be interpreted. Self-play records both players in one
+    // chronological stream, so the final game result is converted to each
+    // sample's own perspective instead of being copied blindly to all samples.
+    void add(const Observation& obs, const std::vector<PlacementAction>& actions,
+             const SearchResult& result, const Tokenizer& tok,
+             int value_perspective) {
         samples_.push_back(make_sample(obs, actions, result, tok, model_version_,
                                        static_cast<std::uint32_t>(samples_.size()),
                                        game_seed_, garbage_style_, garbage_period_,
                                        garbage_lines_));
         attack_at_.push_back(0.0f);
         garbage_at_.push_back(0.0f);
+        perspectives_.push_back(value_perspective < 0 ? -1 : 1);
     }
 
     // Record what actually happened after the most recent placement, so the
@@ -136,18 +147,24 @@ public:
         const int n = static_cast<int>(samples_.size());
         for (int i = 0; i < n; ++i) {
             TrainingSample& s = samples_[static_cast<size_t>(i)];
-            s.outcome = z;
-            s.n_step_return = z;
+            const int perspective = perspectives_[static_cast<size_t>(i)];
+            const float local_z = z * static_cast<float>(perspective);
+            s.outcome = local_z;
+            s.n_step_return = local_z;
             s.time_to_terminal = n - i;
-            s.topped_out_within_4 = (z < 0.0f) && (n - i <= 4);
-            s.topped_out_within_8 = (z < 0.0f) && (n - i <= 8);
+            s.topped_out_within_4 = (local_z < 0.0f) && (n - i <= 4);
+            s.topped_out_within_8 = (local_z < 0.0f) && (n - i <= 8);
 
             // Attack and garbage over a short horizon: auxiliary targets, never
-            // part of the reward.
+            // part of the reward. Only placements by the same player are
+            // included; otherwise recording both players would mix their
+            // future attack and garbage streams.
             float attack = 0.0f, garbage = 0.0f;
             for (int k = i; k < std::min(n, i + 4); ++k) {
-                attack += attack_at_[static_cast<size_t>(k)];
-                garbage += garbage_at_[static_cast<size_t>(k)];
+                if (perspectives_[static_cast<size_t>(k)] == perspective) {
+                    attack += attack_at_[static_cast<size_t>(k)];
+                    garbage += garbage_at_[static_cast<size_t>(k)];
+                }
             }
             s.future_attack_1s = attack;
             s.future_garbage_received = garbage;
@@ -164,12 +181,14 @@ public:
         samples_.clear();
         attack_at_.clear();
         garbage_at_.clear();
+        perspectives_.clear();
     }
 
 private:
     std::vector<TrainingSample> samples_;
     std::vector<float> attack_at_;
     std::vector<float> garbage_at_;
+    std::vector<std::int8_t> perspectives_;
     std::uint32_t model_version_ = 0;
     std::uint64_t game_seed_ = 0;
     std::uint8_t garbage_style_ = 1;

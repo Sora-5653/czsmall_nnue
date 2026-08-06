@@ -752,10 +752,10 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
                               st.duration, ev.positions_evaluated(), ev.batches_issued());
     }
 
-    // GPU self-play records only player 0's samples while player 1 still
-    // changes the incoming-garbage state.  Compact Replay+ metadata does not
+    // GPU self-play records both player perspectives while each side changes
+    // the other's incoming-garbage state. Compact Replay+ metadata does not
     // contain that opponent event stream, so its standalone reconstruction
-    // cannot reproduce these observations reliably.  Keep the already
+    // cannot reproduce these observations reliably. Keep the already
     // tokenized samples in the rectangular v1 format for this path.
     if (!export_buffer(path, buffer, model_version, 0, 0, false))
         throw std::runtime_error("GPU self-play dataset export failed");
