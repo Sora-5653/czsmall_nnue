@@ -281,6 +281,7 @@ trainer/
   train.py          a resumable training loop
   gpu_match.py      GPU inference match runner with APM/APP/PPS output
   gpu_selfplay.py   GPU-backed self-play dataset generator
+  colab_generate.py reproducible Colab shard launcher + manifest validator
   gpu_arena.py      GPU Candidate-vs-Champion Arena runner
   iterate.py        guarded generation/replay/Arena driver
   export_weights.py PyTorch checkpoint -> .tetrawts for the engine

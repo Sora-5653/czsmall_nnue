@@ -181,32 +181,55 @@ the opponent event stream, compact replay metadata would not be sufficient to
 reconstruct these observations. The script also reports the number of
 GPU-evaluated positions.
 
-### Colab position-generation plan
+### Colab position generation
 
 Colab is reserved for generating additional self-play positions. The local
 machine remains the authority for checkpoint promotion and Arena comparison.
-The planned workflow is:
+The launcher is intentionally notebook-friendly and keeps the C++ engine as
+the authority for rules, Cobra move generation, search and labels:
 
-1. Every Colab instance checks out the same commit and loads the same
-   checkpoint.
-2. Instance `shard_id` runs `trainer/gpu_selfplay.py` with
-   `--seed base_seed + shard_id * games_per_shard`; its games then consume the
-   consecutive seeds in that shard only.
-3. The instance returns its `.tetradat` file and a manifest containing the
-   commit, checkpoint hash, ruleset/model/search settings, seed interval and
-   sample count.
-4. The local trainer validates the manifests and supplies the shard files as
-   separate inputs, for example:
+1. Every Colab instance checks out the same commit, installs the Python
+   requirements and loads the same checkpoint.
+2. Run one shard. `--build-engine` compiles `tetra_cli` when the Colab VM does
+   not already have it:
 
 ```sh
-python trainer/train.py data/colab-shard-0.tetradat \
-    data/colab-shard-1.tetradat data/local.tetradat \
+python trainer/colab_generate.py generate models/champion.pt \
+    data/colab/shard-0.tetradat --base-seed 100000 \
+    --shard-id 0 --shard-count 4 --games 32 --pieces 300 --sims 64 \
+    --model-version 4 --device cuda --build-engine
+```
+
+   For shard `i`, use the same `--base-seed`, `--shard-count` and `--games`,
+   changing only `--shard-id i`. The launcher assigns the disjoint interval
+   `[base_seed + i * games, base_seed + (i + 1) * games)`.
+3. Download the `.tetradat` file and its generated
+   `.tetradat.manifest.json`. The manifest records the commit, checkpoint
+   hash, ruleset/model/search settings, seed interval and sample count.
+4. Validate all manifests locally before training:
+
+```sh
+python trainer/colab_generate.py validate \
+    data/colab/shard-0.tetradat.manifest.json \
+    data/colab/shard-1.tetradat.manifest.json \
+    data/colab/shard-2.tetradat.manifest.json \
+    data/colab/shard-3.tetradat.manifest.json \
+    --checkpoint models/champion.pt --require-complete
+```
+
+5. Supply the validated shard files as separate inputs:
+
+```sh
+python trainer/train.py data/colab/shard-0.tetradat \
+    data/colab/shard-1.tetradat data/local.tetradat \
     --resume models/champion.pt --device cuda --require-gpu \
     --value-weight 1.0 --steps 5000 --save models/candidate.pt
 ```
 
-The notebook and manifest validator are intentionally a later stage; the
-existing GPU self-play bridge is the execution core.
+The launcher refuses overlapping seed intervals and incompatible rulesets,
+checkpoints or search settings. Google Apps Script/Drive automation remains a
+later stage; it may move completed files but does not define seeds, labels or
+dataset merging.
 
 `trainer/train.py` accepts multiple dataset paths. The last path is the new
 generation. Keep `--new-data-repeat` at 1 for an unbiased first trial; higher

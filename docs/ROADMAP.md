@@ -49,23 +49,24 @@ Status against the milestones in the specification (§21).
    current model is conservative — it rejects some genuinely reachable
    high-gravity placements — and closing this is the last gap in the movement
    model.
-10. **Colab-sharded position generation (planned).** Colab is used as an
-    additional GPU worker for self-play position generation, not as a second
-    source of rules or move generation. Each instance runs the existing
-    `trainer/gpu_selfplay.py` bridge and exports a rectangular v1 `.tetradat`
-    shard. A shard owns a non-overlapping contiguous seed interval:
+10. **Colab-sharded position generation (Stage 1 implemented).** Colab is used
+    as an additional GPU worker for self-play position generation, not as a
+    second source of rules or move generation. `trainer/colab_generate.py`
+    wraps the existing `trainer/gpu_selfplay.py` bridge and exports a
+    rectangular v1 `.tetradat` shard plus a manifest. A shard owns a
+    non-overlapping contiguous seed interval:
     `seed_start = base_seed + shard_id * games_per_shard`, and game `g` uses
-    `seed_start + g`. The manifest will record the repository commit,
-    checkpoint hash, ruleset/model version, search settings, seed interval,
-    game count and sample count. Local training can pass all validated shard
+    `seed_start + g`. The validator checks dataset integrity, repository and
+    checkpoint compatibility, ruleset/model version, search settings and
+    overlapping seed intervals. Local training can pass all validated shard
     paths to `trainer/train.py`; no byte-level concatenation is required.
 
     Implementation order:
 
-    1. Add a small Colab notebook/launcher that builds the Linux engine,
-       installs the matching PyTorch runtime, and runs one deterministic shard.
-    2. Add manifest creation and validation, including ruleset/checkpoint
-       compatibility and overlapping-seed rejection.
+    1. ~~Add a small Colab launcher that builds the Linux engine and runs one
+       deterministic shard.~~ **Done.**
+    2. ~~Add manifest creation and validation, including ruleset/checkpoint
+       compatibility and overlapping-seed rejection.~~ **Done.**
     3. Add resumable Drive upload/download of completed shards. Google Apps
        Script is optional orchestration only; it must not be the authority for
        seeds, labels or dataset merging.
