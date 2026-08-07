@@ -741,7 +741,7 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
 
     RemoteGpuEvaluator ev(stdin, stdout, cfg.search.batch_size, 0);
     SelfPlayWorker worker(ev, cfg);
-    ReplayBuffer buffer(static_cast<size_t>(std::max(1, games)) *
+    ReplayBuffer buffer(2u * static_cast<size_t>(std::max(1, games)) *
                         static_cast<size_t>(std::max(1, pieces)));
     for (int g = 0; g < std::max(1, games); ++g) {
         SelfPlayStats st;

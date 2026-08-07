@@ -225,4 +225,3 @@ consteval size_t kick_size() {
 } // namespace Gen
 
 } // namespace Cobra
-

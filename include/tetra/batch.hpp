@@ -53,8 +53,16 @@ struct TensorBatch {
     std::vector<float> policy_target;  // [B, A], zero-padded, sums to 1 per row
     std::vector<float> value_target;   // [B]
     std::vector<float> aux_target;     // [B, AUX_TARGETS]
+    std::vector<float> aux_valid_mask; // [B, AUX_TARGETS], 1 = observed target
 
-    static constexpr int AUX_TARGETS = 4;  // attack, garbage, ttk, topout risk
+    static constexpr int AUX_TARGETS = schema::AUX_TARGET_COUNT;
+
+    // Provenance needed for leakage-safe splits and for round-tripping the
+    // target contract.  Inference batches leave these empty.
+    std::vector<std::int32_t> player_perspective; // [B], +1 or -1
+    std::vector<std::int32_t> termination_reason; // [B], TerminationReason
+    std::vector<std::uint64_t> game_seed;         // [B]
+    std::vector<std::uint32_t> move_number;       // [B]
 
     size_t token_stride() const { return static_cast<size_t>(max_tokens) * TOKEN_FEATURES; }
     size_t action_stride() const { return static_cast<size_t>(max_actions) * ACTION_FEATURES; }
@@ -79,6 +87,11 @@ struct TensorBatch {
         policy_target.clear();
         value_target.clear();
         aux_target.clear();
+        aux_valid_mask.clear();
+        player_perspective.clear();
+        termination_reason.clear();
+        game_seed.clear();
+        move_number.clear();
     }
 };
 
@@ -105,6 +118,12 @@ inline void allocate_batch(TensorBatch& out, int b, int t, int a, bool with_targ
         out.policy_target.assign(ba, 0.0f);
         out.value_target.assign(static_cast<size_t>(b), 0.0f);
         out.aux_target.assign(static_cast<size_t>(b) * TensorBatch::AUX_TARGETS, 0.0f);
+        out.aux_valid_mask.assign(static_cast<size_t>(b) * TensorBatch::AUX_TARGETS, 0.0f);
+        out.player_perspective.assign(static_cast<size_t>(b), 1);
+        out.termination_reason.assign(static_cast<size_t>(b),
+                                      static_cast<std::int32_t>(TerminationReason::Unknown));
+        out.game_seed.assign(static_cast<size_t>(b), 0);
+        out.move_number.assign(static_cast<size_t>(b), 0);
     }
 }
 
@@ -234,6 +253,11 @@ inline TensorBatch make_training_batch(const std::vector<const TrainingSample*>&
 
         out.value_target[b] = s.outcome;
 
+        out.player_perspective[b] = s.value_perspective;
+        out.termination_reason[b] = static_cast<std::int32_t>(s.termination_reason);
+        out.game_seed[b] = s.game_seed;
+        out.move_number[b] = s.move_number;
+
         // Auxiliary targets are squashed into roughly [0, 1] before they leave
         // the engine. They are trained with MSE alongside the policy and value
         // losses, so a raw count would dominate the total purely by scale:
@@ -242,12 +266,39 @@ inline TensorBatch make_training_batch(const std::vector<const TrainingSample*>&
         // the auxiliary head the only thing the model was really fitting.
         // Normalising here keeps the loss weights in the trainer meaningful.
         const size_t aux = static_cast<size_t>(b) * TensorBatch::AUX_TARGETS;
-        auto squash = [](float v, float scale) { return v / (v + scale); };
-        out.aux_target[aux + 0] = squash(std::max(0.0f, s.future_attack_1s), 8.0f);
-        out.aux_target[aux + 1] = squash(std::max(0.0f, s.future_garbage_received), 8.0f);
-        out.aux_target[aux + 2] =
-            squash(static_cast<float>(std::max(0, s.time_to_terminal)), 64.0f);
-        out.aux_target[aux + 3] = s.topped_out_within_8 ? 1.0f : 0.0f;
+        auto squash = [](float v, float scale) {
+            v = std::max(0.0f, v);
+            return v / (v + scale);
+        };
+        auto raw_target = [&](int index) {
+            if (s.aux_target_schema_version >= schema::AUX_TARGET_SCHEMA_VERSION)
+                return s.aux_targets[static_cast<size_t>(index)];
+            switch (index) {
+                case 0: return s.future_attack_1s;
+                case 1: return s.future_garbage_received;
+                case 2: return static_cast<float>(std::max(0, s.time_to_terminal));
+                case 3: return s.topped_out_within_8 ? 1.0f : 0.0f;
+                default: return 0.0f;
+            }
+        };
+        auto raw_valid = [&](int index) {
+            if (s.aux_target_schema_version >= schema::AUX_TARGET_SCHEMA_VERSION)
+                return s.aux_valid[static_cast<size_t>(index)] != 0;
+            return index < schema::LEGACY_AUX_TARGET_COUNT;
+        };
+        for (int i = 0; i < TensorBatch::AUX_TARGETS; ++i) {
+            if (!raw_valid(i)) continue;
+            const float raw = raw_target(i);
+            float value = raw;
+            if (i == 2)
+                value = squash(raw, 64.0f);
+            else if (schema::is_count_target(i))
+                value = squash(raw, 8.0f);
+            else
+                value = std::max(0.0f, std::min(1.0f, raw));
+            out.aux_target[aux + static_cast<size_t>(i)] = value;
+            out.aux_valid_mask[aux + static_cast<size_t>(i)] = 1.0f;
+        }
     }
     return out;
 }

@@ -143,7 +143,8 @@ official `gfx1201` / RDNA 4 support. See [`docs/SETUP.md`](docs/SETUP.md).
   feed one short-window GPU micro-batch, and fp16 is the default low-latency
   arithmetic on supported accelerators.
 - **GPU-backed self-play export** (`trainer/gpu_selfplay.py`): the same bridge
-  generates a rectangular v1 `.tetradat` dataset with the current checkpoint,
+  generates a rectangular v3 `.tetradat` dataset with schema and termination
+  metadata alongside the current checkpoint,
   including root exploration noise and hidden-queue determinizations. It
   records both player perspectives. The two-board self-play path keeps the
   already-tokenized samples because compact

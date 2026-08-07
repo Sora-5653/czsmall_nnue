@@ -131,7 +131,7 @@ private:
         candidate_player.reset(rules, seed, 0);
         candidate_player.set_mirror(mirror);
         Player champion_player;
-        champion_player.reset(rules, seed ^ 0xFEEDFACEull, 1);
+        champion_player.reset(rules, seed, 1);
         champion_player.set_mirror(mirror);
 
         MoveGenerator gen;

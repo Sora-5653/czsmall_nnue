@@ -125,6 +125,7 @@ public:
     }
 };
 
+
 }  // namespace
 
 TEST(search_returns_a_legal_action) {
@@ -285,6 +286,15 @@ TEST(a_same_player_child_does_not_negate_value) {
               "a child with the same player to act must keep the value sign");
     for (const auto& c : r.candidates)
         if (c.visits > 0) CHECK_MSG(c.q_value > 0.74f, "same-player Q must remain positive");
+}
+
+TEST(puct_value_is_ranked_from_the_player_to_move_perspective) {
+    const float good_for_root = 0.8f;
+    const float bad_for_root = -0.4f;
+    CHECK(detail::puct_value_for_mover(good_for_root, /*root_to_move=*/true) >
+          detail::puct_value_for_mover(bad_for_root, /*root_to_move=*/true));
+    CHECK(detail::puct_value_for_mover(good_for_root, /*root_to_move=*/false) <
+          detail::puct_value_for_mover(bad_for_root, /*root_to_move=*/false));
 }
 
 TEST(different_seeds_change_gumbel_but_not_legality) {

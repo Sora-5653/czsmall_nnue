@@ -10,7 +10,9 @@
 
 #include "tetra/movegen.hpp"
 #include "tetra/observation.hpp"
+#include "tetra/schema.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -36,6 +38,8 @@ enum class TokenKind : std::uint8_t {
     OpponentColumn = 12,
     OpponentSummary = 13,
     Missing = 14,
+    Bag = 15,
+    OpponentCounters = 16,
 };
 
 inline const char* token_kind_name(TokenKind k) {
@@ -55,6 +59,8 @@ inline const char* token_kind_name(TokenKind k) {
         case TokenKind::OpponentColumn: return "opp_col";
         case TokenKind::OpponentSummary: return "opp_board";
         case TokenKind::Missing: return "missing";
+        case TokenKind::Bag: return "bag";
+        case TokenKind::OpponentCounters: return "opp_counters";
     }
     return "?";
 }
@@ -118,6 +124,7 @@ public:
         encode_active(out, obs, cfg);
         encode_hold(out, obs);
         encode_next(out, obs, cfg);
+        encode_bag(out, obs, cfg);
         encode_garbage(out, obs, cfg);
         encode_counters(out, obs, cfg);
         encode_rule(out, cfg);
@@ -127,6 +134,7 @@ public:
         if (obs.has_opponent) {
             encode_board(out, obs.opponent_board, cfg, /*player=*/1, TokenKind::OpponentRow,
                          TokenKind::OpponentColumn, TokenKind::OpponentSummary);
+            encode_opponent_counters(out, obs);
         } else {
             // Spec 9.3: an explicit Missing token beats silently zero-padding,
             // because the model can then tell "no opponent" from "empty board".
@@ -294,6 +302,45 @@ private:
         }
     }
 
+    void encode_bag(TokenizedObservation& out, const Observation& obs,
+                    const RulesetConfig& cfg) const {
+        Token t;
+        t.kind = TokenKind::Bag;
+        t.index = -1;
+
+        // The remaining contents are public state for bag randomizers. For
+        // memoryless/debug randomizers, emit an explicit missing flag instead
+        // of making an empty vector look like an exhausted bag.
+        const bool is_bag = cfg.randomizer.type == RandomizerType::Bag7 ||
+                            cfg.randomizer.type == RandomizerType::Bag14;
+        if (!is_bag) {
+            t.f[15] = 1.0f;
+            out.tokens.push_back(t);
+            return;
+        }
+
+        std::array<int, PIECE_COUNT> counts{};
+        for (Piece piece : obs.bag_remaining) {
+            const int index = static_cast<int>(piece);
+            if (index >= 0 && index < PIECE_COUNT) ++counts[static_cast<size_t>(index)];
+        }
+        const int max_bag = cfg.randomizer.type == RandomizerType::Bag14 ? 14 : 7;
+        for (int i = 0; i < PIECE_COUNT; ++i)
+            // Bag7 has at most one copy and Bag14 has at most two, so this
+            // preserves the exact public count without leaving [-4, 4].
+            t.f[static_cast<size_t>(i)] =
+                static_cast<float>(counts[static_cast<size_t>(i)]) /
+                static_cast<float>(cfg.randomizer.type == RandomizerType::Bag14 ? 2 : 1);
+        t.f[7] = static_cast<float>(obs.bag_remaining.size()) /
+                 static_cast<float>(max_bag);
+        t.f[8] = obs.bag_remaining.empty() ? 1.0f : 0.0f;
+        int distinct = 0;
+        for (int count : counts)
+            if (count > 0) ++distinct;
+        t.f[9] = static_cast<float>(distinct) / static_cast<float>(PIECE_COUNT);
+        out.tokens.push_back(t);
+    }
+
     void encode_garbage(TokenizedObservation& out, const Observation& obs,
                         const RulesetConfig& cfg) const {
         // One token summarising the whole queue, plus up to four group tokens.
@@ -346,6 +393,22 @@ private:
                   obs.pieces_placed <= cfg.attack.opener_phase_pieces)
                      ? 1.0f
                      : 0.0f;
+        out.tokens.push_back(t);
+    }
+
+    void encode_opponent_counters(TokenizedObservation& out, const Observation& obs) const {
+        Token t;
+        t.kind = TokenKind::OpponentCounters;
+        t.player = 1;
+        t.index = -1;
+        t.f[0] = detail::squash(static_cast<float>(std::max(0, obs.opponent_pending_lines)), 6.0f);
+        t.f[1] = (obs.opponent_pending_lines > 0) ? 1.0f : 0.0f;
+        t.f[2] = detail::squash(static_cast<float>(std::max(0, obs.opponent_combo)), 4.0f);
+        t.f[3] = (obs.opponent_combo >= 0) ? 1.0f : 0.0f;
+        t.f[4] = detail::squash(static_cast<float>(std::max(0, obs.opponent_b2b)), 4.0f);
+        t.f[5] = (obs.opponent_b2b > 0) ? 1.0f : 0.0f;
+        t.f[6] = obs.opponent_alive ? 1.0f : 0.0f;
+        t.f[7] = 1.0f;  // this token is present only when an opponent exists
         out.tokens.push_back(t);
     }
 

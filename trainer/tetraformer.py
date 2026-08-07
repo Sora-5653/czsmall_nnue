@@ -24,6 +24,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+CURRENT_AUX_TARGETS = 36
+
+
 @dataclass
 class TetraFormerConfig:
     token_features: int = 24
@@ -32,7 +35,9 @@ class TetraFormerConfig:
     layers: int = 8
     heads: int = 8
     ffn: int = 768
-    aux_targets: int = 4
+    # New models consume the version-2 interval target contract.  Legacy
+    # checkpoints keep their explicit value (normally 4) when restored.
+    aux_targets: int = CURRENT_AUX_TARGETS
     dropout: float = 0.0
 
 
@@ -168,7 +173,17 @@ def losses(model, batch, weights=None):
     value_target = torch.stack([win, draw, loss_], dim=-1)
     value_loss = -(value_target * torch.log_softmax(wdl, dim=-1)).sum(-1).mean()
 
-    aux_loss = F.mse_loss(aux, batch["aux_target"])
+    aux_target = batch["aux_target"]
+    aux_valid_mask = batch.get("aux_valid_mask")
+    if aux_valid_mask is None:
+        aux_valid_mask = torch.ones_like(aux_target)
+    aux_error = (aux - aux_target).pow(2)
+    valid_count = aux_valid_mask.sum().clamp(min=1.0)
+    aux_loss = (aux_error * aux_valid_mask).sum() / valid_count
+    aux_per_target = (
+        (aux_error * aux_valid_mask).sum(dim=0) /
+        aux_valid_mask.sum(dim=0).clamp(min=1.0)
+    )
 
     # Diagnostics are kept separate from the optimised value loss.  In
     # particular, value_accuracy makes it obvious when the WDL head is still
@@ -179,6 +194,9 @@ def losses(model, batch, weights=None):
         value_accuracy = (value_prob.argmax(dim=-1) == value_class).float().mean()
         value_scalar = value_prob[:, 0] - value_prob[:, 2]
         value_scalar_mse = F.mse_loss(value_scalar, z)
+        valid_aux = aux_valid_mask > 0.5
+        prediction_mean = aux[valid_aux].mean() if valid_aux.any() else aux.new_zeros(())
+        prediction_variance = aux[valid_aux].var(unbiased=False) if valid_aux.any() else aux.new_zeros(())
 
     total = (
         weights["policy"] * policy_loss
@@ -191,5 +209,12 @@ def losses(model, batch, weights=None):
         "value_accuracy": value_accuracy.item(),
         "value_scalar_mse": value_scalar_mse.item(),
         "aux": aux_loss.item(),
+        "aux_valid": valid_count.item(),
+        "aux_prediction_mean": prediction_mean.item(),
+        "aux_prediction_variance": prediction_variance.item(),
+        "aux_per_target": aux_per_target.detach().cpu().tolist(),
+        # Kept private-ish for the training loop's gradient diagnostics.  The
+        # public scalar entries above remain plain Python numbers for callers.
+        "_loss_tensors": (policy_loss, value_loss, aux_loss),
         "total": total.item(),
     }

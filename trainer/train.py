@@ -17,6 +17,7 @@ import argparse
 import math
 import time
 
+import numpy as np
 import torch
 
 import tetra_dataset
@@ -73,6 +74,65 @@ def to_cpu(value):
     return value
 
 
+def split_indices_by_game(ds: tetra_dataset.Dataset) -> tuple[np.ndarray, np.ndarray]:
+    """Split by game seed so adjacent trajectory states never leak across sets."""
+    seeds = np.asarray(ds.game_seed, dtype=np.uint64)
+    unique = sorted({int(seed) for seed in seeds.tolist() if int(seed) != 0})
+    if len(unique) >= 2:
+        cut = max(1, min(len(unique) - 1, int(len(unique) * 0.8)))
+        train_seeds = set(unique[:cut])
+        train = np.asarray([int(seed) in train_seeds for seed in seeds], dtype=bool)
+        return np.flatnonzero(train), np.flatnonzero(~train)
+
+    # Legacy v1 files do not carry game provenance.  Keep the old deterministic
+    # fallback, but make the limitation visible to the caller.
+    generator = np.random.default_rng(0x5EED)
+    permutation = generator.permutation(len(ds))
+    split = max(1, int(len(ds) * 0.8))
+    if split >= len(ds) and len(ds) > 1:
+        split = len(ds) - 1
+    return permutation[:split], permutation[split:]
+
+
+def gradient_diagnostics(model: TetraFormer, loss_tensors, weights: dict[str, float]) -> dict[str, float]:
+    """Measure how each objective pulls on the shared representation."""
+    shared = [
+        parameter for name, parameter in model.named_parameters()
+        if (name.startswith("token_in.") or name.startswith("blocks.") or
+            name.startswith("norm.")) and parameter.requires_grad
+    ]
+    if not shared:
+        return {"policy_grad": 0.0, "value_grad": 0.0, "aux_grad": 0.0,
+                "policy_value_cos": 0.0, "policy_aux_cos": 0.0}
+
+    gradients = []
+    for loss, name in zip(loss_tensors, ("policy", "value", "aux")):
+        grads = torch.autograd.grad(
+            loss * weights[name], shared, retain_graph=True, allow_unused=True
+        )
+        gradients.append([g if g is not None else torch.zeros_like(p)
+                          for g, p in zip(grads, shared)])
+
+    def norm(values):
+        return torch.sqrt(sum(g.pow(2).sum() for g in values)).item()
+
+    def cosine(left, right):
+        dot = sum((a * b).sum() for a, b in zip(left, right))
+        denominator = torch.sqrt(sum(a.pow(2).sum() for a in left)) * \
+            torch.sqrt(sum(b.pow(2).sum() for b in right))
+        if denominator.item() <= 1e-12:
+            return 0.0
+        return (dot / denominator).item()
+
+    return {
+        "policy_grad": norm(gradients[0]),
+        "value_grad": norm(gradients[1]),
+        "aux_grad": norm(gradients[2]),
+        "policy_value_cos": cosine(gradients[0], gradients[1]),
+        "policy_aux_cos": cosine(gradients[0], gradients[2]),
+    }
+
+
 def save_checkpoint(path: str, model: TetraFormer, optimizer: torch.optim.Optimizer,
                     step: int, sample_generator: torch.Generator,
                     loss_weights: dict[str, float]) -> None:
@@ -97,6 +157,8 @@ def main() -> int:
     ap.add_argument("datasets", nargs="+", metavar="DATASET",
                     help="one or more replay generations; the last can be repeated")
     ap.add_argument("--steps", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="training/model seed; keep fixed for paired ablations")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--model", choices=("dev", "s"), default="dev")
@@ -135,7 +197,7 @@ def main() -> int:
     ap.add_argument("--save", default="")
     args = ap.parse_args()
 
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
     torch.set_num_threads(args.threads)
 
     device = args.device
@@ -149,20 +211,24 @@ def main() -> int:
 
     if args.new_data_repeat < 1:
         raise SystemExit("--new-data-repeat must be at least 1")
-    dataset_paths = list(args.datasets)
-    if len(dataset_paths) > 1 and args.new_data_repeat > 1:
-        dataset_paths.extend([dataset_paths[-1]] * (args.new_data_repeat - 1))
     loaded_datasets = []
-    for path in dataset_paths:
+    for path in args.datasets:
         loaded = tetra_dataset.load(path)
         loaded_datasets.append(loaded)
         print(f"replay input   {path}: {len(loaded)} samples")
     ds = tetra_dataset.Dataset.concatenate(loaded_datasets)
     ds.sanity_check()
-    data = ds.torch(device if device != "cpu" else None)
+    # Keep the replay tensors on CPU. Training and validation move only their
+    # current bounded batch to the accelerator, so VRAM scales with batch size
+    # rather than with the number of replay generations.
+    data = ds.torch()
     n = len(ds)
     print(f"dataset       {n} samples from {len(loaded_datasets)} replay inputs, "
           f"{ds.tokens.shape[1]} tokens, {ds.actions.shape[1]} actions")
+    stats = ds.target_statistics()
+    print(f"aux schema    v{ds.header.aux_target_schema_version} / {ds.header.aux_targets} targets")
+    print(f"aux valid     mean {stats['valid_rate'].mean():.3f}  "
+          f"zero mean {stats['zero_rate'].mean():.3f}")
 
     checkpoint = None
     start_step = 0
@@ -186,10 +252,10 @@ def main() -> int:
             model = TetraFormer(cfg)
             model.load_state_dict(checkpoint["state_dict"])
             start_step = int(checkpoint.get("step", 0))
-            if args.start_step >= 0:
-                start_step = args.start_step
     else:
         model = build_model(args.model, ds.header)
+    if args.resume and args.start_step >= 0:
+        start_step = args.start_step
     model.to(device)
     model_label = "checkpoint" if args.resume else args.model
     print(f"model         {model_label} ({model.parameter_count() / 1e6:.2f}M parameters)")
@@ -231,31 +297,72 @@ def main() -> int:
         opt.load_state_dict(checkpoint["optimizer_state_dict"])
         move_optimizer_state(opt, device)
     model.train()
+    shared_gradient_model = model
 
-    # Use a deterministic shuffled holdout.  The exporter appends games in
-    # seed order; a contiguous tail would turn validation into a game/seed
-    # distribution test and make the WDL metric look worse simply because the
-    # last games have a different outcome mix.  A future replay format can do
-    # the stronger game-level split once provenance is available to Python.
-    split = max(1, int(n * 0.8))
-    split_generator = torch.Generator().manual_seed(0x5EED)
-    permutation = torch.randperm(n, generator=split_generator)
-    train_idx = permutation[:split].to(device)
-    val_idx = permutation[split:].to(device)
+    train_np, val_np = split_indices_by_game(ds)
+    raw_train_samples = len(train_np)
+    if len(loaded_datasets) > 1 and args.new_data_repeat > 1:
+        newest_start = sum(len(item) for item in loaded_datasets[:-1])
+        newest_train = train_np[train_np >= newest_start]
+        if len(newest_train) > 0:
+            train_np = np.concatenate(
+                [train_np] + [newest_train] * (args.new_data_repeat - 1)
+            )
+            print(f"replay weight  newest train samples x{args.new_data_repeat} "
+                  f"({len(newest_train)} unique)")
+    train_idx = torch.as_tensor(train_np, dtype=torch.long)
+    val_idx = torch.as_tensor(val_np, dtype=torch.long)
+    if len(val_idx) == 0:
+        print("warning: no game-level validation group is available; using training data")
+        val_idx = torch.as_tensor(train_np[:raw_train_samples], dtype=torch.long)
+    print(f"split         train {len(train_idx)} weighted / validation {len(val_idx)} samples")
 
     def batch_at(idx):
-        return {k: v[idx] for k, v in data.items()}
+        batch = {k: v[idx] for k, v in data.items()}
+        if device != "cpu":
+            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        return batch
 
     def evaluate():
         if len(val_idx) == 0:
             return None
         model.eval()
+        sample_total = 0
+        sample_sums = {
+            "policy": 0.0,
+            "value": 0.0,
+            "value_accuracy": 0.0,
+            "value_scalar_mse": 0.0,
+        }
+        aux_numerator = 0.0
+        aux_valid_total = 0.0
+        eval_batch = max(1, args.batch)
         with torch.no_grad():
-            _, parts = losses(model, batch_at(val_idx), weights=loss_weights)
+            for offset in range(0, len(val_idx), eval_batch):
+                idx = val_idx[offset:offset + eval_batch]
+                batch = batch_at(idx)
+                _, parts = losses(model, batch, weights=loss_weights)
+                count = len(idx)
+                sample_total += count
+                for name in sample_sums:
+                    sample_sums[name] += parts[name] * count
+                valid = float(batch["aux_valid_mask"].sum().item())
+                if valid > 0.0:
+                    aux_numerator += parts["aux"] * valid
+                    aux_valid_total += valid
         model.train()
-        return parts
+        result = {name: total / max(1, sample_total)
+                  for name, total in sample_sums.items()}
+        result["aux"] = aux_numerator / aux_valid_total if aux_valid_total > 0.0 else 0.0
+        result["aux_valid"] = aux_valid_total
+        result["total"] = (
+            loss_weights["policy"] * result["policy"]
+            + loss_weights["value"] * result["value"]
+            + loss_weights["aux"] * result["aux"]
+        )
+        return result
 
-    gen = torch.Generator().manual_seed(1)
+    gen = torch.Generator().manual_seed(args.seed + 1)
     if isinstance(checkpoint, dict) and checkpoint.get("sampling_generator_state") is not None:
         gen.set_state(checkpoint["sampling_generator_state"])
 
@@ -276,10 +383,13 @@ def main() -> int:
         step = start_step + local_step
         pick = train_idx[
             torch.randint(0, len(train_idx), (min(args.batch, len(train_idx)),),
-                          generator=gen).to(device)
+                          generator=gen)
         ]
         total, parts = losses(model, batch_at(pick), weights=loss_weights)
         opt.zero_grad(set_to_none=True)
+        grad_parts = gradient_diagnostics(
+            shared_gradient_model, parts["_loss_tensors"], loss_weights
+        )
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
@@ -287,7 +397,11 @@ def main() -> int:
         if local_step % max(1, args.steps // 10) == 0:
             print(f"step {step:5d}  total {parts['total']:.4f}  policy {parts['policy']:.4f}  "
                   f"value {parts['value']:.4f}  v_acc {parts['value_accuracy']:.3f}  "
-                  f"aux {parts['aux']:.4f}", flush=True)
+                  f"aux {parts['aux']:.4f}  valid {parts['aux_valid']:.0f}  "
+                  f"grad(policy/value/aux) {grad_parts['policy_grad']:.3g}/"
+                  f"{grad_parts['value_grad']:.3g}/{grad_parts['aux_grad']:.3g}  "
+                  f"cos(p,v/a) {grad_parts['policy_value_cos']:.3f}/"
+                  f"{grad_parts['policy_aux_cos']:.3f}", flush=True)
         if args.checkpoint_every > 0 and args.save and step % args.checkpoint_every == 0:
             save_checkpoint(args.save, model, opt, step, gen, loss_weights)
         if eval_interval > 0 and local_step % eval_interval == 0:

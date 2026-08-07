@@ -143,6 +143,10 @@ struct SearchNode {
     size_t size() const { return actions.size(); }
 };
 
+inline float puct_value_for_mover(float root_value, bool root_to_move) {
+    return root_to_move ? root_value : -root_value;
+}
+
 // Full simulator-state key used by the transposition table. This is kept in
 // `detail` so the key contract can be tested without making it part of the
 // public search API. In particular, the board hash used by replay records does
@@ -444,22 +448,29 @@ private:
         const float sqrt_total =
             std::sqrt(static_cast<float>(std::max(1, n.visits)));
         const float parent_q = n.visits > 0 ? n.value_sum / static_cast<float>(n.visits) : 0.0f;
+        const bool root_to_move =
+            !n.has_opponent || n.state.index() == root_player_index_;
 
         int best = 0;
         float best_score = -1e30f;
         for (size_t a = 0; a < n.actions.size(); ++a) {
             const int visits = n.child_visits[a] + n.child_pending[a];
-            float q;
+            float mover_q;
             if (n.child_visits[a] > 0) {
-                q = n.child_value_sum[a] / static_cast<float>(n.child_visits[a]);
+                const float root_q =
+                    n.child_value_sum[a] / static_cast<float>(n.child_visits[a]);
+                mover_q = detail::puct_value_for_mover(root_q, root_to_move);
             } else {
-                // First-play urgency: unvisited children inherit the parent's
-                // value, slightly reduced, rather than an optimistic zero.
-                q = parent_q - cfg_.fpu_reduction;
+                // Stored values are always in the root player's perspective.
+                // Convert to the mover's perspective before applying FPU so an
+                // opponent node minimizes root value rather than cooperating.
+                const float mover_parent_q =
+                    detail::puct_value_for_mover(parent_q, root_to_move);
+                mover_q = mover_parent_q - cfg_.fpu_reduction;
             }
             const float u = cfg_.c_puct * n.prior[a] * sqrt_total /
                             (1.0f + static_cast<float>(visits));
-            const float score = q + u;
+            const float score = mover_q + u;
             if (score > best_score) {
                 best_score = score;
                 best = static_cast<int>(a);
