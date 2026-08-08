@@ -32,7 +32,8 @@ EXPORT_FORMAT = "<IIQQ"
 def generate(model: torch.nn.Module, device: torch.device, engine: str, output: str,
              games: int, pieces: int, sims: int, batch_size: int, seed: int,
              model_version: int, determinizations: int,
-             use_gumbel: bool, precision: str) -> tuple[list[dict[str, int | float]], dict[str, int], float]:
+             use_gumbel: bool, root_noise_fraction: float,
+             precision: str) -> tuple[list[dict[str, int | float]], dict[str, int], float]:
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
@@ -48,6 +49,7 @@ def generate(model: torch.nn.Module, device: torch.device, engine: str, output: 
             str(model_version),
             str(max(1, determinizations)),
             "1" if use_gumbel else "0",
+            f"{root_noise_fraction:.9g}",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -170,9 +172,13 @@ def main() -> int:
                     help="root futures averaged per move; self-play defaults to 2")
     ap.add_argument("--no-gumbel", action="store_true",
                     help="use batched PUCT instead of Gumbel sequential halving")
+    ap.add_argument("--root-noise-fraction", type=float, default=0.25,
+                    help="Dirichlet-style root exploration mix; use 0 for teacher/distillation data")
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp16")
     args = ap.parse_args()
 
+    if not 0.0 <= args.root_noise_fraction <= 1.0:
+        raise SystemExit("--root-noise-fraction must be in [0, 1]")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("GPU requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
@@ -185,8 +191,9 @@ def main() -> int:
 
     results, summary, inference_seconds = generate(
         model, device, engine, args.output, max(1, args.games), max(1, args.pieces),
-        max(1, args.sims), max(1, args.batch), args.seed, max(0, args.model_version),
-        max(1, args.determinizations), not args.no_gumbel, args.precision
+        max(0, args.sims), max(1, args.batch), args.seed, max(0, args.model_version),
+        max(1, args.determinizations), not args.no_gumbel,
+        args.root_noise_fraction, args.precision
     )
     report(results, summary, inference_seconds, device, args.checkpoint, args.output)
     return 0

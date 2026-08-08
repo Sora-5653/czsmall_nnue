@@ -328,6 +328,8 @@ TEST(interval_aux_targets_carry_masks_and_termination_reason) {
     const auto samples = make_samples(1, 25);
     CHECK(!samples.empty());
     bool saw_invalid_future = false;
+    bool saw_observed_one_second = false;
+    const Tick last_sample_time = samples.back().timestamp;
     for (const auto& sample : samples) {
         CHECK_EQ(static_cast<int>(sample.aux_target_schema_version),
                  static_cast<int>(schema::AUX_TARGET_SCHEMA_VERSION));
@@ -337,9 +339,18 @@ TEST(interval_aux_targets_carry_masks_and_termination_reason) {
             CHECK(sample.aux_targets[static_cast<size_t>(i)] >= 0.0f);
             if (sample.aux_valid[static_cast<size_t>(i)] == 0) saw_invalid_future = true;
         }
+        if (sample.timestamp + static_cast<Tick>(league().tick_rate) <= last_sample_time) {
+            saw_observed_one_second = true;
+            for (int channel = 0; channel < schema::AUX_CHANNEL_COUNT; ++channel) {
+                CHECK_EQ(sample.aux_valid[static_cast<size_t>(
+                             schema::real_aux_index(0, channel))], 1);
+            }
+        }
     }
     CHECK_MSG(saw_invalid_future,
               "truncated trajectories must mask horizons beyond the observed future");
+    CHECK_MSG(saw_observed_one_second,
+              "fixture must contain at least one full second of observed future");
 
     const auto batch = make_training_batch(pointers(samples));
     CHECK_EQ(batch.aux_valid_mask.size(), batch.aux_target.size());

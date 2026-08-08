@@ -44,7 +44,11 @@ struct SearchConfig {
     bool use_gumbel = true;
     int gumbel_m = 16;          // candidate actions considered at the root
     float gumbel_c_visit = 50.0f;
-    float gumbel_c_scale = 1.0f;
+    // The paper-style unit scale assumes a well-calibrated root Q.  With this
+    // network it overwhelms log-priors: same-checkpoint Arena measured the
+    // 32-sim Gumbel side at 1-15 versus policy-only.  A 0.01 scale restored
+    // parity across matched trials while still allowing Q to break close ties.
+    float gumbel_c_scale = 0.01f;
 
     // Scale applied to the Gumbel perturbation when picking the root
     // candidates.

@@ -439,6 +439,9 @@ TEST(search_beats_policy_only_under_pressure) {
                     sc.simulations = sims;
                     sc.max_depth = 4;
                     sc.use_gumbel = gumbel;
+                    // Keep this algorithmic regression independent of the
+                    // production calibration used by same-checkpoint Arena.
+                    if (gumbel) sc.gumbel_c_scale = 1.0f;
                     sc.seed = static_cast<std::uint64_t>(seed) * 997 + static_cast<unsigned>(i);
                     sc.batch_size = 16;
                     Searcher s(ev, sc);

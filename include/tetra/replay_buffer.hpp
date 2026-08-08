@@ -311,7 +311,7 @@ public:
                         else opponent_topout = true;
                     }
                 }
-                const bool valid = interval_valid(sample_time, end_seconds * tick_rate_);
+                const bool valid = interval_valid(sample_time, end_seconds);
                 const int attack_index = schema::real_aux_index(h, schema::attack_channel);
                 const int garbage_index = schema::real_aux_index(h, schema::garbage_channel);
                 const int self_topout_index =

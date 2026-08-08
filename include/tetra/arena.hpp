@@ -29,9 +29,17 @@
 namespace tetra {
 
 struct ArenaConfig {
-    int pairs = 10;                     // Number of paired games (2 * pairs total games played)
+    int pairs = 10;                     // Factorial blocks (4 * pairs total games played)
     int max_pieces = 300;               // Placements before truncation
-    SearchConfig search{};              // Equal search budget for Candidate and Champion
+    SearchConfig search{};              // Shared search settings and default budget.
+    // Diagnostic overrides. Negative values keep the shared budget; zero is
+    // policy-only (Searcher's zero-simulation fallback), which lets Arena
+    // measure whether search actually improves a fixed network.
+    int candidate_simulations = -1;
+    int champion_simulations = -1;
+    // -1 inherits search.use_gumbel; 0/1 override per side for diagnostics.
+    int candidate_gumbel = -1;
+    int champion_gumbel = -1;
     GarbageStyle garbage_style = GarbageStyle::Steady;
     int garbage_period = 8;
     int garbage_lines = 2;
@@ -41,6 +49,7 @@ struct ArenaConfig {
 struct ArenaGameResult {
     int pair_index = 0;
     bool is_mirrored = false;
+    bool roles_swapped = false;
     std::uint64_t seed = 0;
     int candidate_pieces = 0;
     int champion_pieces = 0;
@@ -78,10 +87,18 @@ public:
             const std::uint64_t pair_seed =
                 base_seed + static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull;
 
-            // Game A: normal pair
-            res.games.push_back(play_game(rules, pair_seed, i, /*mirror=*/false));
-            // Game B: mirrored pair (same seed, mirrored pieces and hole positions)
-            res.games.push_back(play_game(rules, pair_seed, i, /*mirror=*/true));
+            // Four-game factorial block: normal/mirrored geometry crossed with
+            // player-role assignment.  Role swapping alone cancels queue/index
+            // and tie-break advantages; the mirrored pair separately averages
+            // geometry asymmetry (notably TETR.IO 180-kick asymmetry).
+            res.games.push_back(play_game(rules, pair_seed, i,
+                                          /*mirror=*/false, /*swap_roles=*/false));
+            res.games.push_back(play_game(rules, pair_seed, i,
+                                          /*mirror=*/false, /*swap_roles=*/true));
+            res.games.push_back(play_game(rules, pair_seed, i,
+                                          /*mirror=*/true, /*swap_roles=*/false));
+            res.games.push_back(play_game(rules, pair_seed, i,
+                                          /*mirror=*/true, /*swap_roles=*/true));
         }
 
         res.games_played = static_cast<int>(res.games.size());
@@ -115,10 +132,11 @@ public:
 
 private:
     ArenaGameResult play_game(const RulesetConfig& rules, std::uint64_t seed,
-                              int pair_idx, bool mirror) {
+                              int pair_idx, bool mirror, bool swap_roles) {
         ArenaGameResult g;
         g.pair_index = pair_idx;
         g.is_mirrored = mirror;
+        g.roles_swapped = swap_roles;
         g.seed = seed;
 
         // SelfPlayWorker already defines the game's transition semantics:
@@ -127,16 +145,26 @@ private:
         // turn.  Arena must use that same interaction model; running the two
         // evaluators independently would train a two-board outcome while
         // evaluating a single-board survival proxy.
+        const int candidate_index = swap_roles ? 1 : 0;
+        const int champion_index = swap_roles ? 0 : 1;
         Player candidate_player;
-        candidate_player.reset(rules, seed, 0);
+        candidate_player.reset(rules, seed, candidate_index);
         candidate_player.set_mirror(mirror);
         Player champion_player;
-        champion_player.reset(rules, seed, 1);
+        champion_player.reset(rules, seed, champion_index);
         champion_player.set_mirror(mirror);
 
         MoveGenerator gen;
         SearchConfig candidate_sc = cfg_.search;
         SearchConfig champion_sc = cfg_.search;
+        if (cfg_.candidate_simulations >= 0)
+            candidate_sc.simulations = cfg_.candidate_simulations;
+        if (cfg_.champion_simulations >= 0)
+            champion_sc.simulations = cfg_.champion_simulations;
+        if (cfg_.candidate_gumbel >= 0)
+            candidate_sc.use_gumbel = cfg_.candidate_gumbel != 0;
+        if (cfg_.champion_gumbel >= 0)
+            champion_sc.use_gumbel = cfg_.champion_gumbel != 0;
         Searcher candidate_search(candidate_, candidate_sc);
         Searcher champion_search(champion_, champion_sc);
         int candidate_pieces = 0;
@@ -144,7 +172,10 @@ private:
 
         while (candidate_player.alive() && champion_player.alive() &&
                candidate_pieces < cfg_.max_pieces && champion_pieces < cfg_.max_pieces) {
-            const bool candidate_turn = candidate_player.now() <= champion_player.now();
+            const bool candidate_turn =
+                candidate_player.now() < champion_player.now() ||
+                (candidate_player.now() == champion_player.now() &&
+                 candidate_player.index() < champion_player.index());
             Player& active = candidate_turn ? candidate_player : champion_player;
             Player& inactive = candidate_turn ? champion_player : candidate_player;
             int& active_pieces = candidate_turn ? candidate_pieces : champion_pieces;

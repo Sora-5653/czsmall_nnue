@@ -25,7 +25,10 @@ ARENA_FORMAT = "<4I3fI"
 
 def evaluate(candidate: torch.nn.Module, champion: torch.nn.Module, device: torch.device,
              engine: str, pairs: int, sims: int, pieces: int, batch_size: int,
-             determinizations: int, use_gumbel: bool, precision: str, seed: int
+             determinizations: int, use_gumbel: bool, precision: str, seed: int,
+             candidate_sims: int = -1, champion_sims: int = -1,
+             candidate_gumbel: int = -1, champion_gumbel: int = -1,
+             gumbel_c_scale: float = 0.01
              ) -> tuple[dict[str, int | float], float]:
     proc = subprocess.Popen(
         [
@@ -38,6 +41,11 @@ def evaluate(candidate: torch.nn.Module, champion: torch.nn.Module, device: torc
             str(max(1, determinizations)),
             "1" if use_gumbel else "0",
             str(max(0, seed)),
+            str(candidate_sims),
+            str(champion_sims),
+            str(candidate_gumbel),
+            str(champion_gumbel),
+            f"{gumbel_c_scale:.9g}",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -87,14 +95,23 @@ def evaluate(candidate: torch.nn.Module, champion: torch.nn.Module, device: torc
 
 def report(result: dict[str, int | float], candidate: str, champion: str,
            inference_seconds: float, pairs: int, sims: int, pieces: int,
-           determinizations: int, use_gumbel: bool, precision: str, seed: int) -> None:
+           determinizations: int, use_gumbel: bool, precision: str, seed: int,
+           candidate_sims: int = -1, champion_sims: int = -1,
+           candidate_gumbel: int = -1, champion_gumbel: int = -1,
+           gumbel_c_scale: float = 0.01) -> None:
     games = int(result["games_played"])
     print(f"Arena: Candidate ({candidate}) vs Champion ({champion})")
+    candidate_budget = sims if candidate_sims < 0 else candidate_sims
+    champion_budget = sims if champion_sims < 0 else champion_sims
+    candidate_uses_gumbel = use_gumbel if candidate_gumbel < 0 else candidate_gumbel != 0
+    champion_uses_gumbel = use_gumbel if champion_gumbel < 0 else champion_gumbel != 0
     print(
-        f"Running {pairs} paired games ({games} games total, sims={sims}, "
+        f"Running {pairs} paired games ({games} games total, "
+        f"sims={candidate_budget}/{champion_budget} (candidate/champion), "
         f"max_pieces={pieces}, determinizations={determinizations}, "
-        f"gumbel={'on' if use_gumbel else 'off'}, precision={precision}, "
-        f"seed={seed})...\n"
+        f"gumbel={'on' if candidate_uses_gumbel else 'off'}/"
+        f"{'on' if champion_uses_gumbel else 'off'} (candidate/champion), "
+        f"gumbel_c_scale={gumbel_c_scale:g}, precision={precision}, seed={seed})...\n"
     )
     print(f"Result over {games} games:")
     print(f"  Candidate wins : {int(result['candidate_wins'])}")
@@ -118,15 +135,27 @@ def main() -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--pairs", type=int, default=10)
     ap.add_argument("--sims", type=int, default=16)
+    ap.add_argument("--candidate-sims", type=int, default=-1,
+                    help="diagnostic override; 0 means policy-only")
+    ap.add_argument("--champion-sims", type=int, default=-1,
+                    help="diagnostic override; 0 means policy-only")
     ap.add_argument("--pieces", type=int, default=300)
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--determinizations", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42,
                     help="base seed for paired games; vary it for independent Arena trials")
     ap.add_argument("--gumbel", action="store_true")
+    ap.add_argument("--candidate-gumbel", action="store_true",
+                    help="diagnostic override: enable Gumbel only for the candidate")
+    ap.add_argument("--champion-gumbel", action="store_true",
+                    help="diagnostic override: enable Gumbel only for the champion")
+    ap.add_argument("--gumbel-c-scale", type=float, default=0.01,
+                    help="diagnostic scale on Gumbel root Q ranking")
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp16")
     args = ap.parse_args()
 
+    if args.gumbel_c_scale < 0.0:
+        raise SystemExit("--gumbel-c-scale must be non-negative")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("GPU requested but torch.cuda.is_available() is false")
     device = torch.device(args.device)
@@ -141,12 +170,17 @@ def main() -> int:
     result, inference_seconds = evaluate(
         candidate, champion, device, engine, max(1, args.pairs), max(1, args.sims),
         max(1, args.pieces), max(1, args.batch), max(1, args.determinizations),
-        args.gumbel, args.precision, max(0, args.seed)
+        args.gumbel, args.precision, max(0, args.seed),
+        args.candidate_sims, args.champion_sims,
+        1 if args.candidate_gumbel else -1, 1 if args.champion_gumbel else -1,
+        args.gumbel_c_scale
     )
     report(
         result, args.candidate, args.champion, inference_seconds, max(1, args.pairs),
         max(1, args.sims), max(1, args.pieces), max(1, args.determinizations), args.gumbel,
-        args.precision, max(0, args.seed)
+        args.precision, max(0, args.seed), args.candidate_sims, args.champion_sims,
+        1 if args.candidate_gumbel else -1, 1 if args.champion_gumbel else -1,
+        args.gumbel_c_scale
     )
     return 0
 

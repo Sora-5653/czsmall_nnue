@@ -172,8 +172,13 @@ def main() -> int:
     ap.add_argument("--resume", default="", help="resume model and optimizer state from a .pt checkpoint")
     ap.add_argument("--reset-optimizer", action="store_true",
                     help="resume model weights but initialize a fresh AdamW optimizer")
-    ap.add_argument("--policy-head-only", action="store_true",
-                    help="freeze the shared trunk and value/aux heads; train policy layers only")
+    head_group = ap.add_mutually_exclusive_group()
+    head_group.add_argument("--policy-head-only", action="store_true",
+                            help="freeze the shared trunk and value/aux heads; train policy layers only")
+    head_group.add_argument("--value-head-only", action="store_true",
+                            help="freeze the shared trunk and policy/aux heads; train WDL value branch only")
+    ap.add_argument("--upgrade-value-attention", action="store_true",
+                    help="when resuming a legacy checkpoint, add a learned attention value pooler")
     ap.add_argument("--start-step", type=int, default=-1,
                     help="override the stored global step for a legacy checkpoint")
     ap.add_argument("--checkpoint-every", type=int, default=0,
@@ -196,6 +201,11 @@ def main() -> int:
                     help="return failure when held-out loss does not improve")
     ap.add_argument("--save", default="")
     args = ap.parse_args()
+
+    if args.upgrade_value_attention and not args.resume:
+        raise SystemExit("--upgrade-value-attention requires --resume")
+    if args.upgrade_value_attention and not args.value_head_only:
+        raise SystemExit("--upgrade-value-attention requires --value-head-only for a safe migration")
 
     torch.manual_seed(args.seed)
     torch.set_num_threads(args.threads)
@@ -235,6 +245,8 @@ def main() -> int:
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         if isinstance(checkpoint, TetraFormer):
+            if args.upgrade_value_attention:
+                raise SystemExit("value-attention migration requires a dictionary checkpoint")
             model = checkpoint
         else:
             if "config" not in checkpoint or "state_dict" not in checkpoint:
@@ -249,8 +261,27 @@ def main() -> int:
                     f"vs dataset ({ds.header.token_features}, {ds.header.action_features}, "
                     f"{ds.header.aux_targets})"
                 )
-            model = TetraFormer(cfg)
-            model.load_state_dict(checkpoint["state_dict"])
+            if args.upgrade_value_attention and not cfg.value_attention:
+                cfg.value_attention = True
+                model = TetraFormer(cfg)
+                incompatible = model.load_state_dict(checkpoint["state_dict"], strict=False)
+                allowed_missing = (
+                    "value_query", "value_attn.", "value_norm."
+                )
+                bad_missing = [
+                    key for key in incompatible.missing_keys
+                    if not any(key == prefix or key.startswith(prefix)
+                               for prefix in allowed_missing)
+                ]
+                if bad_missing or incompatible.unexpected_keys:
+                    raise SystemExit(
+                        "unsafe value-attention migration: missing="
+                        f"{bad_missing}, unexpected={incompatible.unexpected_keys}"
+                    )
+                print("migration     added learned attention value pooler")
+            else:
+                model = TetraFormer(cfg)
+                model.load_state_dict(checkpoint["state_dict"])
             start_step = int(checkpoint.get("step", 0))
     else:
         model = build_model(args.model, ds.header)
@@ -288,6 +319,16 @@ def main() -> int:
         if not args.reset_optimizer:
             raise SystemExit("--policy-head-only requires --reset-optimizer")
         print(f"trainable     {sum(p.numel() for p in trainable):,} policy parameters")
+    elif args.value_head_only:
+        value_prefixes = ("value_head.", "value_attn.", "value_norm.")
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad = (
+                name == "value_query" or name.startswith(value_prefixes)
+            )
+        trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if not args.reset_optimizer:
+            raise SystemExit("--value-head-only requires --reset-optimizer")
+        print(f"trainable     {sum(p.numel() for p in trainable):,} value parameters")
     else:
         trainable = list(model.parameters())
 
@@ -379,6 +420,7 @@ def main() -> int:
         save_checkpoint(args.best_save, model, opt, best_step, gen, loss_weights)
 
     t0 = time.time()
+    log_interval = max(1, args.steps // 10)
     for local_step in range(1, args.steps + 1):
         step = start_step + local_step
         pick = train_idx[
@@ -387,14 +429,21 @@ def main() -> int:
         ]
         total, parts = losses(model, batch_at(pick), weights=loss_weights)
         opt.zero_grad(set_to_none=True)
-        grad_parts = gradient_diagnostics(
-            shared_gradient_model, parts["_loss_tensors"], loss_weights
-        )
+        # Gradient diagnostics require three additional autograd traversals.
+        # They are observability, not part of optimisation, so only pay that
+        # cost on steps whose diagnostics are actually printed.
+        should_log = local_step % log_interval == 0
+        grad_parts = None
+        if should_log:
+            grad_parts = gradient_diagnostics(
+                shared_gradient_model, parts["_loss_tensors"], loss_weights
+            )
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
 
-        if local_step % max(1, args.steps // 10) == 0:
+        if should_log:
+            assert grad_parts is not None
             print(f"step {step:5d}  total {parts['total']:.4f}  policy {parts['policy']:.4f}  "
                   f"value {parts['value']:.4f}  v_acc {parts['value_accuracy']:.3f}  "
                   f"aux {parts['aux']:.4f}  valid {parts['aux_valid']:.0f}  "

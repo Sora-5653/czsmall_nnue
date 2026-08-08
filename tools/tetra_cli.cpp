@@ -721,17 +721,20 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
         (argc > 8) ? static_cast<std::uint32_t>(std::strtoul(argv[8], nullptr, 10)) : 1;
     const int determinizations = (argc > 9) ? std::atoi(argv[9]) : 2;
     const bool use_gumbel = (argc > 10) ? std::atoi(argv[10]) != 0 : true;
+    const float root_noise_fraction =
+        (argc > 11) ? std::strtof(argv[11], nullptr) : 0.25f;
     enable_gpu_protocol_stdio();
 
     const RulesetConfig rules = RulesetConfig::tetra_league();
     SelfPlayConfig cfg;
     cfg.max_pieces = std::max(1, pieces);
     cfg.model_version = model_version;
-    cfg.search.simulations = std::max(1, sims);
+    cfg.search.simulations = std::max(0, sims);
     cfg.search.max_depth = 6;
     cfg.search.use_gumbel = use_gumbel;
     cfg.search.batch_size = std::max(1, batch);
-    cfg.search.root_noise_fraction = 0.25f;
+    cfg.search.root_noise_fraction =
+        std::max(0.0f, std::min(1.0f, root_noise_fraction));
     cfg.search.root_noise_alpha = 0.3f;
     cfg.search.determinizations = std::max(1, determinizations);
     cfg.garbage_style = GarbageStyle::Steady;
@@ -781,6 +784,11 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
     const bool use_gumbel = (argc > 7) ? std::atoi(argv[7]) != 0 : false;
     const std::uint64_t base_seed =
         (argc > 8) ? std::strtoull(argv[8], nullptr, 10) : 42;
+    const int candidate_sims = (argc > 9) ? std::atoi(argv[9]) : -1;
+    const int champion_sims = (argc > 10) ? std::atoi(argv[10]) : -1;
+    const int candidate_gumbel = (argc > 11) ? std::atoi(argv[11]) : -1;
+    const int champion_gumbel = (argc > 12) ? std::atoi(argv[12]) : -1;
+    const float gumbel_c_scale = (argc > 13) ? std::strtof(argv[13], nullptr) : 0.01f;
     enable_gpu_protocol_stdio();
 
     RemoteGpuEvaluator candidate(stdin, stdout, std::max(1, batch), 0);
@@ -789,9 +797,14 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
     ArenaConfig cfg;
     cfg.pairs = std::max(1, pairs);
     cfg.max_pieces = std::max(1, pieces);
-    cfg.search.simulations = std::max(1, sims);
+    cfg.search.simulations = std::max(0, sims);
+    cfg.candidate_simulations = candidate_sims;
+    cfg.champion_simulations = champion_sims;
+    cfg.candidate_gumbel = candidate_gumbel;
+    cfg.champion_gumbel = champion_gumbel;
     cfg.search.max_depth = 6;
     cfg.search.use_gumbel = use_gumbel;
+    cfg.search.gumbel_c_scale = std::max(0.0f, gumbel_c_scale);
     cfg.search.batch_size = std::max(1, batch);
     cfg.search.determinizations = std::max(1, determinizations);
 
