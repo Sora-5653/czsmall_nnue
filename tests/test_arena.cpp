@@ -27,17 +27,28 @@ TEST(arena_paired_games_run_normal_and_mirrored) {
     Arena arena(ev1, ev2, quick_arena(/*pairs=*/3, /*sims=*/4, /*pieces=*/15));
     const ArenaResult r = arena.evaluate(league(), 123);
 
-    CHECK_EQ(r.games_played, 6);
-    CHECK_EQ(static_cast<int>(r.games.size()), 6);
+    CHECK_EQ(r.games_played, 12);
+    CHECK_EQ(static_cast<int>(r.games.size()), 12);
     for (int i = 0; i < 3; ++i) {
-        const auto& norm = r.games[static_cast<size_t>(2 * i)];
-        const auto& mirr = r.games[static_cast<size_t>(2 * i + 1)];
-        CHECK_EQ(norm.pair_index, i);
-        CHECK_EQ(mirr.pair_index, i);
-        CHECK(!norm.is_mirrored);
-        CHECK(mirr.is_mirrored);
-        CHECK_EQ(norm.seed, mirr.seed);
+        const size_t base = static_cast<size_t>(4 * i);
+        const auto& norm0 = r.games[base];
+        const auto& norm1 = r.games[base + 1];
+        const auto& mirr0 = r.games[base + 2];
+        const auto& mirr1 = r.games[base + 3];
+        for (const ArenaGameResult* game : {&norm0, &norm1, &mirr0, &mirr1}) {
+            CHECK_EQ(game->pair_index, i);
+            CHECK_EQ(game->seed, norm0.seed);
+        }
+        CHECK(!norm0.is_mirrored);
+        CHECK(!norm1.is_mirrored);
+        CHECK(mirr0.is_mirrored);
+        CHECK(mirr1.is_mirrored);
+        CHECK(!norm0.roles_swapped);
+        CHECK(norm1.roles_swapped);
+        CHECK(!mirr0.roles_swapped);
+        CHECK(mirr1.roles_swapped);
     }
+    CHECK_EQ(r.candidate_wins, r.champion_wins);
 }
 
 TEST(arena_identifies_win_draw_loss) {

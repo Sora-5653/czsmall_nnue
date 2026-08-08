@@ -24,6 +24,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+CURRENT_AUX_TARGETS = 36
+
+
 @dataclass
 class TetraFormerConfig:
     token_features: int = 24
@@ -32,7 +35,13 @@ class TetraFormerConfig:
     layers: int = 8
     heads: int = 8
     ffn: int = 768
-    aux_targets: int = 4
+    # New models consume the version-2 interval target contract.  Legacy
+    # checkpoints keep their explicit value (normally 4) when restored.
+    aux_targets: int = CURRENT_AUX_TARGETS
+    # Legacy checkpoints use masked-mean pooling for value. New checkpoints can
+    # opt into a learned query so value can attend selectively to schema-added
+    # tokens without perturbing the policy trunk.
+    value_attention: bool = False
     dropout: float = 0.0
 
 
@@ -96,7 +105,20 @@ class TetraFormer(nn.Module):
         self.policy_norm = RMSNorm(cfg.width)
         self.policy_out = nn.Linear(cfg.width, 1)
 
-        # WDL value head (spec 10.2) and auxiliary regressions.
+        # WDL value head (spec 10.2) and auxiliary regressions.  The optional
+        # learned-query pooler is deliberately value-only: it can be migrated
+        # and trained while leaving the trunk and policy bit-identical.
+        if cfg.value_attention:
+            self.value_query = nn.Parameter(torch.randn(1, 1, cfg.width) * 0.02)
+            self.value_attn = nn.MultiheadAttention(
+                cfg.width, cfg.heads, dropout=cfg.dropout, batch_first=True
+            )
+            self.value_norm = RMSNorm(cfg.width)
+        else:
+            self.register_parameter("value_query", None)
+            self.value_attn = None
+            self.value_norm = None
+
         self.value_head = nn.Sequential(
             nn.Linear(cfg.width, cfg.width // 2), nn.SiLU(), nn.Linear(cfg.width // 2, 3)
         )
@@ -119,6 +141,16 @@ class TetraFormer(nn.Module):
         # Masked mean pooling for the value head: padding must not dilute it.
         w = token_mask.unsqueeze(-1)
         pooled = (x * w).sum(1) / w.sum(1).clamp(min=1.0)
+        value_pooled = pooled
+        if self.cfg.value_attention:
+            assert self.value_query is not None
+            assert self.value_attn is not None
+            assert self.value_norm is not None
+            value_q = self.value_query.expand(x.shape[0], -1, -1)
+            value_attn, _ = self.value_attn(
+                value_q, x, x, key_padding_mask=pad, need_weights=False
+            )
+            value_pooled = self.value_norm(value_q + value_attn).squeeze(1)
 
         q = self.action_in(actions)
         attn, _ = self.policy_attn(q, x, x, key_padding_mask=pad, need_weights=False)
@@ -126,7 +158,7 @@ class TetraFormer(nn.Module):
         # Illegal/padded actions can never be selected.
         logits = logits.masked_fill(action_mask < 0.5, float("-inf"))
 
-        return logits, self.value_head(pooled), self.aux_head(pooled)
+        return logits, self.value_head(value_pooled), self.aux_head(pooled)
 
     def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -168,7 +200,17 @@ def losses(model, batch, weights=None):
     value_target = torch.stack([win, draw, loss_], dim=-1)
     value_loss = -(value_target * torch.log_softmax(wdl, dim=-1)).sum(-1).mean()
 
-    aux_loss = F.mse_loss(aux, batch["aux_target"])
+    aux_target = batch["aux_target"]
+    aux_valid_mask = batch.get("aux_valid_mask")
+    if aux_valid_mask is None:
+        aux_valid_mask = torch.ones_like(aux_target)
+    aux_error = (aux - aux_target).pow(2)
+    valid_count = aux_valid_mask.sum().clamp(min=1.0)
+    aux_loss = (aux_error * aux_valid_mask).sum() / valid_count
+    aux_per_target = (
+        (aux_error * aux_valid_mask).sum(dim=0) /
+        aux_valid_mask.sum(dim=0).clamp(min=1.0)
+    )
 
     # Diagnostics are kept separate from the optimised value loss.  In
     # particular, value_accuracy makes it obvious when the WDL head is still
@@ -179,6 +221,9 @@ def losses(model, batch, weights=None):
         value_accuracy = (value_prob.argmax(dim=-1) == value_class).float().mean()
         value_scalar = value_prob[:, 0] - value_prob[:, 2]
         value_scalar_mse = F.mse_loss(value_scalar, z)
+        valid_aux = aux_valid_mask > 0.5
+        prediction_mean = aux[valid_aux].mean() if valid_aux.any() else aux.new_zeros(())
+        prediction_variance = aux[valid_aux].var(unbiased=False) if valid_aux.any() else aux.new_zeros(())
 
     total = (
         weights["policy"] * policy_loss
@@ -191,5 +236,12 @@ def losses(model, batch, weights=None):
         "value_accuracy": value_accuracy.item(),
         "value_scalar_mse": value_scalar_mse.item(),
         "aux": aux_loss.item(),
+        "aux_valid": valid_count.item(),
+        "aux_prediction_mean": prediction_mean.item(),
+        "aux_prediction_variance": prediction_variance.item(),
+        "aux_per_target": aux_per_target.detach().cpu().tolist(),
+        # Kept private-ish for the training loop's gradient diagnostics.  The
+        # public scalar entries above remain plain Python numbers for callers.
+        "_loss_tensors": (policy_loss, value_loss, aux_loss),
         "total": total.item(),
     }

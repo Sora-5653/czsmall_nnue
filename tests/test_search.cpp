@@ -125,6 +125,7 @@ public:
     }
 };
 
+
 }  // namespace
 
 TEST(search_returns_a_legal_action) {
@@ -287,6 +288,15 @@ TEST(a_same_player_child_does_not_negate_value) {
         if (c.visits > 0) CHECK_MSG(c.q_value > 0.74f, "same-player Q must remain positive");
 }
 
+TEST(puct_value_is_ranked_from_the_player_to_move_perspective) {
+    const float good_for_root = 0.8f;
+    const float bad_for_root = -0.4f;
+    CHECK(detail::puct_value_for_mover(good_for_root, /*root_to_move=*/true) >
+          detail::puct_value_for_mover(bad_for_root, /*root_to_move=*/true));
+    CHECK(detail::puct_value_for_mover(good_for_root, /*root_to_move=*/false) <
+          detail::puct_value_for_mover(bad_for_root, /*root_to_move=*/false));
+}
+
 TEST(different_seeds_change_gumbel_but_not_legality) {
     HeuristicEvaluator ev;
     const Player p = warmed(11);
@@ -429,6 +439,9 @@ TEST(search_beats_policy_only_under_pressure) {
                     sc.simulations = sims;
                     sc.max_depth = 4;
                     sc.use_gumbel = gumbel;
+                    // Keep this algorithmic regression independent of the
+                    // production calibration used by same-checkpoint Arena.
+                    if (gumbel) sc.gumbel_c_scale = 1.0f;
                     sc.seed = static_cast<std::uint64_t>(seed) * 997 + static_cast<unsigned>(i);
                     sc.batch_size = 16;
                     Searcher s(ev, sc);

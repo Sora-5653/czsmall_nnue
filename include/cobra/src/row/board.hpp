@@ -486,4 +486,3 @@ struct Board {
 };
 
 } // namespace Cobra
-

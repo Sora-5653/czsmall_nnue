@@ -213,4 +213,3 @@ struct Bitboard : BitboardBase<T, N> {
 };
 
 } // namespace Cobra::Arch
-

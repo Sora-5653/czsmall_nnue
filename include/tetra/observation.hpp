@@ -12,6 +12,7 @@
 #include "tetra/events.hpp"
 #include "tetra/player.hpp"
 #include "tetra/ruleset.hpp"
+#include "tetra/schema.hpp"
 
 #include <vector>
 

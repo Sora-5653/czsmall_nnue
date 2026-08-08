@@ -103,19 +103,21 @@ TEST(tokenizer_emits_the_expected_token_layout) {
     Tokenizer tok;
     const auto t = tok.encode(observe(p), cfg);
 
-    int rows = 0, cols = 0, summary = 0, next = 0, rule = 0, time = 0, active = 0, hold = 0,
-        counters = 0, missing = 0;
+    int rows = 0, cols = 0, summary = 0, next = 0, bag = 0, rule = 0, time = 0, active = 0,
+        hold = 0, counters = 0, opponent_counters = 0, missing = 0;
     for (const auto& tk : t.tokens) {
         switch (tk.kind) {
             case TokenKind::Row: ++rows; break;
             case TokenKind::Column: ++cols; break;
             case TokenKind::BoardSummary: ++summary; break;
             case TokenKind::Next: ++next; break;
+            case TokenKind::Bag: ++bag; break;
             case TokenKind::Rule: ++rule; break;
             case TokenKind::Time: ++time; break;
             case TokenKind::Active: ++active; break;
             case TokenKind::Hold: ++hold; break;
             case TokenKind::Counters: ++counters; break;
+            case TokenKind::OpponentCounters: ++opponent_counters; break;
             case TokenKind::Missing: ++missing; break;
             default: break;
         }
@@ -124,11 +126,13 @@ TEST(tokenizer_emits_the_expected_token_layout) {
     CHECK_EQ(cols, cfg.geometry.width);
     CHECK_EQ(summary, 1);
     CHECK_EQ(next, cfg.randomizer.preview_count);
+    CHECK_EQ(bag, 1);
     CHECK_EQ(rule, 1);
     CHECK_EQ(time, 1);
     CHECK_EQ(active, 1);
     CHECK_EQ(hold, 1);
     CHECK_EQ(counters, 1);
+    CHECK_EQ(opponent_counters, 0);
     CHECK_EQ(missing, 1);  // no opponent yet
 
     // Spec 9.5: the context must stay in the 128-256 token band.
@@ -220,6 +224,61 @@ TEST(column_tokens_capture_wells) {
     CHECK(found);
 }
 
+TEST(bag_state_is_visible_to_the_tokenizer) {
+    const RulesetConfig cfg = league();
+    Observation a;
+    a.ruleset = cfg;
+    a.bag_remaining = {Piece::I, Piece::J, Piece::T};
+    Observation b = a;
+    b.bag_remaining = {Piece::I, Piece::I, Piece::T};
+
+    Tokenizer tok;
+    const auto ta = tok.encode(a, cfg);
+    const auto tb = tok.encode(b, cfg);
+    const Token* bag_a = nullptr;
+    const Token* bag_b = nullptr;
+    for (const auto& token : ta.tokens)
+        if (token.kind == TokenKind::Bag) bag_a = &token;
+    for (const auto& token : tb.tokens)
+        if (token.kind == TokenKind::Bag) bag_b = &token;
+    CHECK(bag_a != nullptr);
+    CHECK(bag_b != nullptr);
+    bool differs = false;
+    for (int i = 0; i < TOKEN_FEATURES; ++i)
+        if (bag_a->f[static_cast<size_t>(i)] != bag_b->f[static_cast<size_t>(i)]) differs = true;
+    CHECK_MSG(differs, "bag composition must affect the encoded observation");
+}
+
+TEST(opponent_counters_are_visible_to_the_tokenizer) {
+    const RulesetConfig cfg = league();
+    Player a, b;
+    a.reset(cfg, 1, 0);
+    b.reset(cfg, 2, 1);
+    Observation before = observe(a, &b);
+    Observation after = before;
+    after.opponent_pending_lines += 3;
+    after.opponent_combo = 5;
+    after.opponent_b2b = 2;
+    after.opponent_alive = false;
+
+    Tokenizer tok;
+    const auto ta = tok.encode(before, cfg);
+    const auto tb = tok.encode(after, cfg);
+    const Token* counters_a = nullptr;
+    const Token* counters_b = nullptr;
+    for (const auto& token : ta.tokens)
+        if (token.kind == TokenKind::OpponentCounters) counters_a = &token;
+    for (const auto& token : tb.tokens)
+        if (token.kind == TokenKind::OpponentCounters) counters_b = &token;
+    CHECK(counters_a != nullptr);
+    CHECK(counters_b != nullptr);
+    bool differs = false;
+    for (int i = 0; i < TOKEN_FEATURES; ++i)
+        if (counters_a->f[static_cast<size_t>(i)] != counters_b->f[static_cast<size_t>(i)])
+            differs = true;
+    CHECK_MSG(differs, "opponent counters must affect the encoded observation");
+}
+
 TEST(opponent_tokens_appear_only_with_an_opponent) {
     const RulesetConfig cfg = league();
     Player a, b;
@@ -228,23 +287,28 @@ TEST(opponent_tokens_appear_only_with_an_opponent) {
     Tokenizer tok;
 
     const auto solo = tok.encode(observe(a), cfg);
-    int solo_opp = 0, solo_missing = 0;
+    int solo_opp = 0, solo_counters = 0, solo_missing = 0;
     for (const auto& t : solo.tokens) {
         if (t.kind == TokenKind::OpponentRow || t.kind == TokenKind::OpponentColumn ||
             t.kind == TokenKind::OpponentSummary)
             ++solo_opp;
+        if (t.kind == TokenKind::OpponentCounters) ++solo_counters;
         if (t.kind == TokenKind::Missing) ++solo_missing;
     }
     CHECK_EQ(solo_opp, 0);
+    CHECK_EQ(solo_counters, 0);
     CHECK_EQ(solo_missing, 1);
 
     const auto duel = tok.encode(observe(a, &b), cfg);
-    int duel_opp = 0;
-    for (const auto& t : duel.tokens)
+    int duel_opp = 0, duel_counters = 0;
+    for (const auto& t : duel.tokens) {
         if (t.kind == TokenKind::OpponentRow || t.kind == TokenKind::OpponentColumn ||
             t.kind == TokenKind::OpponentSummary)
             ++duel_opp;
+        if (t.kind == TokenKind::OpponentCounters) ++duel_counters;
+    }
     CHECK(duel_opp > 0);
+    CHECK_EQ(duel_counters, 1);
     CHECK(duel.size() > solo.size());
 }
 

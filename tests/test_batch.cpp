@@ -300,6 +300,13 @@ TEST(dataset_round_trips) {
     CHECK_EQ(static_cast<int>(r.header.max_actions), batch.max_actions);
     CHECK_EQ(static_cast<int>(r.header.token_features), TOKEN_FEATURES);
     CHECK_EQ(static_cast<int>(r.header.action_features), ACTION_FEATURES);
+    CHECK_EQ(static_cast<int>(r.header.version), static_cast<int>(DatasetHeader::VERSION));
+    CHECK_EQ(static_cast<int>(r.header.tokenizer_schema_version),
+             static_cast<int>(schema::TOKENIZER_SCHEMA_VERSION));
+    CHECK_EQ(r.header.tokenizer_schema_hash, schema::TOKENIZER_SCHEMA_HASH);
+    CHECK_EQ(r.header.observation_schema_hash, schema::OBSERVATION_SCHEMA_HASH);
+    CHECK_EQ(static_cast<int>(r.header.aux_target_schema_version),
+             static_cast<int>(schema::AUX_TARGET_SCHEMA_VERSION));
     CHECK_EQ(r.header.ruleset_hash, 0xABCDEF12ull);
     CHECK_EQ(static_cast<int>(r.header.model_version), 7);
 
@@ -310,6 +317,44 @@ TEST(dataset_round_trips) {
     CHECK(r.batch.policy_target == batch.policy_target);
     CHECK(r.batch.value_target == batch.value_target);
     CHECK(r.batch.aux_target == batch.aux_target);
+    CHECK(r.batch.aux_valid_mask == batch.aux_valid_mask);
+    CHECK(r.batch.player_perspective == batch.player_perspective);
+    CHECK(r.batch.termination_reason == batch.termination_reason);
+    CHECK(r.batch.game_seed == batch.game_seed);
+    CHECK(r.batch.move_number == batch.move_number);
+}
+
+TEST(interval_aux_targets_carry_masks_and_termination_reason) {
+    const auto samples = make_samples(1, 25);
+    CHECK(!samples.empty());
+    bool saw_invalid_future = false;
+    bool saw_observed_one_second = false;
+    const Tick last_sample_time = samples.back().timestamp;
+    for (const auto& sample : samples) {
+        CHECK_EQ(static_cast<int>(sample.aux_target_schema_version),
+                 static_cast<int>(schema::AUX_TARGET_SCHEMA_VERSION));
+        CHECK_EQ(sample.termination_reason, TerminationReason::Truncated);
+        for (int i = 0; i < schema::AUX_TARGET_COUNT; ++i) {
+            CHECK(std::isfinite(sample.aux_targets[static_cast<size_t>(i)]));
+            CHECK(sample.aux_targets[static_cast<size_t>(i)] >= 0.0f);
+            if (sample.aux_valid[static_cast<size_t>(i)] == 0) saw_invalid_future = true;
+        }
+        if (sample.timestamp + static_cast<Tick>(league().tick_rate) <= last_sample_time) {
+            saw_observed_one_second = true;
+            for (int channel = 0; channel < schema::AUX_CHANNEL_COUNT; ++channel) {
+                CHECK_EQ(sample.aux_valid[static_cast<size_t>(
+                             schema::real_aux_index(0, channel))], 1);
+            }
+        }
+    }
+    CHECK_MSG(saw_invalid_future,
+              "truncated trajectories must mask horizons beyond the observed future");
+    CHECK_MSG(saw_observed_one_second,
+              "fixture must contain at least one full second of observed future");
+
+    const auto batch = make_training_batch(pointers(samples));
+    CHECK_EQ(batch.aux_valid_mask.size(), batch.aux_target.size());
+    for (float value : batch.aux_valid_mask) CHECK(value == 0.0f || value == 1.0f);
 }
 
 TEST(dataset_rejects_corruption) {
@@ -408,19 +453,19 @@ TEST(two_player_dataset_preserves_opponent_tokens_in_rectangular_format) {
     buf.push_game(w.play(league(), 42));
     CHECK(buf.size() > 5);
 
-    const std::string v1_path = "build/test_v1.tetradat";
-    const std::string v2_path = "build/test_v2.tetradat";
-    CHECK(export_buffer(v1_path, buf, 3, 0, 0, /*compact=*/false));
-    CHECK(export_buffer(v2_path, buf, 3, 0, 0, /*compact=*/true));
+    const std::string rectangular_path = "build/test_rectangular.tetradat";
+    const std::string compact_path = "build/test_compact_or_rectangular.tetradat";
+    CHECK(export_buffer(rectangular_path, buf, 3, 0, 0, /*compact=*/false));
+    CHECK(export_buffer(compact_path, buf, 3, 0, 0, /*compact=*/true));
 
-    const DatasetReadResult r1 = read_dataset_file(v1_path);
-    const DatasetReadResult r2 = read_dataset_file(v2_path);
-    CHECK_MSG(r1.ok, "read v1 failed: " + r1.error);
-    CHECK_MSG(r2.ok, "read v2 failed: " + r2.error);
+    const DatasetReadResult r1 = read_dataset_file(rectangular_path);
+    const DatasetReadResult r2 = read_dataset_file(compact_path);
+    CHECK_MSG(r1.ok, "read rectangular failed: " + r1.error);
+    CHECK_MSG(r2.ok, "read compact-or-rectangular failed: " + r2.error);
 
     CHECK_EQ(static_cast<int>(r2.header.samples), static_cast<int>(r1.header.samples));
     // Compact Replay+ cannot reconstruct the opponent's board/event stream;
-    // requesting compact therefore falls back to rectangular v1 so the
+    // requesting compact therefore falls back to rectangular v3 so the
     // already-masked observation is kept exactly.
     CHECK_EQ(static_cast<int>(r2.header.version), static_cast<int>(DatasetHeader::VERSION));
     CHECK_EQ(r2.header.ruleset_hash, r1.header.ruleset_hash);
@@ -433,18 +478,18 @@ TEST(two_player_dataset_preserves_opponent_tokens_in_rectangular_format) {
     CHECK(r2.batch.value_target == r1.batch.value_target);
     CHECK(r2.batch.aux_target == r1.batch.aux_target);
 
-    std::FILE* f1 = std::fopen(v1_path.c_str(), "rb");
+    std::FILE* f1 = std::fopen(rectangular_path.c_str(), "rb");
     std::fseek(f1, 0, SEEK_END);
     const long sz1 = std::ftell(f1);
     std::fclose(f1);
 
-    std::FILE* f2 = std::fopen(v2_path.c_str(), "rb");
+    std::FILE* f2 = std::fopen(compact_path.c_str(), "rb");
     std::fseek(f2, 0, SEEK_END);
     const long sz2 = std::ftell(f2);
     std::fclose(f2);
 
     CHECK(sz2 == sz1);
 
-    std::remove(v1_path.c_str());
-    std::remove(v2_path.c_str());
+    std::remove(rectangular_path.c_str());
+    std::remove(compact_path.c_str());
 }

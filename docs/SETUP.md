@@ -174,7 +174,7 @@ TETR.IO.
 
 For larger generations, `trainer/gpu_selfplay.py` keeps the same C++ rules and
 search but serves network evaluations from PyTorch/ROCm. It writes a
-rectangular v1 dataset from the C++ side: two-board self-play records both
+rectangular v3 dataset from the C++ side: two-board self-play records both
 players in chronological order, with each value outcome converted to the
 recorded player's perspective. Because either player's observation includes
 the opponent event stream, compact replay metadata would not be sufficient to
@@ -182,6 +182,11 @@ reconstruct these observations. The script also reports the number of
 GPU-evaluated positions.
 
 ### Colab position generation
+
+For the Drive-based semi-automatic workflow, see
+[`docs/COLAB_MANUAL.md`](COLAB_MANUAL.md). It runs setup, generation, validation
+and each ablation training run as separate commands so a Colab error can be
+returned and fixed at the stage where it occurs.
 
 Colab is reserved for generating additional self-play positions. The local
 machine remains the authority for checkpoint promotion and Arena comparison.

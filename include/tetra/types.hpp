@@ -133,6 +133,26 @@ enum class TopoutReason : std::uint8_t {
     GarbageOut, // rising garbage pushed the stack past the internal ceiling
 };
 
+// Whether a trajectory ended with a known game result or stopped while its
+// future was still unobserved.  This is part of the dataset contract: a
+// truncated trajectory must not turn unknown future events into zero targets.
+enum class TerminationReason : std::uint8_t {
+    Unknown = 0,
+    Terminated = 1,
+    Truncated = 2,
+    Mixed = 3,
+};
+
+inline const char* termination_reason_name(TerminationReason r) {
+    switch (r) {
+        case TerminationReason::Unknown: return "unknown";
+        case TerminationReason::Terminated: return "terminated";
+        case TerminationReason::Truncated: return "truncated";
+        case TerminationReason::Mixed: return "mixed";
+    }
+    return "?";
+}
+
 inline const char* topout_name(TopoutReason r) {
     switch (r) {
         case TopoutReason::None: return "none";

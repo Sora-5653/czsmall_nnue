@@ -19,9 +19,10 @@ Validate downloaded shards before training::
         data/colab/shard-0.tetradat.manifest.json \
         data/colab/shard-1.tetradat.manifest.json --require-complete
 
-The manifest is deliberately JSON and the dataset remains the existing
-rectangular v1 `.tetradat` format, so the normal trainer can consume each
-validated file as a separate input.
+The manifest is deliberately JSON and the dataset is the rectangular v3
+`.tetradat` format with explicit schema and termination metadata, so the normal
+trainer can consume each validated file as a separate input. Legacy v1 files
+remain readable for migration and comparison.
 """
 
 from __future__ import annotations
@@ -39,14 +40,45 @@ from typing import Any, Iterable
 
 
 MANIFEST_FORMAT = "czsmall_nnue.colab-shard"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 DATASET_MAGIC = b"TETRADAT"
-DATASET_VERSION = 1
+LEGACY_DATASET_VERSION = 1
+DATASET_VERSION = 3
 UINT64_LIMIT = 1 << 64
 
 # magic, version, samples, max_tokens, max_actions, token_features,
 # action_features, aux_targets, ruleset_hash, model_version
 DATASET_HEADER = struct.Struct("<8s7IQI")
+DATASET_CONTRACT = struct.Struct("<IIQQIIIIQQ")
+
+TOKEN_KIND_ORDER = [
+    "row", "col", "board", "active", "hold", "next", "garbage",
+    "counters", "event", "rule", "time", "opp_row", "opp_col", "opp_board",
+    "missing", "bag", "opp_counters",
+]
+AUX_TARGET_NAMES = [
+    "legacy_future_attack_1s", "legacy_future_garbage_received",
+    "legacy_time_to_terminal", "legacy_topped_out_within_8",
+    "real_0_1s_attack", "real_0_1s_garbage_received", "real_0_1s_self_topout",
+    "real_0_1s_opponent_topout", "real_1_2s_attack", "real_1_2s_garbage_received",
+    "real_1_2s_self_topout", "real_1_2s_opponent_topout", "real_2_4s_attack",
+    "real_2_4s_garbage_received", "real_2_4s_self_topout",
+    "real_2_4s_opponent_topout", "real_4_8s_attack", "real_4_8s_garbage_received",
+    "real_4_8s_self_topout", "real_4_8s_opponent_topout", "placements_0_1_attack",
+    "placements_0_1_garbage_received", "placements_0_1_self_topout",
+    "placements_0_1_opponent_topout", "placements_1_2_attack",
+    "placements_1_2_garbage_received", "placements_1_2_self_topout",
+    "placements_1_2_opponent_topout", "placements_2_4_attack",
+    "placements_2_4_garbage_received", "placements_2_4_self_topout",
+    "placements_2_4_opponent_topout", "placements_4_8_attack",
+    "placements_4_8_garbage_received", "placements_4_8_self_topout",
+    "placements_4_8_opponent_topout",
+]
+TOKENIZER_SCHEMA_VERSION = 2
+TOKENIZER_SCHEMA_HASH = 0x5F1E2C9A7B43D816
+OBSERVATION_SCHEMA_HASH = 0x8C74B1E2D6093A5F
+ACTION_SCHEMA_VERSION = 1
+AUX_TARGET_SCHEMA_VERSION = 2
 
 
 class ManifestError(ValueError):
@@ -64,6 +96,16 @@ class DatasetHeader:
     aux_targets: int
     ruleset_hash: int
     model_version: int
+    contract_version: int = 0
+    tokenizer_schema_version: int = TOKENIZER_SCHEMA_VERSION
+    tokenizer_schema_hash: int = TOKENIZER_SCHEMA_HASH
+    observation_schema_hash: int = OBSERVATION_SCHEMA_HASH
+    action_schema_version: int = ACTION_SCHEMA_VERSION
+    aux_target_schema_version: int = 1
+    randomizer_type: int = 0
+    termination_reason: int = 0
+    self_play_seed: int = 0
+    token_kind_order_hash: int = TOKENIZER_SCHEMA_HASH
 
 
 def sha256_file(path: Path) -> str:
@@ -85,7 +127,13 @@ def _expected_dataset_size(header: DatasetHeader) -> int:
         + 1
         + header.aux_targets
     )
-    return DATASET_HEADER.size + floats * 4
+    metadata = 0
+    header_bytes = DATASET_HEADER.size
+    if header.version == DATASET_VERSION:
+        floats += n * header.aux_targets  # aux_valid_mask
+        metadata = n * (4 + 4 + 8 + 4)
+        header_bytes += DATASET_CONTRACT.size
+    return header_bytes + floats * 4 + metadata
 
 
 def read_dataset_header(path: Path) -> DatasetHeader:
@@ -100,8 +148,35 @@ def read_dataset_header(path: Path) -> DatasetHeader:
     values = DATASET_HEADER.unpack(raw)
     if values[0] != DATASET_MAGIC:
         raise ManifestError(f"not a .tetradat file: {path}")
+    version = values[1]
+    if version not in (LEGACY_DATASET_VERSION, DATASET_VERSION):
+        raise ManifestError(
+            f"Colab shards must be rectangular dataset v1 or v3, got v{version}: {path}"
+        )
+    extra: dict[str, int] = {}
+    if version == DATASET_VERSION:
+        with path.open("rb") as fh:
+            fh.seek(DATASET_HEADER.size)
+            extension = fh.read(DATASET_CONTRACT.size)
+        if len(extension) != DATASET_CONTRACT.size:
+            raise ManifestError(f"dataset contract header is truncated: {path}")
+        values_ext = DATASET_CONTRACT.unpack(extension)
+        extra = {
+            "contract_version": values_ext[0],
+            "tokenizer_schema_version": values_ext[1],
+            "tokenizer_schema_hash": values_ext[2],
+            "observation_schema_hash": values_ext[3],
+            "action_schema_version": values_ext[4],
+            "aux_target_schema_version": values_ext[5],
+            "randomizer_type": values_ext[6],
+            "termination_reason": values_ext[7],
+            "self_play_seed": values_ext[8],
+            "token_kind_order_hash": values_ext[9],
+        }
+        if extra["contract_version"] != 1:
+            raise ManifestError(f"unsupported dataset contract version: {path}")
     header = DatasetHeader(
-        version=values[1],
+        version=version,
         samples=values[2],
         max_tokens=values[3],
         max_actions=values[4],
@@ -110,15 +185,25 @@ def read_dataset_header(path: Path) -> DatasetHeader:
         aux_targets=values[7],
         ruleset_hash=values[8],
         model_version=values[9],
+        **extra,
     )
-    if header.version != DATASET_VERSION:
-        raise ManifestError(
-            f"Colab shards must be rectangular dataset v1, got v{header.version}: {path}"
-        )
     if header.samples <= 0 or header.max_tokens <= 0 or header.max_actions <= 0:
         raise ManifestError(f"dataset has no usable samples or dimensions: {path}")
     if header.token_features <= 0 or header.action_features <= 0 or header.aux_targets <= 0:
         raise ManifestError(f"dataset has invalid feature widths: {path}")
+    if header.version == DATASET_VERSION:
+        if (header.tokenizer_schema_version != TOKENIZER_SCHEMA_VERSION or
+                header.tokenizer_schema_hash != TOKENIZER_SCHEMA_HASH or
+                header.token_kind_order_hash != TOKENIZER_SCHEMA_HASH or
+                header.observation_schema_hash != OBSERVATION_SCHEMA_HASH or
+                header.action_schema_version != ACTION_SCHEMA_VERSION):
+            raise ManifestError(f"tokenizer/observation/action schema mismatch: {path}")
+        if header.aux_target_schema_version == AUX_TARGET_SCHEMA_VERSION and header.aux_targets != 36:
+            raise ManifestError(f"aux target width does not match schema v2: {path}")
+        if header.aux_target_schema_version == 1 and header.aux_targets != 4:
+            raise ManifestError(f"legacy aux target width does not match schema v1: {path}")
+        if header.aux_target_schema_version not in (1, AUX_TARGET_SCHEMA_VERSION):
+            raise ManifestError(f"unknown aux target schema: {path}")
     actual_size = path.stat().st_size
     expected_size = _expected_dataset_size(header)
     if actual_size != expected_size:
@@ -216,14 +301,35 @@ def create_manifest(
             "sha256": sha256_file(dataset_path),
             "bytes": dataset_path.stat().st_size,
             "version": header.version,
+            "dataset_version": header.version,
+            "tokenizer_schema_version": header.tokenizer_schema_version,
+            "tokenizer_schema_hash": f"{header.tokenizer_schema_hash:016x}",
+            "observation_schema_hash": f"{header.observation_schema_hash:016x}",
+            "action_schema_version": header.action_schema_version,
+            "aux_target_schema_version": header.aux_target_schema_version,
+            "max_token_count": header.max_tokens,
             "samples": header.samples,
             "max_tokens": header.max_tokens,
             "max_actions": header.max_actions,
             "token_features": header.token_features,
             "action_features": header.action_features,
             "aux_targets": header.aux_targets,
+            "aux_target_names": AUX_TARGET_NAMES[:header.aux_targets],
             "ruleset_hash": f"{header.ruleset_hash:016x}",
             "model_version": header.model_version,
+            "randomizer_type": header.randomizer_type,
+            "termination_reason": header.termination_reason,
+            "self_play_seed": header.self_play_seed,
+            "token_kind_order_hash": f"{header.token_kind_order_hash:016x}",
+        },
+        "schema": {
+            "token_kind_order": TOKEN_KIND_ORDER,
+            "aux_targets": AUX_TARGET_NAMES[:header.aux_targets],
+            "tokenizer_schema_version": header.tokenizer_schema_version,
+            "tokenizer_schema_hash": f"{header.tokenizer_schema_hash:016x}",
+            "observation_schema_hash": f"{header.observation_schema_hash:016x}",
+            "action_schema_version": header.action_schema_version,
+            "aux_target_schema_version": header.aux_target_schema_version,
         },
         "run": {
             "base_seed": base_seed,
@@ -263,7 +369,7 @@ def _load_manifest(path: Path) -> dict[str, Any]:
         raise ManifestError(f"unsupported manifest format: {path}")
     if value.get("manifest_version") != MANIFEST_VERSION:
         raise ManifestError(f"unsupported manifest version: {path}")
-    for key in ("repository", "checkpoint", "dataset", "run"):
+    for key in ("repository", "checkpoint", "dataset", "schema", "run"):
         if not isinstance(value.get(key), dict):
             raise ManifestError(f"manifest is missing object '{key}': {path}")
     return value
@@ -316,18 +422,37 @@ def validate_manifests(
             raise ManifestError(f"dataset byte count mismatch: {dataset_path}")
         for key, actual in (
             ("version", header.version),
+            ("dataset_version", header.version),
             ("samples", header.samples),
             ("max_tokens", header.max_tokens),
+            ("max_token_count", header.max_tokens),
             ("max_actions", header.max_actions),
             ("token_features", header.token_features),
             ("action_features", header.action_features),
             ("aux_targets", header.aux_targets),
+            ("tokenizer_schema_version", header.tokenizer_schema_version),
+            ("action_schema_version", header.action_schema_version),
+            ("aux_target_schema_version", header.aux_target_schema_version),
             ("model_version", header.model_version),
         ):
             if dataset_info.get(key) != actual:
                 raise ManifestError(f"dataset header field {key} mismatch: {manifest_path}")
         if _ruleset_hash(dataset_info.get("ruleset_hash")) != header.ruleset_hash:
             raise ManifestError(f"dataset ruleset_hash mismatch: {manifest_path}")
+        for key, actual in (
+            ("tokenizer_schema_hash", header.tokenizer_schema_hash),
+            ("observation_schema_hash", header.observation_schema_hash),
+            ("token_kind_order_hash", header.token_kind_order_hash),
+        ):
+            if _ruleset_hash(dataset_info.get(key)) != actual:
+                raise ManifestError(f"dataset schema field {key} mismatch: {manifest_path}")
+        schema_info = manifest.get("schema")
+        if schema_info.get("token_kind_order") != TOKEN_KIND_ORDER:
+            raise ManifestError(f"token_kind_order mismatch: {manifest_path}")
+        expected_aux_names = AUX_TARGET_NAMES[:header.aux_targets]
+        if (schema_info.get("aux_targets") != expected_aux_names or
+                dataset_info.get("aux_target_names") != expected_aux_names):
+            raise ManifestError(f"aux target order mismatch: {manifest_path}")
 
         run = manifest.get("run")
         if not isinstance(run, dict):
@@ -357,6 +482,14 @@ def validate_manifests(
         ("repository.commit", lambda m: m["repository"]["commit"]),
         ("checkpoint.sha256", lambda m: m["checkpoint"]["sha256"]),
         ("dataset.ruleset_hash", lambda m: m["dataset"]["ruleset_hash"]),
+        ("dataset.tokenizer_schema_version", lambda m: m["dataset"]["tokenizer_schema_version"]),
+        ("dataset.tokenizer_schema_hash", lambda m: m["dataset"]["tokenizer_schema_hash"]),
+        ("dataset.observation_schema_hash", lambda m: m["dataset"]["observation_schema_hash"]),
+        ("dataset.action_schema_version", lambda m: m["dataset"]["action_schema_version"]),
+        ("dataset.aux_target_schema_version", lambda m: m["dataset"]["aux_target_schema_version"]),
+        ("dataset.aux_target_names", lambda m: m["dataset"]["aux_target_names"]),
+        ("schema.token_kind_order", lambda m: m["schema"]["token_kind_order"]),
+        ("schema.aux_targets", lambda m: m["schema"]["aux_targets"]),
         ("run.base_seed", lambda m: m["run"]["base_seed"]),
         ("run.shard_count", lambda m: m["run"]["shard_count"]),
         ("run.games_per_shard", lambda m: m["run"]["games_per_shard"]),

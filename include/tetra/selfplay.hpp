@@ -45,6 +45,7 @@ struct SelfPlayStats {
     TopoutReason topout = TopoutReason::None;
     float outcome = 0.0f;
     Tick duration = 0;
+    TerminationReason termination_reason = TerminationReason::Unknown;
 };
 
 // Plays one game and returns its samples.
@@ -83,6 +84,8 @@ public:
                                   rules);
             if (actions.empty()) {
                 p_active.die(TopoutReason::BlockOut);
+                recorder.note_topout(p_active.index(), p_active.now(),
+                                     recorder.size() == 0 ? 0 : recorder.size() - 1);
                 break;
             }
 
@@ -98,24 +101,30 @@ public:
             if (r.best_action < 0 ||
                 r.best_action >= static_cast<int>(actions.size())) {
                 p_active.die(TopoutReason::BlockOut);
+                recorder.note_topout(p_active.index(), p_active.now(),
+                                     recorder.size() == 0 ? 0 : recorder.size() - 1);
                 break;
             }
 
-            recorder.add(obs, actions, r, tokenizer, p0_turn ? 1 : -1);
+            recorder.add(obs, actions, r, tokenizer, p0_turn ? 1 : -1,
+                         p_active.index(), p_active.now());
 
             const PlacementAction& chosen = actions[static_cast<size_t>(r.best_action)];
             if (chosen.use_hold && !p_active.do_hold()) {
                 p_active.die(TopoutReason::BlockOut);
+                recorder.note_topout(p_active.index(), p_active.now(), recorder.size() - 1);
                 break;
             }
             p_active.set_active(chosen.piece_state());
             int sent = 0;
             const LockResult lr = p_active.lock_piece(chosen.total_duration(), &sent);
             
-            recorder.note_outcome_of_last(sent, lr.garbage_received);
+            recorder.note_outcome_of_last(sent, lr.garbage_received, p_active.now(),
+                                          lr.topped_out);
 
             if (!lr.ok && !lr.topped_out) {
                 p_active.die(TopoutReason::BlockOut);
+                recorder.note_topout(p_active.index(), p_active.now(), recorder.size() - 1);
                 break;
             }
             if (lr.topped_out) break;
@@ -172,6 +181,12 @@ public:
             }
         }
         stats.outcome = z;
+
+        stats.termination_reason =
+            (p0.alive() && p1.alive()) ? TerminationReason::Truncated
+                                       : TerminationReason::Terminated;
+        recorder.set_termination(stats.termination_reason,
+                                 std::max(p0.now(), p1.now()));
 
         if (stats_out) *stats_out = stats;
         return recorder.finalize(z);
