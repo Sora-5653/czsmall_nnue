@@ -534,11 +534,13 @@ TEST(action_cost_is_the_true_shortest_path) {
             const auto acts = gen.generate_for_piece(b, p, cfg, false);
 
             // Brute force: enumerate every input sequence up to length 4 and
-            // record the cheapest cost that reaches each final placement.
+            // record the cheapest cost for each final placement *and spin
+            // class*. A plain landing and a T-spin can occupy the same cells
+            // but are distinct actions with different attack values.
             const std::vector<Input> alphabet = {Input::Left,  Input::Right, Input::DasLeft,
                                                  Input::DasRight, Input::Cw, Input::Ccw,
                                                  Input::Flip, Input::SoftDrop};
-            std::map<std::tuple<int, int, int>, Tick> best;
+            std::map<std::tuple<int, int, int, int>, Tick> best;
             std::vector<std::vector<Input>> frontier{{}};
             for (int depth = 0; depth <= 3; ++depth) {
                 std::vector<std::vector<Input>> next;
@@ -548,8 +550,10 @@ TEST(action_cost_is_the_true_shortest_path) {
                     const ExecutionResult r =
                         execute_inputs(b, spawn_piece(p, cfg), seq, cfg);
                     if (r.ok && grounded(b, r.piece)) {
+                        const PlacementOutcome outcome = evaluate_placement(b, r.piece, cfg);
                         const auto key = std::make_tuple(r.piece.x, r.piece.y,
-                                                         static_cast<int>(r.piece.rot));
+                                                         static_cast<int>(r.piece.rot),
+                                                         static_cast<int>(outcome.spin));
                         auto it = best.find(key);
                         if (it == best.end() || r.cost < it->second) best[key] = r.cost;
                     }
@@ -566,10 +570,11 @@ TEST(action_cost_is_the_true_shortest_path) {
             // Anything brute force can reach, the generator must price at most
             // as cheaply (it may know a cheaper longer route, never a dearer one).
             for (const auto& [key, brute_cost] : best) {
-                const auto [bx, by, brot] = key;
+                const auto [bx, by, brot, bspin] = key;
                 for (const auto& a : acts) {
                     if (a.final_x == bx && a.final_y == by &&
-                        static_cast<int>(a.final_rotation) == brot) {
+                        static_cast<int>(a.final_rotation) == brot &&
+                        static_cast<int>(a.spin) == bspin) {
                         const Tick generator_cost =
                             a.base_duration -
                             (a.cleared_lines > 0 ? cfg.clear_rules.line_clear_delay : 0);

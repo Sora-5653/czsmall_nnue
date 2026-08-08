@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // TetraFormer / TetraZero -- Candidate Gating and the Arena (spec 20).
 //
-// Evaluates a Candidate network against a Champion network using paired games
-// with mirrored boards and identical piece sequences. To eliminate left-right
-// bias and queue luck, every trial is evaluated twice:
+// Evaluates a Candidate network against a Champion network using paired,
+// two-board games with mirrored boards and identical seeds. To eliminate
+// left-right bias and queue luck, every trial is evaluated twice:
 //   1. Normal board, normal piece sequence (seed S)
 //   2. Mirrored board, mirrored piece sequence (seed S, J <-> L, S <-> Z)
 //
@@ -48,6 +48,8 @@ struct ArenaGameResult {
     std::int64_t champion_cleared = 0;
     std::int64_t candidate_sent = 0;
     std::int64_t champion_sent = 0;
+    Tick candidate_duration = 0;
+    Tick champion_duration = 0;
     bool candidate_survived = false;
     bool champion_survived = false;
     float candidate_score = 0.0f;       // 1.0 = win, 0.5 = draw, 0.0 = loss
@@ -99,7 +101,12 @@ public:
             const float gp = static_cast<float>(res.games_played);
             res.win_rate = (cw + 0.5f * dw) / gp;
             compute_wilson_ci(res.win_rate, res.games_played, &res.ci_lower, &res.ci_upper);
-            res.promoted = (res.win_rate >= cfg_.promotion_threshold);
+            // A point estimate above 55% is not enough to call a noisy trial
+            // an improvement.  Require the Wilson lower bound to clear 50%
+            // as well, so promotion means the candidate is supported as
+            // stronger than the champion rather than merely lucky.
+            res.promoted = (res.win_rate >= cfg_.promotion_threshold &&
+                            res.ci_lower > 0.5f);
         }
         return res;
     }
@@ -107,84 +114,6 @@ public:
     const ArenaConfig& config() const { return cfg_; }
 
 private:
-    struct SideStats {
-        int pieces = 0;
-        std::int64_t cleared = 0;
-        std::int64_t sent = 0;
-        bool survived = false;
-    };
-
-    void maybe_send_garbage(Player& p, int move, Rng& rng) {
-        if (cfg_.garbage_style == GarbageStyle::None || move == 0) return;
-        switch (cfg_.garbage_style) {
-            case GarbageStyle::Steady:
-                if (move % cfg_.garbage_period == 0)
-                    p.receive_attack(cfg_.garbage_lines, p.now(), 1);
-                break;
-            case GarbageStyle::FastSmall:
-                if (move % std::max(1, cfg_.garbage_period / 3) == 0)
-                    p.receive_attack(1, p.now(), 1);
-                break;
-            case GarbageStyle::SlowLarge:
-                if (move % (cfg_.garbage_period * 3) == 0)
-                    p.receive_attack(cfg_.garbage_lines * 3, p.now(), 1);
-                break;
-            case GarbageStyle::Burst:
-                if (rng.chance(1, std::max(2, cfg_.garbage_period)))
-                    p.receive_attack(
-                        cfg_.garbage_lines + static_cast<int>(rng.below(4)), p.now(), 1);
-                break;
-            case GarbageStyle::None:
-                break;
-        }
-    }
-
-    SideStats run_one_side(Evaluator& ev, const RulesetConfig& rules,
-                           std::uint64_t seed, bool mirror) {
-        Player p;
-        p.reset(rules, seed, 0);
-        p.set_mirror(mirror);
-
-        MoveGenerator gen;
-        SearchConfig sc = cfg_.search;
-        Searcher searcher(ev, sc);
-        Rng garbage_rng(seed ^ 0x5EEDFACEull);
-
-        int i = 0;
-        for (; i < cfg_.max_pieces && p.alive(); ++i) {
-            maybe_send_garbage(p, i, garbage_rng);
-
-            const auto actions = gen.generate(
-                p.board(), p.active().type, p.hold(),
-                p.visible_next().empty() ? Piece::None : p.visible_next()[0],
-                rules);
-            if (actions.empty()) break;
-
-            sc.seed = seed * 0x9E3779B97F4A7C15ull + static_cast<std::uint64_t>(i);
-            searcher.set_config(sc);
-
-            const SearchResult r = searcher.search(p);
-            if (r.best_action < 0 || r.best_action >= static_cast<int>(actions.size()))
-                break;
-
-            const PlacementAction& chosen = actions[static_cast<size_t>(r.best_action)];
-            if (chosen.use_hold && !p.do_hold()) break;
-            p.set_active(chosen.piece_state());
-
-            int sent = 0;
-            const LockResult lr = p.lock_piece(chosen.total_duration(), &sent);
-            if (!lr.ok && !lr.topped_out) break;
-            if (lr.topped_out) break;
-        }
-
-        SideStats st;
-        st.pieces = i;
-        st.cleared = p.lines_cleared();
-        st.sent = p.lines_sent();
-        st.survived = p.alive();
-        return st;
-    }
-
     ArenaGameResult play_game(const RulesetConfig& rules, std::uint64_t seed,
                               int pair_idx, bool mirror) {
         ArenaGameResult g;
@@ -192,36 +121,106 @@ private:
         g.is_mirrored = mirror;
         g.seed = seed;
 
-        const SideStats c = run_one_side(candidate_, rules, seed, mirror);
-        const SideStats h = run_one_side(champion_, rules, seed, mirror);
+        // SelfPlayWorker already defines the game's transition semantics:
+        // both boards advance in timestamp order, attacks are delivered to
+        // the other board, and the same model/search contract is used on each
+        // turn.  Arena must use that same interaction model; running the two
+        // evaluators independently would train a two-board outcome while
+        // evaluating a single-board survival proxy.
+        Player candidate_player;
+        candidate_player.reset(rules, seed, 0);
+        candidate_player.set_mirror(mirror);
+        Player champion_player;
+        champion_player.reset(rules, seed ^ 0xFEEDFACEull, 1);
+        champion_player.set_mirror(mirror);
 
-        g.candidate_pieces = c.pieces;
-        g.champion_pieces = h.pieces;
-        g.candidate_cleared = c.cleared;
-        g.champion_cleared = h.cleared;
-        g.candidate_sent = c.sent;
-        g.champion_sent = h.sent;
-        g.candidate_survived = c.survived;
-        g.champion_survived = h.survived;
+        MoveGenerator gen;
+        SearchConfig candidate_sc = cfg_.search;
+        SearchConfig champion_sc = cfg_.search;
+        Searcher candidate_search(candidate_, candidate_sc);
+        Searcher champion_search(champion_, champion_sc);
+        int candidate_pieces = 0;
+        int champion_pieces = 0;
+
+        while (candidate_player.alive() && champion_player.alive() &&
+               candidate_pieces < cfg_.max_pieces && champion_pieces < cfg_.max_pieces) {
+            const bool candidate_turn = candidate_player.now() <= champion_player.now();
+            Player& active = candidate_turn ? candidate_player : champion_player;
+            Player& inactive = candidate_turn ? champion_player : candidate_player;
+            int& active_pieces = candidate_turn ? candidate_pieces : champion_pieces;
+            Searcher& searcher = candidate_turn ? candidate_search : champion_search;
+            SearchConfig& sc = candidate_turn ? candidate_sc : champion_sc;
+
+            const auto actions = gen.generate(
+                active.board(), active.active().type, active.hold(),
+                active.visible_next().empty() ? Piece::None : active.visible_next()[0],
+                rules);
+            if (actions.empty()) {
+                active.die(TopoutReason::BlockOut);
+                break;
+            }
+
+            sc.seed = seed * 0x9E3779B97F4A7C15ull +
+                      static_cast<std::uint64_t>(candidate_pieces + champion_pieces);
+            searcher.set_config(sc);
+            Evaluator& opponent_evaluator = candidate_turn ? champion_ : candidate_;
+            const SearchResult r = searcher.search(
+                active, &inactive, &opponent_evaluator,
+                /*deliver_attacks=*/cfg_.garbage_style != GarbageStyle::None);
+            if (r.best_action < 0 || r.best_action >= static_cast<int>(actions.size())) {
+                active.die(TopoutReason::BlockOut);
+                break;
+            }
+
+            const PlacementAction& chosen = actions[static_cast<size_t>(r.best_action)];
+            if (chosen.use_hold && !active.do_hold()) {
+                active.die(TopoutReason::BlockOut);
+                break;
+            }
+            active.set_active(chosen.piece_state());
+            int sent = 0;
+            const LockResult lr = active.lock_piece(chosen.total_duration(), &sent);
+            if (!lr.ok && !lr.topped_out) {
+                active.die(TopoutReason::BlockOut);
+                break;
+            }
+            if (lr.topped_out) break;
+
+            if (sent > 0 && cfg_.garbage_style != GarbageStyle::None)
+                inactive.receive_attack(sent, active.now(), active.index());
+            ++active_pieces;
+        }
+
+        g.candidate_pieces = candidate_pieces;
+        g.champion_pieces = champion_pieces;
+        g.candidate_cleared = candidate_player.lines_cleared();
+        g.champion_cleared = champion_player.lines_cleared();
+        g.candidate_sent = candidate_player.lines_sent();
+        g.champion_sent = champion_player.lines_sent();
+        g.candidate_duration = candidate_player.now();
+        g.champion_duration = champion_player.now();
+        g.candidate_survived = candidate_player.alive();
+        g.champion_survived = champion_player.alive();
 
         float score = 0.5f;
-        if (c.survived && !h.survived) {
+        if (g.candidate_survived && !g.champion_survived) {
             score = 1.0f;
-        } else if (!c.survived && h.survived) {
+        } else if (!g.candidate_survived && g.champion_survived) {
             score = 0.0f;
-        } else if (!c.survived && !h.survived) {
-            if (c.pieces > h.pieces) score = 1.0f;
-            else if (c.pieces < h.pieces) score = 0.0f;
+        } else if (!g.candidate_survived && !g.champion_survived) {
+            if (g.candidate_pieces > g.champion_pieces) score = 1.0f;
+            else if (g.candidate_pieces < g.champion_pieces) score = 0.0f;
             else {
-                if (c.sent > h.sent) score = 1.0f;
-                else if (c.sent < h.sent) score = 0.0f;
+                if (g.candidate_sent > g.champion_sent) score = 1.0f;
+                else if (g.candidate_sent < g.champion_sent) score = 0.0f;
             }
         } else {
-            // Both survived: compare attack lines sent
-            if (c.sent > h.sent) score = 1.0f;
-            else if (c.sent < h.sent) score = 0.0f;
-            else if (c.cleared > h.cleared) score = 1.0f;
-            else if (c.cleared < h.cleared) score = 0.0f;
+            // Both survived to the truncation boundary: compare attack lines
+            // first, then cleared lines as a deterministic tie-break.
+            if (g.candidate_sent > g.champion_sent) score = 1.0f;
+            else if (g.candidate_sent < g.champion_sent) score = 0.0f;
+            else if (g.candidate_cleared > g.champion_cleared) score = 1.0f;
+            else if (g.candidate_cleared < g.champion_cleared) score = 0.0f;
         }
         g.candidate_score = score;
         return g;

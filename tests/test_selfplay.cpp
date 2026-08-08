@@ -25,12 +25,13 @@ SelfPlayConfig quick_config(int pieces = 40, int sims = 12) {
 
 }  // namespace
 
-TEST(selfplay_produces_one_sample_per_placement) {
+TEST(selfplay_records_each_player_placement) {
     HeuristicEvaluator ev;
     SelfPlayWorker w(ev, quick_config());
     SelfPlayStats st;
     const auto samples = w.play(league(), 1, &st);
-    CHECK_EQ(static_cast<int>(samples.size()), st.pieces);
+    CHECK_MSG(samples.size() >= static_cast<size_t>(st.pieces),
+              "the recorder must include the active player's placements");
     CHECK(st.pieces > 0);
 }
 
@@ -103,13 +104,15 @@ TEST(outcome_is_the_game_result_only) {
     CHECK(!samples.empty());
     const float z = st.outcome;
     for (const auto& s : samples)
-        CHECK_MSG(s.outcome == z, "every sample in a game shares the game's outcome");
+        CHECK_MSG(s.outcome == z || s.outcome == -z,
+                  "every sample must use either player's game-result perspective");
 
     if (!st.survived) {
         CHECK_EQ(z, -1.0f);
         // Garbage received must NOT have leaked into the reward.
         CHECK(st.lines_received > 0);
-        for (const auto& s : samples) CHECK(s.outcome == -1.0f);
+        for (const auto& s : samples)
+            CHECK(s.outcome == -1.0f || s.outcome == 1.0f);
     }
 }
 
@@ -376,6 +379,43 @@ TEST(game_recorder_stamps_the_outcome_on_every_sample) {
     CHECK_EQ(static_cast<int>(rec.size()), 0);  // finalize drains the recorder
 }
 
+TEST(game_recorder_converts_outcome_to_each_sample_perspective) {
+    GameRecorder rec;
+    Tokenizer tok;
+    const RulesetConfig cfg = league();
+    Player p;
+    p.reset(cfg, 17, 0);
+    MoveGenerator gen;
+    HeuristicEvaluator ev;
+    SearchConfig sc;
+    sc.simulations = 8;
+    sc.max_depth = 2;
+    Searcher s(ev, sc);
+
+    const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
+                                   p.visible_next().empty() ? Piece::None
+                                                            : p.visible_next()[0],
+                                   cfg);
+    CHECK(!acts.empty());
+    const Observation obs = observe(p);
+    const SearchResult r = s.search(p);
+    CHECK(r.best_action >= 0);
+
+    rec.add(obs, acts, r, tok, /*value_perspective=*/1);
+    rec.note_outcome_of_last(/*attack_sent=*/3, /*garbage_received=*/0);
+    rec.add(obs, acts, r, tok, /*value_perspective=*/-1);
+    rec.note_outcome_of_last(/*attack_sent=*/5, /*garbage_received=*/0);
+    const auto samples = rec.finalize(1.0f);
+
+    CHECK_EQ(samples.size(), static_cast<size_t>(2));
+    CHECK_EQ(samples[0].outcome, 1.0f);
+    CHECK_EQ(samples[0].n_step_return, 1.0f);
+    CHECK_EQ(samples[0].future_attack_1s, 3.0f);
+    CHECK_EQ(samples[1].outcome, -1.0f);
+    CHECK_EQ(samples[1].n_step_return, -1.0f);
+    CHECK_EQ(samples[1].future_attack_1s, 5.0f);
+}
+
 TEST(selfplay_feeds_a_buffer_end_to_end) {
     // The whole pipeline: search -> samples -> buffer -> training batch.
     // With this in place, attaching a network is an Evaluator change alone.
@@ -411,7 +451,8 @@ TEST(selfplay_works_with_a_uniform_evaluator) {
     SelfPlayStats st;
     const auto samples = w.play(league(), 1, &st);
     CHECK(!samples.empty());
-    CHECK_EQ(static_cast<int>(samples.size()), st.pieces);
+    CHECK_MSG(samples.size() >= static_cast<size_t>(st.pieces),
+              "the recorder must include the active player's placements");
 }
 
 TEST(selfplay_runs_under_every_preset) {

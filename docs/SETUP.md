@@ -75,7 +75,7 @@ export HSA_OVERRIDE_GFX_VERSION=12.0.1   # only if detection still fails
 
 ## 2. What is already done
 
-- The engine builds and its 263 tests pass with no dependencies at all.
+- The engine builds and its 272 tests pass with no dependencies at all.
 - Self-play, search, the replay buffer and dataset export are complete.
 - `trainer/` contains the network, the dataset reader and a training loop.
 - The C++ inference path is **numerically verified against PyTorch** to ~1e-7
@@ -93,7 +93,7 @@ in `tests/data/` will be missing. They are fully reproducible from seeds:
 python scripts/make_fixtures.py   # needs torch; regenerates them byte-for-byte
 ```
 
-Without them, `make test` skips the two PyTorch-parity tests and the other 261
+Without them, `make test` skips the two PyTorch-parity tests and the other 270
 still run.
 
 ```sh
@@ -107,13 +107,30 @@ make test
 
 # 3. Train. Add --device cuda to use the GPU (ROCm reports as "cuda").
 python trainer/train.py data/train.tetradat --steps 2000 --model s \
-    --device cuda --save models/gen1.pt
+    --device cuda --require-gpu --save models/gen1.pt
 
 # 4. Export the weights for the C++ engine.
 python trainer/export_weights.py models/gen1.pt models/gen1.tetrawts
 
 # 5. Play with them.
 ./build/tetra_cli play models/gen1.tetrawts 200 64
+
+# GPU-backed C++ search/inference with a Tetr.io-style APM/APP/PPS report.
+python trainer/gpu_match.py models/gen1.pt --device cuda --games 4 \
+    --pieces 200 --sims 32 --precision fp16 --workers 4
+
+# GPU-backed paired Arena (the C++ simulator remains authoritative).
+python trainer/gpu_arena.py models/candidate.pt models/champion.pt --device cuda \
+    --pairs 20 --pieces 300 --sims 32 --precision fp16 --seed 42
+
+# GPU-backed self-play data generation for the next training generation.
+python trainer/gpu_selfplay.py models/gen1.pt data/gen2.tetradat \
+    --device cuda --games 32 --pieces 300 --sims 64 --model-version 2
+
+# One guarded generation: the candidate is promoted only if Arena passes.
+python trainer/iterate.py --champion models/champion.pt \
+    --replay data/gen1.tetradat --generation 2 \
+    --champion-output models/champion --device cuda
 ```
 
 Or simply:
@@ -132,20 +149,114 @@ AlphaZero-style training is iterative. One generation is:
 # Self-play with the current best weights -> new data
 ./build/tetra_cli export data/gen$N.tetradat 200 300 64
 
-# Train on it
+# Train on it; --resume also restores the optimizer and sampling RNG.
 python trainer/train.py data/gen$N.tetradat --steps 5000 --model s \
-    --device cuda --save models/gen$N.pt
+    --device cuda --require-gpu --checkpoint-every 1000 \
+    --value-weight 1.0 \
+    --best-save models/gen$N.best.pt --save models/gen$N.pt
 
 # Export and play
 python trainer/export_weights.py models/gen$N.pt models/gen$N.tetrawts
+python trainer/export_weights.py models/gen$N.best.pt models/gen$N.best.tetrawts
 ./build/tetra_cli play models/gen$N.tetrawts
 ```
 
-**A limitation to be aware of.** `tetra_cli export` currently self-plays with
-the built-in `HeuristicEvaluator`, not with your trained weights, so the loop
-above is *supervised bootstrapping* rather than true self-play iteration.
-Wiring `--weights` into `export` is a small change and is the first thing worth
-doing on your machine; see `docs/ROADMAP.md`.
+`tetra_cli export` accepts `--weights` when the current model should drive the
+next generation, for example:
+
+```sh
+./build/tetra_cli export data/gen$N.tetradat 200 300 64 \
+    --weights models/gen$N.best.tetrawts
+```
+
+The exported data is still local simulator data; the project never connects to
+TETR.IO.
+
+For larger generations, `trainer/gpu_selfplay.py` keeps the same C++ rules and
+search but serves network evaluations from PyTorch/ROCm. It writes a
+rectangular v1 dataset from the C++ side: two-board self-play records both
+players in chronological order, with each value outcome converted to the
+recorded player's perspective. Because either player's observation includes
+the opponent event stream, compact replay metadata would not be sufficient to
+reconstruct these observations. The script also reports the number of
+GPU-evaluated positions.
+
+### Colab position generation
+
+Colab is reserved for generating additional self-play positions. The local
+machine remains the authority for checkpoint promotion and Arena comparison.
+The launcher is intentionally notebook-friendly and keeps the C++ engine as
+the authority for rules, Cobra move generation, search and labels:
+
+1. Every Colab instance checks out the same commit, installs the Python
+   requirements and loads the same checkpoint.
+2. Run one shard. `--build-engine` compiles `tetra_cli` when the Colab VM does
+   not already have it:
+
+```sh
+python trainer/colab_generate.py generate models/champion.pt \
+    data/colab/shard-0.tetradat --base-seed 100000 \
+    --shard-id 0 --shard-count 4 --games 32 --pieces 300 --sims 64 \
+    --model-version 4 --device cuda --build-engine
+```
+
+   For shard `i`, use the same `--base-seed`, `--shard-count` and `--games`,
+   changing only `--shard-id i`. The launcher assigns the disjoint interval
+   `[base_seed + i * games, base_seed + (i + 1) * games)`.
+3. Download the `.tetradat` file and its generated
+   `.tetradat.manifest.json`. The manifest records the commit, checkpoint
+   hash, ruleset/model/search settings, seed interval and sample count.
+4. Validate all manifests locally before training:
+
+```sh
+python trainer/colab_generate.py validate \
+    data/colab/shard-0.tetradat.manifest.json \
+    data/colab/shard-1.tetradat.manifest.json \
+    data/colab/shard-2.tetradat.manifest.json \
+    data/colab/shard-3.tetradat.manifest.json \
+    --checkpoint models/champion.pt --require-complete
+```
+
+5. Supply the validated shard files as separate inputs:
+
+```sh
+python trainer/train.py data/colab/shard-0.tetradat \
+    data/colab/shard-1.tetradat data/local.tetradat \
+    --resume models/champion.pt --device cuda --require-gpu \
+    --value-weight 1.0 --steps 5000 --save models/candidate.pt
+```
+
+The launcher refuses overlapping seed intervals and incompatible rulesets,
+checkpoints or search settings. Google Apps Script/Drive automation remains a
+later stage; it may move completed files but does not define seeds, labels or
+dataset merging.
+
+`trainer/train.py` accepts multiple dataset paths. The last path is the new
+generation. Keep `--new-data-repeat` at 1 for an unbiased first trial; higher
+values deliberately oversample the newest generation, for example:
+
+```sh
+python trainer/train.py data/gen1.tetradat data/gen2.tetradat \
+    --resume models/champion.pt --new-data-repeat 1 \
+    --device cuda --require-gpu --value-weight 1.0 \
+    --steps 5000 --save models/gen2.pt
+```
+
+`trainer/iterate.py` runs this sequence automatically and uses the GPU Arena
+by default. It copies the candidate to `--champion-output` only when the Arena
+promotion threshold is met; pass `--cpu-arena` for the legacy CPU evaluator.
+
+GPU play defaults to fp16 inference, one root determinization, and batched
+PUCT to keep latency bounded. Use `--precision fp32`, `--determinizations 2`,
+and `--gumbel` when reproducing the higher-exploration self-play configuration.
+
+The WDL value head is trained together with the policy head. The default loss
+weights are `policy=1.0`, `value=1.0`, and `aux=0.1`; they are stored in the
+checkpoint and restored on `--resume`. Use `--value-weight 0` only for a
+deliberate policy-only ablation. For a conservative policy experiment,
+`--policy-head-only --reset-optimizer` freezes the shared trunk and value/aux
+heads. Training output also reports value accuracy and scalar value MSE so a
+run cannot look healthy from policy loss alone.
 
 ---
 
@@ -160,10 +271,11 @@ On a 2-core CPU the dev model trains at ~25 steps/s. Your GPU should manage the
 `s` model comfortably; start with a batch size of 256 and raise it until VRAM
 (16 GB) complains.
 
-The C++ inference path is scalar CPU code, so a spec-sized model is slow for
-*self-play generation*. Options, in order of effort: keep generating with the
-`dev` model, run generation on many CPU cores in parallel, or add an ONNX
-Runtime backend behind the same `Evaluator` interface.
+`tetra_cli play` remains a dependency-free scalar CPU path. For GPU inference
+inside the C++ search loop, use `trainer/gpu_match.py`: it launches the C++
+rules/search child and answers its batched evaluator frames with PyTorch/ROCm.
+The script prints PPS, APM and APP; APM is outgoing attack lines per minute and
+APP is outgoing attack lines per placed piece.
 
 ---
 

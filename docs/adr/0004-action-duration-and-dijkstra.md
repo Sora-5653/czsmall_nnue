@@ -1,7 +1,8 @@
 # ADR 0004: Action duration, and why movegen became Dijkstra
 
 ## Status
-Accepted.
+Superseded for route enumeration by the pure-Cobra movegen integration; the
+action-duration and delay-bin contract remains accepted.
 
 ## Context
 Spec §8.4 defines a placement's cost in time and a set of delay bins, and spec
@@ -11,6 +12,12 @@ change every action was priced as a constant (the CLI passed a hardcoded 20
 ticks to `lock_piece`), so none of that was expressible.
 
 ## Decision
+
+The historical Dijkstra implementation described below has been removed. The
+current move generator delegates legal-state and canonical-path enumeration to
+Cobra's `MoveList` and `PathFinder`, then replays the tap and finesse paths
+through `HandlingModel` and keeps the cheaper valid route. The timing contract
+and action metadata remain unchanged.
 
 **1. Every action carries a real duration.** `HandlingModel` derives the cost of
 each input from `RulesetConfig::movement` (DAS, ARR, SDF, ARE, lock delay), so a

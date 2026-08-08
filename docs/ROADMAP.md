@@ -7,8 +7,8 @@ Status against the milestones in the specification (§21).
 | **M0 — rule core** | **Done.** Board, pieces, SRS/SRS+/180 kicks, spins, clears, attack, garbage, ruleset versioning, event log. |
 | **M1 — single-board policy inputs** | **Done** for the non-neural half: legal placement generation, per-action durations and delay bins, observation masking, Row/Column tokenizer, action embeddings. The Transformer itself and supervised pretraining are not implemented. |
 | M2 — Leela-style search | **Done.** Batched `Evaluator`, PUCT and Gumbel sequential halving with virtual loss, transposition table, root determinization (chance nodes), training samples, replay buffer, self-play worker, candidate gating (`Arena` / spec §20), and compact Replay+π dataset format (ADR 0012). |
-| M3 — garbage-aware self-play | Partially enabled: the rule core already models travel time, activation, cancellation and action duration. The self-play loop and curriculum are not written. |
-| M4 — opponent board | `Observation` already has opponent fields and the tokenizer emits opponent tokens. Opponent Intent Head and 1v1 event-driven search are not written. |
+| M3 — garbage-aware self-play | **Enabled.** Self-play and Arena advance both boards in timestamp order and deliver attacks through the same event transition used by search. The style flag still supports explicit no-attack curriculum runs. |
+| M4 — opponent board | **Partially enabled.** `Observation` and the tokenizer carry opponent tokens; the search now keeps both boards, routes attacks, swaps turns by clock, and can route each side to its own evaluator. Opponent Intent Head and league training remain. |
 | M5 — multimodal | Not started. |
 
 ## Immediate next steps
@@ -32,14 +32,16 @@ Status against the milestones in the specification (§21).
    ADR 0009.
 5. ~~**The network.**~~ **Built and training.** `trainer/tetraformer.py`
    implements the spec §9-10 architecture and trains on engine-exported data
-   (held-out loss 4.86 -> 2.91). What remains is *training it seriously*, which
-   needs a GPU: a spec-sized forward pass is ~8.6 ms/position on this 2-core
+   (held-out loss 4.86 -> 2.91). Policy and WDL value losses are enabled by
+   default. Resumable GPU training, best-validation checkpoints and a
+   GPU-backed match runner are now available. A spec-sized
+   forward pass is ~8.6 ms/position on this 2-core
    CPU against a 30 ms / 64-simulation budget (ADR 0007). The C++ inference
    path is now closed: `TetraFormerEvaluator` loads `.tetrawts` weights and is
    verified against PyTorch to ~1e-7 (ADR 0011).
-6. ~~**Self-play with trained weights.**~~ **Done.** `tetra_cli export`, `selfplay-gen`, `search`, and `play` now accept an optional `--weights <path>` flag to load `.tetrawts` and evaluate positions with `TetraFormerEvaluator`.
-7. ~~**Candidate gating and the Arena** (spec §20).~~ **Done.** `Arena` (`include/tetra/arena.hpp`) evaluates Candidate against Champion over paired games with mirrored boards and identical piece sequences (`J <-> L`, `S <-> Z`), computing Wilson score 95% confidence intervals and checking spec §20 promotion thresholds. `tetra_cli arena` drives it.
-8. ~~**Compact dataset serialization (ADR 0012).**~~ **Done.** `DatasetHeader::VERSION_COMPACT` (=2) stores Replay + π (ruleset, seed, move number, chosen action, policy/value/aux targets) and reconstructs tokenized observations and action embeddings on the fly during dataset loading (`deserialize_compact_dataset` in C++ and `tetra_cli decode-dataset` in Python), reducing `.tetradat` disk size and I/O by over 100x.
+6. ~~**Self-play with trained weights.**~~ **Done.** `tetra_cli export`, `selfplay-gen`, `search`, and `play` accept an optional `--weights <path>` flag to load `.tetrawts`; `trainer/gpu_match.py` runs the same C++ search with PyTorch/ROCm inference and reports APM/APP/PPS. `trainer/gpu_selfplay.py` exports the already-tokenized two-board samples through the GPU evaluator bridge.
+7. ~~**Candidate gating and the Arena** (spec §20).~~ **Done.** `Arena` (`include/tetra/arena.hpp`) evaluates Candidate against Champion over paired games with mirrored boards and identical piece sequences (`J <-> L`, `S <-> Z`), computing Wilson score 95% confidence intervals and checking spec §20 promotion thresholds. `tetra_cli arena` remains the CPU fallback; `trainer/gpu_arena.py` serves both checkpoints through the GPU bridge, and `trainer/iterate.py` uses that path by default.
+8. ~~**Compact dataset serialization (ADR 0012).**~~ **Done for single-board samples.** `DatasetHeader::VERSION_COMPACT` (=2) stores Replay + π (ruleset, seed, move number, chosen action, policy/value/aux targets) and reconstructs tokenized observations and action embeddings on the fly during dataset loading (`deserialize_compact_dataset` in C++ and `tetra_cli decode-dataset` in Python). Two-board samples intentionally fall back to rectangular v1 because replay metadata does not contain the opponent event stream.
 9. **Lock delay and `reset_limit`.** Gravity is now enforced as a reachability
    constraint (ADR 0006), but the lock-delay window is not: a piece resting on
    the stack may be manoeuvred for `lock_delay` ticks with a bounded number of
@@ -47,6 +49,29 @@ Status against the milestones in the specification (§21).
    current model is conservative — it rejects some genuinely reachable
    high-gravity placements — and closing this is the last gap in the movement
    model.
+10. **Colab-sharded position generation (Stage 1 implemented).** Colab is used
+    as an additional GPU worker for self-play position generation, not as a
+    second source of rules or move generation. `trainer/colab_generate.py`
+    wraps the existing `trainer/gpu_selfplay.py` bridge and exports a
+    rectangular v1 `.tetradat` shard plus a manifest. A shard owns a
+    non-overlapping contiguous seed interval:
+    `seed_start = base_seed + shard_id * games_per_shard`, and game `g` uses
+    `seed_start + g`. The validator checks dataset integrity, repository and
+    checkpoint compatibility, ruleset/model version, search settings and
+    overlapping seed intervals. Local training can pass all validated shard
+    paths to `trainer/train.py`; no byte-level concatenation is required.
+
+    Implementation order:
+
+    1. ~~Add a small Colab launcher that builds the Linux engine and runs one
+       deterministic shard.~~ **Done.**
+    2. ~~Add manifest creation and validation, including ruleset/checkpoint
+       compatibility and overlapping-seed rejection.~~ **Done.**
+    3. Add resumable Drive upload/download of completed shards. Google Apps
+       Script is optional orchestration only; it must not be the authority for
+       seeds, labels or dataset merging.
+    4. Compare local-only and mixed local/Colab generations with the same
+       Arena protocol before promoting a checkpoint.
 
 ## Open questions
 

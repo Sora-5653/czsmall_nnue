@@ -152,7 +152,7 @@ TEST(weights_load_with_the_expected_shape) {
     if (!file_exists(kWeights)) {
         // The fixture is reproducible rather than precious: regenerate it with
         // `python scripts/make_fixtures.py` (needs torch). Skipping instead of
-        // failing keeps the other 261 tests useful on a machine without it.
+        // failing keeps the other 270 tests useful on a machine without it.
         std::printf("       (skipped: run python scripts/make_fixtures.py)\n");
         return;
     }
