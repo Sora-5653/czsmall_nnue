@@ -86,3 +86,18 @@ The model is not *strong*. It is trained on a few hundred samples from a
 heuristic-guided search, on a CPU, purely to prove the handover is correct and
 that the loss decreases on held-out data. Real training belongs on a GPU, and
 strength evaluation needs the Arena and gating (spec §20) that M2 still lacks.
+
+## Follow-up decisions (2026-08)
+
+The fixed tensor contract proved useful beyond TetraFormer: CNN and
+CNN+Transformer ablations reuse the same public input/output interface, allowing
+architecture comparisons without changing the simulator or dataset semantics.
+[ADR 0013](0013-architecture-ablation-and-local-geometry.md) records the rule
+that these architectures are selected with search/Arena evidence rather than
+held-out policy loss alone.
+
+The auxiliary regressions introduced here also evolved into a larger
+sample-efficiency program. [ADR 0014](0014-objectives-auxiliary-targets-and-vs-score.md)
+keeps WDL as the objective anchor while permitting masked multi-horizon and
+action-conditioned auxiliary targets with explicit gradient-interference
+monitoring.

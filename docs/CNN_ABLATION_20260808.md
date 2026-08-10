@@ -1,5 +1,9 @@
 # CNN architecture ablation — 2026-08-08
 
+> This file is experimental evidence, not the project architecture policy.
+> [ADR 0013](adr/0013-architecture-ablation-and-local-geometry.md) records the
+> accepted interpretation and the constraints on follow-up hybrids.
+
 ## Question
 
 Does an explicit local 2D board inductive bias improve the current TetraFormer policy when the data, split, optimiser, minibatches, number of steps, and seed are held fixed?
