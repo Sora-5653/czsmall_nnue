@@ -1,111 +1,105 @@
-# ADR 0013: Judge architecture changes by game strength; keep local-geometry experiments incremental
+# ADR 0013: Architecture変更はgame strengthで判断し、local geometry実験は段階的に進める
 
-## Status
-Accepted.
+## 状態
 
-## Context
+採用。
 
-The original network path is TetraFormer: a Transformer consumes the engine's
-row/column/global tokens and scores a variable legal-action set. By August 2026
-the self-play corpus was large enough to ask whether an explicit 2D board
-inductive bias would learn local geometry more efficiently.
+## 背景
 
-The 2026-08-08 ablation compared three parameter-matched families on the same
-47,693-sample corpus and controlled optimizer, update count, minibatch schedule,
-and seed:
+当初のnetwork pathはTetraFormerです。Transformerがengineのrow/column/global tokenを読み、positionごとに可変なlegal-action setをscoreします。
 
-- the existing TetraFormer-S control;
-- a residual CNN board encoder plus global-token pooling;
-- a CNN+Transformer hybrid.
+2026年8月までにself-play corpusが約47,693 samplesへ増え、明示的な2D board inductive biasを持つCNNがlocal geometryをよりsample-efficientに学ぶかを比較できるようになりました。
 
-The experiment exposed a useful conflict between metrics. The Transformer
-consistently achieved slightly better held-out policy cross-entropy against a
-Transformer-search-generated teacher. On the corrected hashed split, however,
-the CNN learned WDL/value much more successfully. The CNN's strongest repeatable
-advantage appeared when the network was used *inside search*: its 16-simulation
-Arena results were materially stronger than the matched Transformer across
-independent seed blocks, while raw policy-only play was closer to parity.
+2026-08-08のablationでは、同一corpus上でparameter scaleを近づけた3 familyを比較しました。
 
-Follow-up hybrids also mattered. A compact independent CNN value branch could
-look good on static held-out value metrics and then overfit badly; small
-CNN-token/fusion variants did not recover the full CNN baseline's search
-advantage. Simple inference-time policy/value swaps likewise failed to identify
-one head as the sole cause.
+- existing TetraFormer-S control
+- residual CNN board encoder + global-token pooling
+- CNN+Transformer hybrid
 
-The central lesson is that this project has at least three different questions:
+optimizer、update count、minibatch schedule、seedなども揃えました。
 
-1. how closely a network imitates its search teacher;
-2. how well it predicts WDL/value on held-out samples;
-3. how useful its policy/value representation is when embedded back inside
-   search.
+結果は、1つのmetricだけでは説明できませんでした。
 
-Those questions are related, but the ablation showed they are not equivalent.
+- TransformerはTransformer-search-generated teacherに対するheld-out policy cross-entropyが一貫してわずかに良かった。
+- corrected hashed splitではCNNがWDL/value targetを大幅に良く学習した。
+- CNNの最も再現性の高い優位はnetworkを**search内部へ戻したとき**に現れた。
+- 16-simulation Arenaでは独立seed blockを跨いでCNNがmatched Transformerより強かった。
+- 一方raw policy-only playはparityに近く、初期の大勝だけを一般化できなかった。
 
-## Decision
+follow-up hybridも重要でした。
 
-### 1. Keep TetraFormer as the reference/control
+- independent compact CNN value branchはstatic held-out value metricが良くてもlate overfitした。
+- small CNN token / fusion branchはfull CNN baselineのsearch advantageを再現できなかった。
+- inference時にpolicy/value outputを単純swapしても、どちらか1 headだけが原因とは切り分けられなかった。
 
-The existing Transformer is not replaced merely because a new architecture
-wins one short Arena, and it is not discarded because a CNN has a stronger local
-inductive bias. It remains the stable comparison model while alternatives are
-measured.
+つまり少なくとも次の3問いは別です。
 
-### 2. Treat the CNN result as real evidence, not as a production replacement
+1. networkがsearch teacherをどれだけ正確に模倣するか。
+2. held-out sampleでWDL/valueをどれだけ正確に予測するか。
+3. policy/value representationをsearchへ埋め戻したとき、実際にどれだけ役に立つか。
 
-The full CNN baseline remains a first-class experimental candidate because its
-search advantage survived corrected splitting and multiple Arena seed blocks.
-That evidence justifies further work on local board encoders.
+関連はありますが、ablationは**同値ではない**ことを示しました。
 
-It does **not** justify silently changing the production/champion architecture.
-Promotion still goes through the normal Candidate/Champion gate.
+## 決定
 
-### 3. Do not use held-out policy loss as the architecture selector
+### 1. TetraFormerをreference/controlとして残す
 
-Held-out policy cross-entropy is an imitation diagnostic. In this corpus the
-teacher itself is Transformer-search-derived, so small differences in imitation
-loss are not architecture-neutral evidence of game strength.
+新architectureが短いArenaで勝っただけでは、既存Transformerをproduction referenceから外しません。
 
-Architecture evaluation must include paired Arena play under fixed search
-budgets and multiple seeds. Raw-policy Arena remains useful as a diagnostic, but
-search Arena is the relevant test for a network intended to live inside search.
+逆に、CNNがstrong local inductive biasを持つという理由だけでTransformerを捨てません。
 
-### 4. Future hybrids must test a concrete representation hypothesis
+alternativeを測る間、TetraFormerをstable comparison targetとして残します。
 
-The next CNN+Transformer experiment should not repeat the pattern of attaching a
-small, weakly coupled CNN head and hoping that local geometry transfers.
+### 2. CNN resultをreal evidenceとして扱うが、即production replacementにはしない
 
-A justified next hybrid should test one of the hypotheses left open by the
-ablation, for example:
+full CNN baselineのsearch advantageはcorrected splitとmultiple Arena seed blocksでも残りました。
 
-- a full-capacity local CNN encoder comparable to the successful CNN baseline;
-- local features shared by both policy and value rather than an isolated value
-  branch;
-- CNN-derived spatial features fed into a Transformer that is reserved for
-  longer-range/global/opponent interactions.
+したがってlocal board encoderをさらに研究する十分な根拠があります。
 
-The exact implementation is still an experiment. The accepted design rule is
-that the hybrid must isolate a stated hypothesis and preserve the common
-input/output contract so the comparison remains controlled.
+しかし、これはChampion architectureをsilent replacementしてよいことを意味しません。normal Candidate/Champion gateを通します。
 
-### 5. Keep production Champion protected during ablations
+### 3. Held-out policy lossをarchitecture selectorにしない
 
-Architecture experiments produce experimental checkpoints. They do not mutate
-the production Champion until the configured Arena promotion criterion is met.
+policy cross-entropyは**teacher imitation diagnostic**です。
 
-## Consequences
+今回のcorpusではteacher自体がTransformer-driven searchから生成されています。したがって小さなCE差はarchitecture-neutralなgame strength evidenceではありません。
 
-- The project may retain multiple model families longer than a single-metric
-  workflow would, increasing experiment code and checkpoint complexity.
-- The comparison is more expensive because search Arenas are required, but this
-  directly measures the deployment regime of the evaluator.
-- Policy loss, value metrics, and game strength can be reported without forcing
-  them into one scalar story.
-- Future sparse-MoE work must be based on a trunk that has already demonstrated
-  useful dense-model behaviour; MoE is not a shortcut around unresolved
-  CNN-vs-Transformer representation questions. See ADR 0016.
+architecture evaluationには次を必須とします。
 
-## Evidence
+- fixed search budget
+- paired Arena
+- multiple seeds
 
-See `../CNN_ABLATION_20260808.md` for the fixed-data experiment, split audit,
-independent-seed runs, policy/value factorial diagnostics, and failed hybrid
-variants.
+raw-policy Arenaも診断には使いますが、search evaluatorとしてdeployするnetworkならsearched Arenaが主要testです。
+
+### 4. 次のhybridはconcrete representation hypothesisを検証する
+
+small weakly-coupled CNN headを足し、「local geometryが何となくtransferする」ことを期待する実験は繰り返しません。
+
+次のhybrid候補は、ablationが残した具体hypothesisを1つずつtestします。
+
+例:
+
+- successful full CNN baselineに近いcapacityのlocal CNN encoder
+- isolated value branchではなくpolicy/value双方が同じlocal featureを使うshared representation
+- CNN-derived spatial featureをTransformerへ渡し、Transformerはlong-range/global/opponent interactionを主に担当する構成
+
+exact implementationはまだexperimentです。採用済みなのは、**hypothesisを明示し、common I/O contractを保ったcontrolled comparisonにする**という規則です。
+
+### 5. Ablation中もproduction Championを保護する
+
+architecture experimentが生成するのはexperimental Candidate checkpointです。
+
+configured Arena promotion criterionを満たすまでChampionを変更しません。
+
+## 帰結
+
+- single metricで即座にmodel familyを1つへ絞るより、複数architectureを長く保持するためexperiment code/checkpoint管理は複雑になる。
+- search Arenaが必要になるためcomparison costは上がる。
+- その代わり、evaluatorが実際に使われるdeployment regimeを直接測定できる。
+- policy loss、value metric、game strengthが異なる方向を示しても、それぞれを別diagnosticとして報告できる。
+- future sparse MoEは、まず有用性が確認されたdense shared trunk上で試す。未解決のCNN-vs-Transformer representation questionをMoEで迂回しない（ADR 0016）。
+
+## 根拠
+
+固定data experiment、split audit、independent seed、policy/value factorial diagnostic、失敗したhybrid variantの詳細は `../CNN_ABLATION_20260808.md` を参照してください。

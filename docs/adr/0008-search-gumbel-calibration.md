@@ -1,41 +1,42 @@
-# ADR 0008: PUCT and Gumbel, and why Gumbel is the default
+# ADR 0008: PUCTとGumbel、およびGumbelを既定とする理由
 
-## Status
-Accepted.
+## 状態
 
-## Context
-Spec §11.1 specifies PUCT and §11.2 recommends Gumbel sequential halving "to
-stabilise policy improvement at low simulation counts", which is the regime this
-bot runs in (16-128 simulations against a 30-50 ms budget).
+採用。
 
-Both were implemented on top of the batched `Evaluator` (ADR 0007). Getting
-Gumbel right took three attempts, each caught by the same behavioural test: a
-position whose two bottom rows are complete except for one column, so exactly
-one placement clears anything. A correct search must find it at every budget.
+## 背景
 
-## Bugs found, in order
+Spec §11.1はPUCTを定義し、§11.2はlow simulation countでpolicy improvementを安定させるためGumbel sequential halvingを推奨しています。本botが主に扱う16–128 simulations / 30–50 ms級budgetはまさにその領域です。
 
-1. **The heuristic prior was degenerate.** Its softmax temperature produced a
-   top prior of 0.9918, so the search had nothing to explore and every mode
-   collapsed onto one action. The temperature is now scaled by the observed
-   score spread, which keeps the prior informative on any board.
+PUCTとGumbelをADR 0007のbatched `Evaluator` 上へ実装しました。Gumbelの校正では、同じbehavioural testが複数のbugを発見しました。
 
-2. **Unvisited actions were scored as q = 0.** Values here are mostly negative,
-   so an unexplored action always looked better than an explored one and
-   sequential halving discarded exactly the actions it had learned about.
-   Unvisited actions now inherit the parent value.
+使ったtest positionは、bottom 2 rowsが1 columnだけ欠けており、**clearできるplacementが実質1つ**という局面です。correct searchならbudgetにかかわらずその手を見つける必要があります。
 
-3. **Gumbel noise drowned the logits.** With a weak policy the logits of ~34
-   placements span ~0.6 nats while Gumbel noise over that many draws spans ~5,
-   making root candidate selection ~90% random. Measured effect: Gumbel played
-   at 27 pieces per game against 200 for its own policy-only baseline.
+## 発見した問題
 
-## Decision
+### 1. Heuristic priorが極端すぎた
 
-Add `SearchConfig::gumbel_noise_scale`, defaulting to **0.05**, and default
-`use_gumbel` to true.
+softmax temperatureの設定によりtop priorが0.9918となり、searchが事実上1 actionへcollapseしていました。
 
-The scale was calibrated on the forced-clear position:
+score spreadに応じてtemperatureをscaleし、boardごとにpriorが十分な情報量と探索余地を持つよう修正しました。
+
+### 2. Unvisited actionを `q = 0` としていた
+
+このvalue scaleでは多くのposition valueがnegativeです。そのためunvisited actionの0が常に「既に調べたnegative action」より良く見え、sequential halvingが**調べて情報を得たactionほど捨てる**状態になっていました。
+
+unvisited actionはparent valueをinheritするよう変更しました。
+
+### 3. Gumbel noiseがlogitを圧倒していた
+
+weak policyで約34 placementsのlogit spreadが約0.6 natsしかない一方、Gumbel noiseは約5程度のspreadを持ち、root candidate selectionがほぼrandomになっていました。
+
+実測ではGumbelが自身のpolicy-only baseline 200 piecesに対して平均27 pieces程度しか生存しない状態でした。
+
+## 決定
+
+`SearchConfig::gumbel_noise_scale` を追加し、defaultを **0.05** とします。また `use_gumbel` をdefault trueとします。
+
+forced-clear positionでのcalibration:
 
 | noise scale | 16 sims | 64 sims | 256 sims |
 |---|---|---|---|
@@ -43,38 +44,36 @@ The scale was calibrated on the forced-clear position:
 | 0.2 | wrong | wrong | correct |
 | 0.05 | correct | correct | correct |
 
-A trained, confident policy can raise this back towards 1; root Dirichlet noise
-remains the intended exploration knob for self-play.
+trained policyが十分confidentになった場合、このscaleを1へ近づける余地はあります。self-play explorationの主要knobとしてroot noiseも別に存在します。
 
-## Measured outcome
+## 当時の測定結果
 
-Under a steady garbage stream (2 lines every 8 placements), 6 games of 250
-placements:
+steady garbage stream（8 placementsごとに2 lines）、6 games、最大250 placements:
 
-| | pieces | survived | attack/piece |
-|---|---|---|---|
+| 条件 | pieces | survived | attack / piece |
+|---|---:|---:|---:|
 | policy-only | 228.7 | 5/6 | 0.169 |
 | gumbel 32 | 250.0 | 6/6 | 0.207 |
 | puct 32 | 62.7 | 0/6 | 0.136 |
 | puct 128 | 250.0 | 6/6 | 0.249 |
 
-Timing on this 2-core CPU with the heuristic evaluator, all within the §19.4
-budget:
+初期2-core CPU + heuristic evaluatorでのtiming:
 
-| | ms | mean batch |
-|---|---|---|
+| 条件 | ms | mean batch |
+|---|---:|---:|
 | gumbel 32 | 11.5 | 5.5 |
 | gumbel 64 | 20.5 | 4.9 |
 | puct 64 | 23.5 | 13.0 |
 | puct 128 | 46.7 | 14.3 |
 
-## A limitation worth knowing
+これらはsearch algorithm校正時のhistorical measurementであり、現在のneural Championのstrength benchmarkではありません。
 
-**PUCT is unreliable below roughly two simulations per legal action.** A tetris
-position offers 25-50 placements; with a flat prior and a thin budget PUCT
-concentrates its visits on an arbitrary tie-break rather than surveying the
-options, and can finish *worse* than following the prior (puct-32: 62.7 pieces
-against 228.7 for policy-only). Gumbel surveys 8 distinct actions where PUCT
-surveys 1 on the same budget. This is pinned by
-`puct_needs_enough_simulations_to_beat_its_prior` so it is not later mistaken
-for a regression, and it is the concrete reason Gumbel is the default.
+## 重要な制限
+
+**PUCTは、legal actionあたりおおむね2 simulations未満のthin budgetで不安定になりやすい**という実測上の性質があります。
+
+Tetris positionでは25–50 placements程度のbranchingがあり、flat prior + small budgetだとPUCTがarbitrary tie-breakへvisitを集中し、priorをそのままfollowするより悪化する場合があります。
+
+上の測定ではpuct-32が平均62.7 pieces、policy-onlyが228.7 piecesでした。同budgetでGumbelは複数actionをsurveyできました。
+
+`puct_needs_enough_simulations_to_beat_its_prior` がこのfailure modeをtestとして固定しています。したがってこれは「後に偶然壊れたregression」ではなく、Gumbelをlow-budget defaultとした具体的理由です。

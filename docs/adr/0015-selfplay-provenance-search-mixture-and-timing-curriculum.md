@@ -1,134 +1,122 @@
-# ADR 0015: Keep self-play provenance-locked; stage timing and cancellation play after basic tactics
+# ADR 0015: 自己対局provenanceを固定し、timing・相殺外しは基本戦術の後に段階導入する
 
-## Status
-Accepted.
+## 状態
 
-## Context
+採用。
 
-The training loop now spans local GPU generation, Colab workers, replay mixing,
-resumable training, and paired Candidate/Champion Arena evaluation. That makes
-sample volume much easier to scale, but also creates two risks:
+## 背景
 
-1. data from different commits, checkpoints, rulesets, schemas, seeds, or search
-   budgets can be mixed so that an apparent learning gain is actually a data
-   provenance change;
-2. because delay bins already exist in the legal action space, it is easy to
-   mistake "the engine can represent timing" for "the policy has learned
-   timing".
+training loopはlocal GPU generation、Colab worker、replay mixing、resumable training、paired Candidate/Champion Arenaまで広がりました。
 
-The second risk was observed directly. Early trained policies overwhelmingly
-selected the fastest placement. `WAIT_FOR_EVENT` and other delay choices existed,
-but the generated data did not establish that garbage timing or cancellation
-avoidance (相殺外し) had been explored enough to learn.
+これによりsample volumeを増やしやすくなった一方、2つのriskが大きくなりました。
 
-At the same time, the project needs more self-play than a uniformly deep search
-can cheaply provide. A mixture of broad shallow-search data and a smaller amount
-of deeper-search data can improve coverage without making every position
-expensive.
+1. commit、checkpoint、ruleset、schema、seed、search budgetが違うdatasetを混ぜ、apparent gainの原因がtraining methodではなくdata provenance changeになる。
+2. delay binがaction spaceに存在するだけで、「timingを学習した」と誤認する。
 
-## Decision
+後者は実際に観測されました。初期trained policyはほぼ常にfastest placementを選んでいました。`WAIT_FOR_EVENT` や他のdelay choiceは存在していても、garbage timing・cancellation avoidance（相殺外し）を学ぶだけのexploration/data coverageがあるとは言えませんでした。
 
-### 1. Treat generated shards as immutable, provenance-tagged artifacts
+同時に、uniformly deep searchで全self-playを生成するのは高価です。広いcoverageにはshallow searchを多く使い、より高品質なteacher signalを少量のdeep searchで注入するmixtureが有力です。
 
-A serious self-play shard must be attributable to a concrete generation
-configuration. Record or validate at least:
+## 決定
 
-- repository commit;
-- checkpoint identity/hash;
-- ruleset hash;
-- dataset/tokenizer/action/aux schema versions;
-- model version;
-- search algorithm and simulation budget;
-- determinization and root-noise settings;
-- seed interval / shard identity;
-- sample count and termination metadata.
+### 1. Generated shardをimmutable・provenance-tagged artifactとして扱う
 
-Do not byte-concatenate shards or silently merge incompatible schemas. Colab,
-Drive, or Google Apps Script may transport artifacts, but they are not the
-authority for seed allocation, labels, or dataset merge semantics.
+本格self-play shardは具体的generation configurationへ追跡可能にします。
 
-### 2. Protect Champion from data-generation experiments
+最低限:
 
-Experiments generate Candidates. Champion is replaced only through the normal
-paired Arena gate.
+- repository commit
+- checkpoint identity/hash
+- ruleset hash
+- dataset/tokenizer/action/aux schema version
+- model version
+- search algorithm / simulation budget
+- determinization / root-noise setting
+- seed interval / shard identity
+- sample count / termination metadata
 
-A successful training run, lower validation loss, higher APM/APP/VS Score, or a
-single short Arena is not by itself permission to overwrite Champion. This keeps
-the comparison target stable while the self-play distribution is changing.
+shardをbyte-concatenateせず、incompatible schemaをsilent mergeしません。
 
-### 3. Use a search-strength mixture rather than one uniform budget
+Colab、Drive、Google Apps Scriptはartifact transport/orchestrationには使えますが、seed allocation、label、dataset merge semanticsの権威にはしません。
 
-Once the self-play loop is closed and stable, prefer a mixture with:
+### 2. Data-generation experimentからChampionを保護する
 
-- **mostly shallow-search games/positions** for broad and inexpensive coverage;
-- **a smaller deep-search component** for higher-quality policy/value targets;
-- multiple search strengths or deliberately imperfect/recovery positions so the
-  learner is not confined to the narrow state distribution of its current best
-  policy.
+experimentが作るのはCandidateです。Championはnormal paired Arena gateだけで更新します。
 
-Any position-start, stratified, or recovery curriculum is stored as a distinct
-provenance class so its contribution can be ablated.
+次のもの単独ではChampionをoverwriteしません。
 
-The comparison between mixtures must hold total game count or generation compute
-fixed when making sample-efficiency claims.
+- training runが成功した
+- validation lossが下がった
+- APM/APP/VS Scoreが高い
+- 1回の短いArenaで勝った
 
-### 4. Treat timing as a staged capability
+self-play distribution自体を変えている最中もcomparison targetをstableに保つためです。
 
-Timing actions remain representable throughout training, but an explicit timing
-curriculum is deferred until basic board tactics are visibly competent.
+### 3. Uniform search budgetではなくsearch-strength mixtureを試す
 
-Readiness is judged from multiple signals:
+self-play loopが安定した後は、次を基本候補とします。
 
-- qualitative play shows stable stacking, Quads, and T-spins rather than random
-  attack production;
-- Arena strength is no longer dominated by elementary board failures;
-- APP near the flat-stack Quad baseline of roughly 0.5 can be used as a rough
-  diagnostic that attack construction exists.
+- **mostly shallow-search games/positions:** broad coverageを安価に得る。
+- **smaller deep-search component:** より強いpolicy/value targetを注入する。
+- multiple search strengths / deliberately imperfect or recovery positions: current best policyのnarrow on-policy manifoldだけへ閉じない。
 
-The APP number is **not** a hard gate and is not a reward target. It is only one
-readiness signal alongside play inspection, VS Score, and Arena results.
+position-start、stratified、recovery curriculumを導入した場合は、manifest上でdistinct provenance classにします。
 
-### 5. When timing is activated, measure actual use of the action dimension
+sample-efficiency claimでは、total game countまたはgeneration computeを固定します。
 
-Do not infer timing skill from the presence of delay bins in move generation.
-Track at least:
+### 4. Timingをstaged capabilityとして扱う
 
-- frequency of `FASTEST` versus delayed actions;
-- `WAIT_FOR_EVENT` usage;
-- attack sent/received/cancelled around timing decisions;
-- cancellation avoidance / off-cancel events where definable;
-- paired win rate and VS Score under the same search budget.
+Delay actionはtraining全期間で表現可能にしておきますが、explicit timing curriculumをbasic board tacticsの後段へ置きます。
 
-A timing experiment should demonstrate that delayed actions are selected in
-situations where they improve game outcomes, not merely that their frequency
-increased.
+readinessは複数signalで見ます。
 
-### 6. Do not hand-shape a positive reward for waiting
+- stable stacking
+- Quad
+- T-spin
+- basic attack construction
+- Arena strengthがelementary board failureだけで決まっていない
+- APP / 将来のVS Score / qualitative play
 
-The model should learn *when* delay is useful from search, game outcome, and
-trajectory-derived targets. A generic reward for waiting or for avoiding
-cancellation would hard-code a tactical preference that can be wrong in other
-states.
+平積みQuad baselineのAPP約0.5は**rough diagnostic**として使えますが、hard gateでもreward targetでもありません。
 
-If exploration is insufficient, change search exploration, data sampling, or
-curriculum coverage rather than redefining the terminal objective.
+### 5. Timing導入後はaction dimensionの実利用を測る
 
-## Consequences
+Delay binがgeneratorに存在することからtiming skillを推論しません。
 
-- Self-play storage and manifests become slightly more verbose, but experiments
-  are reproducible and failed runs can be diagnosed instead of guessed at.
-- Deep-search data is spent where it has the most teaching value instead of on
-  every generated position.
-- Timing/cancellation play can be developed without contaminating the earlier
-  question of whether the model can stack and attack at all.
-- The project may temporarily underrepresent sophisticated timing while the
-  board-policy baseline is weak. This is deliberate: it reduces the chance that
-  a sparse, difficult action dimension consumes training capacity before the
-  simpler tactical substrate exists.
+最低限:
 
-## Related documents
+- `FASTEST` vs delayed action frequency
+- `WAIT_FOR_EVENT` usage
+- timing decision周辺のattack sent/received/cancelled
+- definableな範囲でcancellation avoidance / off-cancel event
+- same search budgetでのpaired win rate
+- VS Score（実装後）
 
-- ADR 0009 — determinization and the original self-play reward contract.
-- ADR 0014 — objective/metric hierarchy and VS Score.
-- `../COLAB_MANUAL.md` — shard generation workflow.
-- `../TRAINING_AND_EVALUATION.md` — fixed-budget ablation and Arena protocol.
+「delay actionを選ぶ頻度が増えた」だけでは成功としません。delayが有効な局面でgame outcomeを改善している必要があります。
+
+### 6. Waitingへgeneric positive rewardを与えない
+
+networkには**いつdelayが有用か**をsearch、game result、trajectory-derived targetから学習させます。
+
+waitingやcancellation avoidance自体へgeneric rewardを与えると、別局面では誤ったtactical preferenceをhard-codeする危険があります。
+
+exploration不足なら、terminal objectiveを変えるのではなく次を調整します。
+
+- search exploration
+- data sampling
+- curriculum coverage
+- search-strength mixture
+
+## 帰結
+
+- self-play artifact/manifestはややverboseになるが、runを再現・診断できる。
+- deep-search computeを全positionへ均等に使わず、高品質教師として部分的に配分できる。
+- board policyの基礎能力とtiming/cancellation能力を分けて評価できる。
+- dense basic policyが弱い間は高度timing dataを意図的に少なくする可能性がある。これは、rare/difficult action dimensionが早期にtraining capacityを消費するのを避けるためのtrade-offである。
+
+## 関連文書
+
+- ADR 0009 — determinizationとterminal reward contract
+- ADR 0014 — objective/metric hierarchy、VS Score
+- `../COLAB_MANUAL.md` — shard generation workflow
+- `../TRAINING_AND_EVALUATION.md` — fixed-budget ablation / Arena protocol

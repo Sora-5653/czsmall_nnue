@@ -1,132 +1,132 @@
-# Current architecture
+# 現在のアーキテクチャ
 
-This document describes the architecture that exists on `main` and the boundary
-between production code and experiments. It is not a replacement for
-`SPEC.md`; later design changes are recorded in ADRs.
+この文書は、現在の `main` に存在する構成と、production code・実験系の境界を説明します。`SPEC.md` の置き換えではありません。仕様策定後の設計変更はADRに記録します。
 
-## 1. Simulation and rules: C++ is authoritative
+## 1. シミュレーションとルール: C++を権威とする
 
-The C++ engine owns all state transitions that can affect game truth:
+ゲーム上の真実へ影響する状態遷移はC++エンジンが所有します。
 
-- ruleset configuration and hashing;
-- board state, pieces, spins, attack, garbage, B2B/combo/Surge;
-- Cobra-backed legal placement generation;
-- action duration, gravity reachability, and delay bins;
-- observation masking and token/action generation;
-- PUCT/Gumbel search, determinization, and two-player event ordering;
-- replay verification, dataset serialization, and Arena game mechanics.
+- ruleset設定とhash
+- 盤面、piece、spin、attack、garbage、B2B/combo/Surge
+- Cobraによる合法配置生成
+- action duration、gravity reachability、delay bin
+- observation maskingとtoken/action生成
+- PUCT/Gumbel探索、determinization、二盤面event ordering
+- replay verification、dataset serialization、Arena game mechanics
 
-The learner is not allowed to reconstruct a second, approximate game. This
-keeps training labels and inference semantics tied to one simulator.
+学習側が別の近似ゲームを再実装することは避けます。これにより、学習labelと推論時の意味論を1つのシミュレータへ固定します。
 
-## 2. Observation and action contract
+## 2. 観測・action contract
 
-The engine converts a masked player observation into a variable-length state
-sequence and legal-action sequence. `TensorBatch` pads those ragged sequences
-and carries masks so the same contract can be consumed by C++ inference,
-PyTorch, and dataset readers.
+エンジンは、mask済みのplayer observationを可変長のstate sequenceとlegal-action sequenceへ変換します。`TensorBatch` はそれらをpaddingし、同時にmaskを保持します。同一contractをC++ inference、PyTorch、dataset readerが共有します。
 
-The observation contains public information only. Hidden queue state and hidden
-garbage information must not leak into tokens or search. Dataset/schema metadata
-exists so equal tensor widths cannot be mistaken for semantic compatibility.
+観測にはpublic informationだけを含めます。hidden queueや未着弾garbageのhidden情報はtokenや探索へ漏らしません。
 
-See ADR 0009, ADR 0010, ADR 0012, and `SAMPLE_EFFICIENCY_PLAN.md`.
+現行contractはfeature widthだけでは識別しません。`schema.hpp` がtokenizer、observation、action、auxiliary targetのversion/hashを定義し、同じ `TOKEN_FEATURES=24` でも意味やtoken順が違うdatasetを互換扱いしないようにします。
 
-## 3. Neural evaluators
+関連: ADR 0009、ADR 0010、ADR 0012、`SAMPLE_EFFICIENCY_PLAN.md`。
 
-### TetraFormer reference
+## 3. Neural evaluator
 
-`trainer/tetraformer.py` is the current reference architecture. It uses a
-Transformer state encoder, variable-length action scoring, a WDL value head,
-and auxiliary prediction heads. It remains the comparison control even when an
-experimental architecture wins an Arena.
+### TetraFormer — 基準モデル
 
-### CNN and hybrid experiments
+`trainer/tetraformer.py` が現在の基準architectureです。Transformer state encoder、可変長action scoring、WDL value head、auxiliary prediction headを持ちます。
 
-`trainer/ablation_models.py` contains local-board CNN and CNN+Transformer
-variants that preserve the same public forward contract. Their purpose is to
-measure whether an explicit 2D inductive bias improves game strength without
-changing the simulator or training data contract.
+新しい構造が短いArenaで勝っただけではTetraFormerを捨てません。比較のcontrolとして残し、同じdataset・split・optimizer・search budgetで候補構造を評価します。
 
-The 2026-08-08 experiment established an important separation:
+### CNN / hybrid — 実験モデル
 
-- the Transformer fit the Transformer-generated policy teacher slightly better;
-- the CNN learned WDL/value targets substantially better on the corrected split;
-- the CNN's most reproducible advantage appeared under search rather than in
-  raw policy-only play;
-- small bolt-on CNN hybrid branches did not reproduce the full CNN's behaviour
-  and showed late value overfitting.
+`trainer/ablation_models.py` には、同じpublic forward contractを維持するlocal-board CNNとCNN+Transformer系を実装しています。目的は、シミュレータやdataset契約を変えずに、明示的な2次元局所帰納バイアスがゲーム強度へ寄与するかを切り分けることです。
 
-Therefore the next hybrid experiment should test a concrete representation
-hypothesis—such as a full-capacity local encoder shared by policy and value—
-rather than adding more weakly coupled heads. See ADR 0013 and
-`CNN_ABLATION_20260808.md`.
+2026-08-08のablationでは、次の分離が見えました。
 
-## 4. Search
+- Transformerは、Transformer-search由来のteacher policyをわずかに良く模倣した。
+- 修正済みhashed splitでは、CNNがWDL/valueを大幅に良く学習した。
+- CNNの最も再現性の高い優位は、raw policy-onlyより**search内で使ったとき**に現れた。
+- 小さなbolt-on CNN branchを持つhybridはfull CNNの性質を再現できず、valueのlate overfitも起こした。
 
-The evaluator returns policy/value estimates; C++ search turns those estimates
-into an improved root policy. Gumbel sequential halving is the default low-budget
-search because ordinary PUCT was poorly calibrated when the simulation budget
-was small relative to the branching factor.
+そのため、次のhybridは「CNNを少し足す」のではなく、**何の表現仮説を検証するのか**を明示する必要があります。候補は、full CNN相当の局所encoderをpolicy/valueで共有し、Transformerを長距離・global・opponent interactionへ使う構成です。
 
-Hidden future pieces are handled by root determinization. Self-play targets are
-therefore generated from information a real player is allowed to observe.
+関連: ADR 0013、`CNN_ABLATION_20260808.md`。
 
-## 5. Self-play and datasets
+## 4. 探索
 
-The generation loop is:
+Evaluatorはpolicy/value estimateを返し、C++ searchがそれを改善されたroot policyへ変換します。
 
-1. load a checkpoint and exact repository/ruleset/schema provenance;
-2. generate self-play with a fixed, recorded search configuration and seed
-   range;
-3. store immutable shards plus manifests;
-4. train on a controlled replay mixture;
-5. evaluate Candidate against Champion with paired Arena seeds;
-6. promote only if the configured gate passes.
+低simulation数では、合法手数に対してPUCTの探索が薄くなりやすいため、Gumbel sequential halvingを既定としています。virtual lossとtransposition tableもC++側にあります。
 
-Colab is an additional worker, not a second authority for rules, labels, or seed
-allocation. Shards from different schema/ruleset/checkpoint contracts are not
-silently merged. See ADR 0015 and `COLAB_MANUAL.md`.
+不可視なfuture pieceはroot determinizationで扱います。したがって自己対局教師は、人間playerが観測可能な情報の範囲で生成されます。
 
-## 6. Objectives
+## 5. 自己対局とdataset
 
-The objective hierarchy is intentionally separated:
+基本generation loopは次のとおりです。
 
-- **policy:** imitate the search-improved action distribution;
-- **value:** predict WDL from a fixed player perspective;
-- **auxiliary heads:** extract dense supervision such as future attack, garbage,
-  survival/top-out horizons, and action-conditioned consequences;
-- **reward / terminal target:** remains the actual game result.
+1. checkpointと、repository/ruleset/schema provenanceを固定する。
+2. search設定とseed範囲を記録して自己対局を生成する。
+3. shardとmanifestをimmutable artifactとして保存する。
+4. 管理されたreplay mixtureで学習する。
+5. paired seedのArenaでCandidateとChampionを比較する。
+6. promotion gateを満たした場合だけChampionを更新する。
 
-Combat statistics such as VS Score, APM, APP, PPS, and cancellation are
-measurements. They may become auxiliary prediction targets after ablation, but
-they do not replace WDL or Arena promotion. See ADR 0014.
+Colabは追加workerであり、rules、label、seed allocationの第二の権威ではありません。ruleset/schema/checkpoint contractが異なるshardを暗黙に混ぜません。
 
-## 7. Timing as a learned capability
+### dataset version
 
-Delay actions already exist in the action space, but their existence does not
-mean the network has learned timing. Early Arena evidence showed policies almost
-always choosing the fastest action. Explicit garbage timing / cancellation
-avoidance is therefore treated as a staged capability after basic board tactics
-are competent. See ADR 0015.
+- **Version 3:** 現行のrectangular dataset。schema/termination metadataを保持し、二盤面自己対局で使用します。
+- **Version 2 (`VERSION_COMPACT`):** Replay+πを保存し、再生可能な単盤面trajectoryからtoken/actionをload時に再生成するcompact形式です。
+- **Version 1:** 旧rectangular形式。readerは後方互換のため残しています。
 
-## 8. Deferred research: teaching agents, language mediation, MoE/SAE
+二盤面self-playは相手側event streamを観測へ含むため、現在のcompact metadataだけでは正確に再構成できません。この経路を無理にcompact化せずversion 3を使う判断は意図的です。
 
-The long-term AI→human learning agenda separates two roles that need not share
-one model: an agent optimized for playing strength and an agent optimized for
-analysis/teaching. The latter may interrogate or distill the former and is
-judged by whether it exposes useful, checkable strategic knowledge rather than
-by Arena strength alone.
+関連: ADR 0012、ADR 0015、`COLAB_MANUAL.md`。
 
-Natural language is intended to become a bidirectional mediation layer: human
-questions should be convertible into reproducible engine/model probes, while
-states, interventions, learned features, and discovered regularities should be
-convertible back into explanations. The exact simulator and provenance remain
-the source of game truth.
+## 6. 学習目的
 
-Sparse MoE and Sparse Autoencoders are candidate techniques inside that agenda,
-not architectural requirements. MoE is deferred until a strong dense baseline
-exists; if tested, it should start as a small observable-routing ablation over a
-proven trunk. SAE work likewise comes after a strong checkpoint and must validate
-candidate features with counterexamples/interventions before passing them to a
-teaching layer. See ADR 0016.
+目的を混同しないよう、階層を分けます。
+
+- **方策:** search-improved action distributionを学ぶ。
+- **価値:** 固定player perspectiveからWDLを予測する。
+- **補助head:** future attack、future garbage、survival/top-out horizonなど、同一trajectoryから得られる密な教師信号を学ぶ。
+- **終端目的:** 実際のgame resultを維持する。
+
+VS Score、APM、APP、PPS、cancellationなどは測定値です。将来、ablationを経てauxiliary prediction targetへ使う可能性はありますが、WDLやArena promotionを置き換えません。
+
+現行aux schema v2は36 targetsを持ち、未知未来にはvalid maskを使います。trainerはshared trunk上のpolicy/value/aux gradient normとcosineも記録できます。
+
+関連: ADR 0014。
+
+## 7. Timingを「表現可能」と「学習済み」に分ける
+
+move generatorにはdelay actionと `WAIT_FOR_EVENT` がすでにあります。しかしaction spaceに存在することは、networkがtimingを学習したことを意味しません。
+
+初期の学習済みpolicyでは最速actionへ偏る傾向が見られたため、garbage timingや相殺外しは、基本stacking・Quad・T-spinなどが成立した後に段階的に強める能力として扱います。
+
+timing能力は、delay action頻度だけでなく、cancellation interaction、VS Score、paired Arena resultと合わせて検証します。
+
+関連: ADR 0015。
+
+## 8. 将来研究: 強いplayer、teaching agent、自然言語媒介
+
+長期のAI→人間学習構想では、同じモデルへすべてを押し込みません。
+
+- **playing agent:** Arenaで最大限強く指すことを主目的とする。
+- **teaching/analysis agent:** 強いagentのtrace、search、activation、featureなどを使い、人間に役立つ戦略概念を抽出・検証・説明することを主目的とする。
+
+teaching agentの質はArena strengthだけでは測りません。counterfactual questionへ答えられるか、概念を再現可能な局面集合へ落とせるか、不確実性を表現できるか、人間の学習に実際に役立つか、といった別の評価が必要です。
+
+自然言語は**双方向の媒介層**として位置づけます。
+
+- human → engine/model: 「このstackでなぜこの手が悪いのか」といった問いを、position slice、search probe、intervention、comparisonへ落とす。
+- engine/model → human: discovered regularity、feature、routing pattern、counterfactual resultを、検証可能な説明や教材へ変換する。
+
+ゲーム上の事実の権威は引き続きexact simulatorとprovenanceに置きます。言語modelは説明interface・仮説生成器であって、rule engineの代替ではありません。
+
+### MoE / Sparse Autoencoder
+
+Sparse MoEとSparse Autoencoderは、この構想の**候補手法**であり必須構造ではありません。
+
+MoEは強いdense baselineができるまで延期します。最初に試す場合は、小数expert・shared trunk・observable routingから始め、opening/midgame/finisher、高stack pressureなどのhuman labelをsemantic guaranteeとみなしません。
+
+Sparse Autoencoderも強いcheckpointができた後にactivation feature抽出へ試します。featureを人間概念と結びつける際は、強くactivateする例だけでなくcounterexample、intervention、ablationで検証してからteaching layerへ渡します。
+
+関連: ADR 0016。

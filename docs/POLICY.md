@@ -1,42 +1,37 @@
-# Usage policy and scope
+# 利用範囲と運用ポリシー
 
-This repository implements a **local, offline Tetris simulator and research
-codebase**. It is not a TETR.IO client and contains no code that talks to
-TETR.IO in any way.
+このリポジトリは、**ローカル・オフラインで動作するTetrisシミュレータおよび研究コード**です。TETR.IO clientではなく、TETR.IOへ接続するコードを含みません。
 
-## What this repository is
+## このリポジトリに含まれるもの
 
-- An exact, deterministic, event-driven rule core (`/include/tetra`).
-- A legal-placement generator over that rule core.
-- An observation/tokenizer layer for machine-learning experiments.
-- Developer tools that run entirely on the local machine.
+- 厳密・決定論的・event-drivenなrule core（`/include/tetra`）
+- rule core上の合法配置generator
+- machine-learning実験用のobservation / tokenizer layer
+- ローカルmachine上だけで動作するdeveloper tool
 
-## What this repository deliberately is not
+## 意図的に含めないもの
 
-Per the specification's operational notes (spec §1, §3.2, §22):
+当初仕様の運用条件（spec §1, §3.2, §22）に従い、次を標準構成へ入れません。
 
-- **No network code.** There is no HTTP client, no WebSocket client, and no
-  dependency that provides one. `grep -r` for `socket`, `curl`, or `http` in
-  `src/` and `include/` returns nothing.
-- **No TETR.IO API access.** The main game API requires explicit written
-  permission from the TETR.IO operators. This project does not use it, and no
-  adapter for it is provided in the standard build.
-- **No DOM/memory/private-endpoint scraping.**
-- **No use of information a human player could not see.** Hidden state (the RNG
-  state, the unshuffled remainder of the bag, the hole column of garbage that
-  has not yet risen) lives only inside the simulator and is stripped by
-  `observe()` in `include/tetra/observation.hpp`. This is enforced by tests in
-  `tests/test_observation.cpp`.
+- **Network code。** HTTP client、WebSocket client、およびそれらを提供するdependencyを持ちません。
+- **TETR.IO API access。** 本プロジェクトはTETR.IO APIを利用せず、標準buildにadapterも含めません。
+- **DOM / memory / private endpoint scraping。**
+- **人間playerが観測できない情報の利用。** RNG state、preview以後のhidden queue、未着弾garbageのhidden hole columnなどはsimulator内部にのみ存在し、`include/tetra/observation.hpp` の `observe()` でmodel inputから除外します。`tests/test_observation.cpp` で回帰検証しています。
 
-## Competitive play
+## 公開・競技環境での利用
 
-TETR.IO's rules prohibit bots, macros, and solver assistance for competitive
-advantage. Do not use this code, or anything derived from it, to play on public
-TETR.IO servers or in ranked modes. If you intend to run a bot in a public
-environment, obtain explicit prior permission from the TETR.IO operators first.
+このコードまたは派生物を、公開TETR.IO serverやranked/competitive playで自動操作・solver assistanceとして利用しないでください。
 
-## If a connection adapter is ever added
+将来、公開環境でbotを動作させる必要が生じた場合は、対象サービスの運営者から明示的な事前許可を得たうえで、標準buildから分離されたopt-in adapterとして設計する必要があります。
 
-The specification requires that any such adapter be a **separate, opt-in
-module** that is disabled in the standard build. It must not be linked into
-`core-rules`, `movegen`, or the default tools.
+## 将来connection adapterを追加する場合
+
+`SPEC.md` の方針どおり、connection adapterは**標準buildで無効な独立opt-in module**とします。
+
+少なくとも次のcore componentへ直接linkしません。
+
+- `core-rules`
+- `movegen`
+- default developer tools
+
+ゲームルール・探索・学習コードをnetwork integrationから分離し、ローカルoffline simulatorとしての再現可能性を保ちます。

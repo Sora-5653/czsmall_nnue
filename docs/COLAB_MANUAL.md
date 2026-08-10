@@ -1,6 +1,8 @@
 # Colab手動実行手順
 
-`trainer/colab_manual.py` は、Google Driveを受け渡しに使う半自動ランナーです。Colabのセルから一段ずつ実行し、失敗したコマンドの出力だけを返せるようにしています。
+`trainer/colab_manual.py` は、Google Driveをartifact受け渡しに使う半自動runnerです。Colabのcellから一段ずつ実行し、失敗した段階のoutputをそのまま診断へ返せるようにしています。
+
+この手順でも、ルール・Cobra合法手生成・探索・label生成の権威はC++ engineです。Colabは追加workerであり、Champion promotion、seed allocation、dataset merge semanticsの第二の権威にはしません。生成datasetは現行schema付きrectangular version 3です。
 
 ## 1. Driveに置くファイル
 
@@ -42,9 +44,9 @@ setup後は、展開されたスクリプトを使えます。
 !python /content/czsmall_nnue/trainer/colab_manual.py inspect
 ```
 
-## 3. 補助lossの比較学習
+## 3. 補助目標の比較学習
 
-同じseedで `aux` と `noaux` を別々に実行します。両方とも同じデータ分割・初期化seedを使うため、paired ablationになります。
+同じseedで `aux` と `noaux` を別々に実行します。両方とも同じデータ分割・初期化seedを使うため、paired ablationになります。`aux` 条件の既定weightは0.1、`noaux` は0.0です。これは補助目標の有無を切り分ける実験であり、WDL reward自体は変更しません。
 
 ```python
 !python /content/czsmall_nnue/trainer/colab_manual.py train --condition aux --seed 0
@@ -60,7 +62,7 @@ setup後は、展開されたスクリプトを使えます。
 
 チェックポイントは `aux_seed0.pt` / `aux_seed0.best.pt` のような名前でDriveへ保存されます。既存の出力を置き換える場合だけ `--overwrite` を付けます。
 
-## 4. エラーの返し方
+## 4. Errorを診断するとき
 
 自動で次の段階へ進めず、各コマンドが失敗した時点で停止します。`error:` 行だけでなく、直前のGPU情報、実行した `$ ...` 行、Python/C++のtracebackを含むセル出力をそのまま渡してください。
 

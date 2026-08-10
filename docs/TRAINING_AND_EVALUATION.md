@@ -1,174 +1,150 @@
-# Training and evaluation protocol
+# 学習・評価プロトコル
 
-This document is the short operational contract for learning experiments. The
-more detailed target-generation plan remains in `SAMPLE_EFFICIENCY_PLAN.md`;
-accepted design rationale lives in ADR 0014 and ADR 0015.
+この文書は、学習実験を比較可能に保つための短い運用契約です。補助目標生成の細部は `SAMPLE_EFFICIENCY_PLAN.md`、判断理由はADR 0014・0015を参照してください。
 
-## 1. What counts as progress
+## 1. 何を「改善」とみなすか
 
-The project optimizes for stronger play under a controlled compute budget, not
-for one offline loss number. Evidence is ranked as follows:
+本プロジェクトの目的は、単一のoffline lossを最小化することではなく、**管理された計算budgetのもとで実際に強いplayerを作ること**です。証拠の優先順位は次のようにします。
 
-1. **Paired Candidate-vs-Champion Arena performance** at a fixed search budget,
-   reported with a confidence interval.
-2. **VS Score and combat diagnostics** under the same paired conditions.
-3. **APM, APP, PPS, survival, cancellation, and timing statistics** that explain
-   *how* the result was obtained.
-4. **Held-out policy/value/auxiliary metrics** that diagnose representation and
-   training health.
+1. **固定search budget・paired seedのCandidate vs Champion Arena**。勝率と信頼区間を報告する。
+2. **VS Scoreと戦闘診断**。同じpaired条件で比較する。
+3. **APM、APP、PPS、生存時間、相殺、timing統計**。なぜ差が出たかを説明する。
+4. **検証用policy/value/auxiliary metrics**。表現学習とtraining healthを診断する。
 
-A lower held-out policy loss can be useful without implying a stronger player.
-The CNN ablation is the canonical example: the Transformer imitated its
-Transformer-derived teacher better, while the CNN produced the stronger and
-more stable search player in the relevant Arenas.
+検証用policy lossが低いことは有用ですが、強いplayerであることを直接意味しません。CNN ablationが典型例です。TransformerはTransformer由来teacherをより良く模倣した一方、CNNはsearch内でより強い挙動を示しました。
 
-## 2. Objective contract
+## 2. 目的関数の契約
 
-The terminal game result remains the value/reward anchor. The model may learn
-additional dense targets, but they are not reward shaping.
+終端game resultを価値・rewardの基準として維持します。追加の密な教師信号を学んでも、reward shapingへ置き換えません。
 
-Conceptually:
+概念的には次の形です。
 
 \[
 L = L_{\pi} + \lambda_v L_v + \sum_i \lambda_i L_{\mathrm{aux},i}.
 \]
 
-The current rules for auxiliary objectives are:
+補助目標には次の制約を課します。
 
-- every target must be derivable from information or future events in the
-  recorded trajectory under a defined player perspective;
-- `terminated` and `truncated` trajectories must not be conflated;
-- invalid future horizons are masked instead of trained as zero;
-- auxiliary targets may not read hidden state that policy inference cannot see;
-- loss weights are judged by shared-trunk gradient norms/cosines as well as raw
-  loss magnitudes;
-- an auxiliary loss is retained only if it is neutral or beneficial to policy
-  learning and Arena performance under controlled ablation.
+- recorded trajectoryと定義済みplayer perspectiveから導出できること。
+- `terminated` と `truncated` を混同しないこと。
+- 観測できないfuture horizonを0として学習せず、valid maskで除外すること。
+- policy inferenceで見えないhidden stateを補助label生成に使って表現へ漏洩させないこと。
+- loss weightはscalar lossだけでなくshared-trunk gradient norm / cosineも見て判断すること。
+- 補助目標は、管理されたablationで方策・Arenaへ中立以上である場合だけ残すこと。
 
-## 3. Dense targets
+## 3. 密な補助目標
 
-The sample-efficiency program extracts more supervision from each trajectory
-without pretending that extra labels create new independent games. Current or
-planned target families include:
+同じtrajectoryから複数の教師信号を抽出し、1局面あたりの学習情報量を増やします。ただし、label数が増えても独立したgame数が増えるわけではありません。
 
-- future attack over several time/placement horizons;
-- future garbage received;
-- self/opponent survival or top-out horizons;
-- time-to-terminal / discrete time-to-event targets;
-- action-conditioned immediate consequences when they can be computed exactly
-  from the engine;
-- combat summaries such as VS Score as an ablation-gated auxiliary target.
+現行・計画中のtarget family:
 
-VS Score is first a **reported evaluation metric**. Using it as an auxiliary
-prediction target is a separate experiment and must not change the WDL reward or
-promotion rule.
+- 複数time/placement horizonのfuture attack
+- future garbage received
+- self/opponent survival・top-out horizon
+- time-to-terminal / 離散time-to-event
+- engineから厳密に算出できるaction-conditioned immediate consequence
+- ablationを経たVS Scoreなどのcombat summary prediction
+
+VS Scoreはまず**評価指標**として導入します。VS Scoreをauxiliary targetとして使うことは別実験であり、WDL rewardやpromotion ruleを変更しません。
 
 ## 4. Dataset provenance
 
-Every serious run should make it possible to answer: which code, checkpoint,
-ruleset, schema, search settings, and seeds produced this sample?
+本格的なrunについて、「このsampleはどのcode・checkpoint・ruleset・schema・search設定・seedから生成されたか」を後から答えられる状態にします。
 
-At minimum record or validate:
+最低限、次を記録・検証します。
 
-- repository commit;
-- checkpoint identity/hash;
-- ruleset hash;
-- dataset/tokenizer/action/aux schema versions;
-- search algorithm, simulations, determinizations, and root-noise settings;
-- game/seed interval and shard identity;
-- termination reason;
-- sample count and source generation.
+- repository commit
+- checkpoint identity/hash
+- ruleset hash
+- dataset/tokenizer/action/aux schema version
+- search algorithm、simulation数、determinizations、root noise
+- game/seed interval、shard identity
+- termination reason
+- sample count、source generation
 
-Generated shards are immutable inputs. Do not byte-concatenate datasets or
-silently mix incompatible schemas. Colab/Drive/GAS may transport artifacts but
-must not become the authority for seeds, labels, or merge semantics.
+生成済みshardはimmutable inputとして扱います。datasetをbyte concatenationせず、schemaが異なるshardを暗黙に混ぜません。Colab / Drive / GASはartifact transportを補助できますが、seed、label、merge semanticsの権威にはしません。
 
-## 5. Train/validation splits
+## 5. Train / validation split
 
-Split by game, seed, or shard—not by adjacent position. Consecutive seed ranges
-must not be assigned by a naive ordered 80/20 split if that makes validation a
-proxy for shard identity. A stable hash of the game seed is the preferred simple
-split when sources occupy consecutive numeric ranges.
+隣接局面を無作為に分けず、game、seed、またはshard単位でsplitします。
 
-For architecture comparisons, share the exact split and, where practical, the
-same sampled minibatch schedule.
+特に、source shardが連続したnumeric seed rangeを持つ場合、seedをsortして上位80% / 下位20%に切るだけでは、validationが「特定shardだけ」になる危険があります。単純な既定法として、**game seedのstable hashでsplitする方法**を優先します。
 
-## 6. Architecture ablation contract
+architecture比較では、同じsplitを共有し、可能ならsampled minibatch scheduleも共有します。
 
-When comparing Transformer, CNN, hybrid, or future MoE variants, hold fixed or
-record:
+## 6. アーキテクチャ比較実験の契約
 
-- training sample set;
-- split;
-- optimizer and learning-rate schedule;
-- update count and batch size;
-- model parameter scale;
-- training seed(s);
-- search budget and Arena seed(s);
-- replay mixture and opponent/champion checkpoint;
-- wall-clock and accelerator time.
+Transformer、CNN、hybrid、将来のMoEを比較するとき、次を固定または記録します。
 
-Do not replace the production/reference model because of one seed or one metric.
-Architecture changes are first experiments, then Candidate checkpoints, and only
-then eligible for Champion promotion.
+- training sample set
+- train/validation split
+- optimizer・learning-rate schedule
+- update数・batch size
+- model parameter scale
+- training seed
+- search budget・Arena seed
+- replay mixture・opponent/Champion checkpoint
+- wall-clock time・accelerator time
+
+1 seed・1 metricだけでproduction/reference modelを置き換えません。
+
+architecture変更は、まずexperiment、次にCandidate checkpoint、最後に通常のChampion promotion gateという順に進めます。
 
 ## 7. Arena report
 
-A useful Arena report contains at least:
+有用なArena reportには、最低限次を含めます。
 
-| Category | Metrics |
+| 分類 | 指標 |
 |---|---|
-| Promotion | wins/losses/draws, win rate, 95% confidence interval, paired seed protocol |
-| Combat | VS Score, APM, APP |
-| Speed | PPS |
-| Survival | mean survival time, placements to top out |
-| Garbage interaction | sent/received/cancelled attack, cancellation efficiency |
-| Timing | FASTEST vs delayed-action frequency, WAIT-for-event use, timing-related cancellations |
-| Search dependence | raw-policy and searched-policy results where useful |
+| 昇格判定 | wins/losses/draws、win rate、95% confidence interval、paired seed protocol |
+| 戦闘 | VS Score、APM、APP |
+| 速度 | PPS |
+| 生存 | mean survival time、placements to top out |
+| Garbage interaction | sent/received/cancelled attack、cancellation efficiency |
+| Timing | FASTEST / delayed action比率、`WAIT_FOR_EVENT` 使用率、timing関連cancellation |
+| Search依存性 | 必要に応じてraw-policy / searched-policyの両方 |
 
-VS Score is deliberately adjacent to, not above, win rate: a combat metric can
-be more informative than APM/APP while still being a proxy.
+VS Scoreはwin rateより上位の目標ではありません。APM/APPだけでは区別しにくいcombat styleを説明するproxyとして使います。
 
-## 8. Timing / cancellation curriculum
+**現時点ではVS Scoreは未実装です。** 計算式とruleset interpretationを固定してから標準reportへ追加します。
 
-The move generator exposes delay bins including `WAIT_FOR_EVENT`, but timing is
-not considered learned until the policy actually explores and uses them
-productively.
+## 8. Timing / 相殺外しカリキュラム
 
-The staged policy is:
+move generatorは `WAIT_FOR_EVENT` を含むdelay binをすでに出せますが、networkがそれらを使いこなすまではtimingを「学習済み」とみなしません。
 
-1. first establish competent board tactics such as stable stacking, quads, and
-   T-spins;
-2. inspect play and combat metrics rather than rely on a single numerical gate;
-3. use APP around the flat-stack Quad baseline (~0.5) only as a rough readiness
-   signal, not as a promotion threshold;
-4. then add or strengthen explicit exploration/data for garbage timing and
-   cancellation avoidance (相殺外し);
-5. verify the capability through action-frequency and paired Arena diagnostics.
+段階は次のとおりです。
 
-The timing curriculum must not hand-code a positive reward for delaying. Search
-and game outcome should determine when waiting is useful.
+1. まずstable stacking、Quad、T-spinなど基本的なboard tacticsを獲得する。
+2. 単一数値ではなく、play inspectionとcombat metricsを併用する。
+3. 平積みQuadの理論baselineであるAPP約0.5は、attack constructionが成立し始めたかを見る**粗いreadiness signal**としてのみ使う。hard thresholdにはしない。
+4. その後、garbage timing・相殺外しを含むdelay actionの探索/data coverageを強める。
+5. action frequency、cancellation interaction、VS Score、paired Arenaで能力が実在するか検証する。
 
-## 9. Self-play search mixture
+「待つこと」自体へ正のrewardを付けません。待つべき局面かどうかはsearchと実際のgame resultから学ばせます。
 
-Once the loop is closed, prefer a mixture that gets broad coverage cheaply but
-still injects high-quality targets:
+## 9. 自己対局のsearch mixture
 
-- mostly shallow-search self-play for volume;
-- a smaller fraction of deeper-search games/positions for stronger policy
-  targets;
-- multiple search strengths or deliberately imperfect positions so the model
-  sees recovery states rather than only its current narrow on-policy manifold.
+自己対局loopが安定した後は、すべてのpositionをuniformに深く探索するより、次のmixtureを基本候補とします。
 
-Any position-start or stratified curriculum should be recorded as a separate
-source in the dataset manifest so it can be ablated rather than silently mixed.
+- **大部分を浅いsearch:** 安価に広いstate coverageを得る。
+- **少量を深いsearch:** より高品質なpolicy/value targetを注入する。
+- 複数search strengthや、意図的に不完全・recoveryが必要なpositionを含め、current policyの狭いon-policy manifoldだけに閉じない。
 
-## 10. Promotion rule
+position-startやstratified curriculumを導入する場合は、dataset manifest上で別sourceとして記録し、通常self-playへ暗黙に混ぜません。
 
-Champion is a protected artifact. Training and experimentation produce
-Candidates. A Candidate may replace Champion only through the configured Arena
-gate; neither a lower validation loss nor an impressive APM/APP/VS Score is
-sufficient by itself.
+sample-efficiencyを比較するときは、game数またはgeneration computeを揃えます。
 
-This distinction lets aggressive experiments proceed without making the
-production comparison target drift during the experiment.
+## 10. Champion promotion
+
+Championは保護artifactです。training・ablationから得られるものはCandidateです。
+
+CandidateがChampionを置き換えられるのは、設定済みpaired Arena gateを満たした場合だけです。
+
+次のもの単独ではpromotion理由になりません。
+
+- validation lossが下がった
+- VS Score/APM/APPが高い
+- 1つの短いArenaで勝った
+- auxiliary lossが良くなった
+
+この分離により、aggressiveな実験を行っても比較対象のChampionが途中でdriftしません。

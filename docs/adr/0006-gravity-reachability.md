@@ -1,46 +1,52 @@
-# ADR 0006: Gravity as a reachability constraint
+# ADR 0006: Gravityをreachability constraintとして扱う
 
-## Status
-Accepted.
+## 状態
 
-## Context
-`MovementCfg::gravity_num/den` was carried in the ruleset and hashed, but the
-generator ignored it. At normal speed (1/60 G) that is harmless: a placement
-takes a handful of ticks and gravity needs 60 to move the piece one cell. At
-high gravity it is not — the generator would emit placements the player could
-never physically reach, and at 20G the piece is on the floor the instant it
-spawns.
+採用。
 
-## Decision
-Now that actions are priced in ticks (ADR 0004), the constraint is nearly free
-to state: at a node reached after `cost` ticks, gravity has pulled the piece
-down `floor(cost * num / den)` cells, so a node sitting higher than the spawn
-row minus that amount is unreachable and is not expanded.
+## 背景
 
-Gravity is kept as an exact rational and the comparison is integer arithmetic,
-so reachability stays bit-reproducible (spec 5.2, 18.1).
+`MovementCfg::gravity_num/den` はrulesetに含まれhashにも反映されていましたが、初期move generatorはgravityを無視していました。
 
-The check is skipped entirely when gravity is slower than
-`gravity_check_threshold` (default 8 ticks/cell), so the common case pays
-nothing.
+通常速度（1/60 G）では、placementが数ticksで終わる一方gravityが1 cell落とすまで60 ticksかかるため、実害はほぼありません。しかしhigh gravityでは違います。generatorがplayerには物理的に到達不能なplacementをemitでき、20Gではspawnした瞬間にpieceがfloorへ落ちます。
 
-## Consequences
+## 決定
 
-- At 20G the placement count on an empty board drops from 162 to 58; at 1G and
-  below nothing changes, verified by
-  `normal_gravity_does_not_restrict_placements`.
-- Restriction is monotonic in gravity, which is asserted directly: faster
-  gravity can only remove options.
-- Measured cost: none. 174.8 µs/call before the change, 173.2 µs after, on the
-  same benchmark.
+ADR 0004でactionをtick単位に価格付けできるようになったため、gravityをreachability constraintとして導入します。
 
-## Limitations
+旧generatorでは、`cost` ticks後にgravityが
 
-- **Lock delay and `reset_limit` are still not modelled.** A piece resting on
-  the stack may be moved for `lock_delay` ticks, with a bounded number of
-  resets, which at high gravity is the *only* remaining manoeuvring window.
-  Modelling gravity without it is conservative in one direction (some genuinely
-  reachable high-gravity placements are rejected) and is the next gap to close.
-- The check assumes the piece falls from the spawn row. A piece that has already
-  soft-dropped is treated correctly because the cost is accumulated along its
-  path, but no credit is given for gravity that happened *during* a DAS slide.
+\[
+\left\lfloor \frac{cost \cdot gravity\_num}{gravity\_den} \right\rfloor
+\]
+
+cells落下させたとみなし、その時点でpieceが存在できる高さより上にあるnodeをunreachableとしてexpandしませんでした。
+
+現行Cobra pathでも同じ不変条件を維持しています。Cobraが返したcanonical path prefixをproject側 `execute_inputs` / `HandlingModel` で再生し、各prefixの経過tickに対してgravity上の到達可能性を検査します。
+
+Gravityはexact rationalのまま保持し、comparisonもinteger arithmeticで行います。これによりspec §5.2 / §18.1のbit reproducibilityを維持します。
+
+common caseのoverheadを避けるため、gravityが `gravity_check_threshold` より遅い場合はcheck自体をskipします。defaultは8 ticks/cellです。
+
+## 帰結
+
+旧実装導入時の測定:
+
+- empty board・20Gでplacement countが162→58へ減少。
+- 1G以下では変化なし。`normal_gravity_does_not_restrict_placements` で固定。
+- faster gravityはoptionを増やさないというmonotonicityをtest。
+- benchmark上は174.8→173.2 µs/callで、測定可能なoverheadは見られなかった。
+
+数値は導入当時のhistorical measurementです。現行Cobra implementationのthroughputはADR 0003を参照してください。
+
+## 制限
+
+### Lock delayと `reset_limit` は完全にはmodelしていない
+
+pieceがstackへ接触した後も `lock_delay` ticksの間は操作でき、reset回数には上限があります。high gravityではこのwindowが主要なmanoeuvring timeになります。
+
+現在のgravity modelはこの点で保守的です。本来到達可能なhigh-gravity placementを一部rejectする可能性があります。
+
+### Gravity中のhandling近似
+
+現行checkはcanonical input prefixを再実行して経過時間と位置を比較しますが、完全なcontinuous handling/lock-delay simulatorではありません。したがって、gravity correctnessの残課題は `ROADMAP.md` のengine correctness項目として追跡します。

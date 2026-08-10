@@ -1,88 +1,98 @@
-# ADR 0009: Determinization, and the self-play pipeline
+# ADR 0009: Determinizationと自己対局pipeline
 
-## Status
-Accepted.
+## 状態
 
-## Context
-Two things stood between the search and a trainable network: the search was
-reading hidden information, and there was nowhere to put training samples.
+採用。
 
-## The information leak
+## 背景
 
-`Player` owns the whole piece queue, including the pieces beyond the preview.
-The search copies a `Player` per node, so a tree deeper than `preview_count`
-was planning against the *true* future:
-* preview_count = 5
-* player can see: S O J Z I
-* search actually had: S O J Z I L Z L O T
+searchからtrainable networkへ進む前に、2つの構造的問題がありました。
 
+1. searchがhidden informationを読めていた。
+2. training sampleを正しく保存するcontractがなかった。
 
-Spec §3.2 and §18.3 forbid exactly this. It is also the most damaging kind of
-bug for a self-play project, because it does not crash or fail a test — it
-quietly inflates the value of setups that only work because the engine peeked,
-and the resulting policy collapses the moment it faces a real opponent.
+## 情報漏洩
 
-## Decision: determinize at the root
+`Player` はpreviewより先を含むpiece queue全体を所有します。search nodeが `Player` をcopyするだけだと、tree depthが `preview_count` を超えた時点で**実際のhidden future**を使ってplanningできてしまいます。
 
-`Player::determinize(seed)` discards everything the player cannot legitimately
-see and regenerates it. Two properties are preserved:
+例:
 
-* **The visible preview is untouched.** Determinization must not change what the
-  player is looking at.
-* **The bag is preserved.** A 7-bag is public knowledge and a human counts it,
-  so a resample that ignored the bag would be *less* informed than a person. The
-  discarded pieces are returned to the bag and it is reshuffled. An earlier
-  version skipped the return step and produced three O and one L inside a
-  14-piece window — a measurable violation of the bag guarantee.
+```text
+preview_count = 5
+playerが見える:   S O J Z I
+searchが実際に持つ: S O J Z I L Z L O T
+```
 
-`SearchConfig::determinizations > 1` repeats the search over independently
-sampled futures and averages the visit distributions, which is the particle form
-of the chance node in spec §11.3.
+Spec §3.2 / §18.3はこれを禁止しています。
 
-Measured cost: **19.1 ms → 19.4 ms** for a 64-simulation search. Effectively
-free, because resampling is a queue operation rather than a per-node one.
+self-playでは特に危険です。crashもtest failureも起こさず、engineがpeekしたfutureでしか成立しないsetupのvalueを静かに過大評価し、そのpolicyをtraining dataとして増幅してしまうからです。
 
-## Decision: samples store tokens, not states
+## 決定1: rootでdeterminizeする
 
-`TrainingSample` holds the tokenized observation and the action embeddings
-rather than a `Player`. This keeps samples compact, decouples the on-disk format
-from simulator internals, and — most importantly — makes it structurally
-impossible for a learner to read state that the observation mask removed.
+`Player::determinize(seed)` はplayerが合法的に見えないfutureを捨て、再sampleします。
 
-Every sample carries `ruleset_hash` and `model_version`, and `ReplayBuffer` can
-drop foreign rulesets, because spec §14 lists mixing rulesets without an
-identifier as a forbidden augmentation.
+次の2つを維持します。
 
-## Decision: the reward is the game result, nothing else
+### Visible previewは変えない
 
-Spec §12.3 is emphatic that adding a garbage penalty to the reward prevents the
-bot from ever learning a sensible non-cancel. `GameRecorder` enforces this
-structurally: `outcome` is set solely from win/draw/loss, while attack and
-garbage are written to separate auxiliary fields.
+Determinizationによって現在playerが見ているpreviewを変更しません。
 
-A related detail: a game that survives to the piece limit is scored as a **draw,
-not a win**. It did not beat anything, and rewarding it would teach the bot that
-stalling is optimal.
+### Bag informationを保つ
 
-## Consequences
+7-bagの残り構成はpublic informationであり、人間playerもcountできます。bagを無視してfutureをresampleすると、人間より情報の少ないagentになってしまいます。
 
-The pipeline now runs end to end — self-play → samples → buffer → training batch
-— at ~157 placements/s with a 16-simulation search on this 2-core CPU.
+そのためdiscardしたpieceをbagへ戻してreshuffleします。
 
-Attaching a TetraFormer is now an `Evaluator` implementation and nothing else:
-the search, the sample format, the buffer and the token layout are all fixed and
-tested against baselines whose behaviour is known.
+初期版では戻し忘れがあり、14-piece window内にOが3つ、Lが1つというbag guarantee違反を実際に生成しました。このbugを修正してからbag balanceをtestで固定しました。
 
-## Follow-up decisions (2026-08)
+`SearchConfig::determinizations > 1` の場合は、independentにsampleした複数futureでsearchし、visit distributionを平均します。これはspec §11.3のchance nodeをparticle approximationした形です。
 
-This ADR's two core constraints remain active: hidden information is
-determinized/masked, and terminal reward remains the actual game result. Later
-work deliberately extends *supervision and curriculum* without weakening those
-constraints:
+導入当時の64-simulation searchでは19.1 ms → 19.4 msで、resamplingがroot queue operationだけのためcostは小さく抑えられました。
 
-- [ADR 0014](0014-objectives-auxiliary-targets-and-vs-score.md) adds dense
-  trajectory-derived targets and VS Score as diagnostics while keeping WDL as
-  the objective anchor.
-- [ADR 0015](0015-selfplay-provenance-search-mixture-and-timing-curriculum.md)
-  records provenance-locked self-play, mixed search budgets, Champion
-  protection, and staged timing/cancellation learning.
+## 決定2: sampleにはraw stateではなくtokenを保存する
+
+`TrainingSample` は `Player` そのものではなく、tokenized observationとaction embeddingを保持します。
+
+これにより:
+
+- sampleをsimulator internal stateからdecoupleできる。
+- observation maskで除外したhidden stateをlearnerが後から読む経路を構造的に閉じられる。
+- on-disk contractをmodel inputへ近づけられる。
+
+各sampleは `ruleset_hash` と `model_version` を持ち、`ReplayBuffer` はforeign rulesetをdropできます。spec §14が禁止する「ruleset identityなしの混合」を防ぎます。
+
+> 後にADR 0012で、再構成可能な単盤面sampleについてはReplay+πをcompactに保存しload時にtokenを再生成する形式も追加しました。二盤面self-playは相手event streamの再構成が必要なため現行rectangular v3を使います。
+
+## 決定3: rewardはgame resultだけにする
+
+Spec §12.3の方針に従い、garbage penaltyやstack heuristicをterminal rewardへ混ぜません。
+
+`GameRecorder` は `outcome` をwin/draw/lossだけから設定し、attack・garbageなどは別のauxiliary fieldへ保存します。
+
+piece limitまで生存したgameも**winではなくdraw**として扱います。相手を倒していないtrajectoryをwinとしてrewardすると、stallingを最適行動として学ぶ危険があります。
+
+## 帰結
+
+導入時点で、
+
+```text
+self-play -> sample -> replay buffer -> training batch
+```
+
+がend-to-endで接続されました。
+
+当時の2-core CPU・16-simulation searchでは約157 placements/sでした。この値はhistorical pipeline measurementです。
+
+TetraFormerを接続するときは `Evaluator` implementationを追加すればよく、search、sample contract、buffer、token layoutを別々に書き換える必要がなくなりました。
+
+## 2026-08の追補
+
+本ADRの根本制約は現在も維持します。
+
+- hidden informationはmask / determinizationする。
+- terminal objectiveはactual game resultにする。
+
+後続のsample-efficiency workはこの制約を弱めず、**supervision densityとcurriculum**だけを拡張します。
+
+- [ADR 0014](0014-objectives-auxiliary-targets-and-vs-score.md): WDLをobjective anchorに残したままmulti-horizon auxiliary targetとVS Score diagnosticsを導入する。
+- [ADR 0015](0015-selfplay-provenance-search-mixture-and-timing-curriculum.md): provenance-locked self-play、search-budget mixture、Champion保護、timing/相殺外しのstaged learningを定める。

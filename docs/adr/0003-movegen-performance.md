@@ -1,50 +1,57 @@
-# ADR 0003: Movegen is optimised as the MCTS inner loop
+# ADR 0003: movegenをMCTS inner loopとして最適化する
 
-## Status
-Superseded by the pure-Cobra movegen integration. The measurements below are
-the historical optimization record for the removed project-side generator.
+## 状態
 
-## Context
-Spec §19.4 sets inference targets of 5 ms for policy-only and 30–50 ms for
-64–128 simulations. Every simulation needs a legal move list, so movegen
-throughput bounds the whole search budget. The first correct implementation ran
-at 279 µs per call, which would have consumed the entire budget in ~180 calls.
+**旧project-side generatorについては置換済み。** 現在の合法配置生成はpure Cobra integrationを使用します。以下の測定と最適化は、削除済みgeneratorのhistorical recordです。
 
-## Decision
-Three targeted optimisations, each verified to leave the output byte-identical
-(same 777,136 placements over the benchmark, same determinism hashes, all tests
-green):
+## 背景
 
-1. **Parent-linked BFS paths.** The BFS copied a `vector<Input>` per expansion.
-   Nodes now store a parent index and a single input; the path is reconstructed
-   only for placements that are actually emitted. 279 → 163 µs.
-2. **Flat, generation-stamped visited table.** The 20-bit packed state indexes a
-   direct-mapped array instead of an `unordered_map`. Clearing it per call would
-   cost more than the search, so a generation counter invalidates stale entries
-   in O(1). 163 → 124 µs.
-3. **Reused scratch buffers.** The arena, frontier and landing vectors live in
-   `thread_local` scratch, so a steady-state call performs no heap allocation.
-   124 → 117 µs.
+Spec §19.4は、policy-onlyで5 ms、64–128 simulationsで30–50 msというinference targetを置いています。各simulationはlegal move listを必要とするため、movegen throughputはsearch budget全体の上限になります。
 
-Collision detection was also rewritten to use precomputed per-row bitmasks.
-This turned out not to be the bottleneck, but it is strictly better and is
-differentially tested against the naive implementation over 5.9M cases.
+最初のcorrect implementationは1 callあたり279 µsで、約180 callsだけでsearch budget全体を消費する水準でした。
 
-## Consequences
-- 2.4× faster overall, with headroom for the search budget.
-- The `thread_local` scratch means a `MoveGenerator` is safe to share across
-  threads but its buffers are per-thread; this is verified under ASan.
-- The bitmask collision path has a subtlety: the bounding box may hang off the
-  left edge (negative `x`) while no filled cell does, so the shift direction
-  must be chosen accordingly. This was caught by the differential test and is
-  commented at the call site.
+## 決定
 
-## Current implementation
+旧generatorへ3つのtargeted optimizationを導入しました。各変更について、同一benchmarkの777,136 placements、determinism hash、全testがbyte-identicalであることを確認しました。
 
-`MoveGenerator` now uses Cobra's fixed standard 10x40 board directly. Cobra's
-`MoveList` enumerates legal targets and an all-target `PathFinder` traversal
-supplies canonical input paths in one pass per piece and input model; the
-removed legacy generator is not used as a fallback. On the same CLI benchmark,
-the pure-Cobra implementation measured **99.0 µs/call**, versus **132.4
-µs/call** for the pre-switch hybrid adapter (20,000 calls, standard 10x40
-field).
+1. **Parent-linked BFS path**
+   - BFS expansionごとに `vector<Input>` をcopyする方式を廃止。
+   - nodeはparent indexと単一inputだけを持ち、実際にemitするplacementについてのみpathを再構築。
+   - 279 → 163 µs。
+
+2. **Flat generation-stamped visited table**
+   - 20-bit packed stateを `unordered_map` ではなくdirect-mapped arrayへindex。
+   - 毎callの全clearを避け、generation counterでstale entryをO(1) invalidation。
+   - 163 → 124 µs。
+
+3. **Scratch buffer再利用**
+   - arena、frontier、landing vectorを `thread_local` scratchへ移動。
+   - steady-state callでheap allocationを行わない。
+   - 124 → 117 µs。
+
+collision detectionもprecomputed per-row bitmaskへ変更しました。これは主要bottleneckではありませんでしたが、naive implementationとの5.9M differential casesで一致を確認しています。
+
+## 帰結
+
+旧generatorでは次の結果を得ました。
+
+- 初期実装比で約2.4倍高速化。
+- `thread_local` scratchにより、`MoveGenerator` 自体をthread間で共有しつつbufferはthread-localとなった。
+- bitmask collisionではbounding boxの `x` がnegativeでもfilled cell自体はfield内にあるcaseがあり、shift directionの扱いが必要だった。このbugはdifferential testで発見した。
+
+## 現行実装
+
+現在の `MoveGenerator` は、Cobraの固定10x40 boardを直接使用します。
+
+- Cobra `MoveList` がlegal targetを列挙する。
+- all-target `PathFinder` がpiece/input modelごとのcanonical input pathをまとめて供給する。
+- removed legacy generatorへのfallbackはない。
+
+同じ標準10x40・20,000 call CLI benchmarkでは次の測定でした。
+
+| 実装 | µs / call |
+|---|---:|
+| pure Cobra移行前のhybrid adapter | 132.4 |
+| pure Cobra | **99.0** |
+
+したがって、このADRの「movegen throughputをsearch architecture上の重要制約として測る」という原則は維持しつつ、具体的な旧BFS optimizationはpure Cobraによって置き換えられています。
