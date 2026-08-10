@@ -72,3 +72,17 @@ The pipeline now runs end to end — self-play → samples → buffer → traini
 Attaching a TetraFormer is now an `Evaluator` implementation and nothing else:
 the search, the sample format, the buffer and the token layout are all fixed and
 tested against baselines whose behaviour is known.
+
+## Follow-up decisions (2026-08)
+
+This ADR's two core constraints remain active: hidden information is
+determinized/masked, and terminal reward remains the actual game result. Later
+work deliberately extends *supervision and curriculum* without weakening those
+constraints:
+
+- [ADR 0014](0014-objectives-auxiliary-targets-and-vs-score.md) adds dense
+  trajectory-derived targets and VS Score as diagnostics while keeping WDL as
+  the objective anchor.
+- [ADR 0015](0015-selfplay-provenance-search-mixture-and-timing-curriculum.md)
+  records provenance-locked self-play, mixed search budgets, Champion
+  protection, and staged timing/cancellation learning.

@@ -1,6 +1,15 @@
 # Sample-efficiency 実装計画
 
-最終更新: 2026-08-06
+最終更新: 2026-08-10
+
+> この文書は実装順序と実験詳細を保持する作業計画である。原仕様は
+> `SPEC.md`、後続の設計判断は ADR 0014/0015、短い運用契約は
+> `TRAINING_AND_EVALUATION.md` を参照する。`SPEC.md` は後から書き換えない。
+>
+> 2026-08-10 時点の `main` では Phase 1 と Phase 2a、および Phase 2b の
+> 基盤（aux schema v2、36 targets、valid mask、target統計、gradient
+> diagnostics）が実装済み。Phase 3 の action-conditioned target、VS Score
+> の実装/aux ablation、検索強度mixの本格運用は次段階である。
 
 ## 目的
 
@@ -26,12 +35,12 @@
 ### 検証済み
 
 - `make test`
-- 280 tests / 1,019,326 assertions / 0 failed
+- 2026-08-10時点: 282 tests / 1,045,724 assertions / 0 failed
 - C++ / PyTorchのfeature widthは変更していないため、`TOKEN_FEATURES=24`の契約は維持する。
 
 ただし、feature widthが同一でもtoken kindやtoken順序の意味は変わり得るため、互換性判定にはwidthだけでなくTokenizer schemaを使用する。
 
-現在のTokenizer関連3ファイルは未コミットである。次セッションでは、まず差分を確認してからこの変更をコミットする。
+これらのTokenizer/schema変更は現在の`main`へ取り込まれている。以後はfeature widthだけでなくschema version/hashを互換性判定の権威とする。
 
 ## 用語とデータ契約
 
@@ -53,7 +62,7 @@ trajectory終了理由を明示的に区別する。
 
 ## 実装順序
 
-## Phase 1: 観測とデータ契約を固定する
+## Phase 1: 観測とデータ契約を固定する — 実装済み
 
 1. 現在のTokenizer変更を再検証し、token kind名、token順序、solo/duelのtoken数を固定する。
 2. Dataset export / import、GPU bridge、C++ evaluator、PyTorch入力で可変token長が維持されることを確認する。
@@ -87,16 +96,13 @@ trajectory終了理由を明示的に区別する。
 - Dataset round-trip後にtoken列、mask、player perspective、termination reasonが一致する。
 - 異なるschemaのshardをvalidatorが拒否する。
 
-## Phase 2a: 多段補助targetを生成する
+## Phase 2a: 多段補助targetを生成する — 実装済み（aux schema v2）
 
-現在の補助targetは次の4個である。
+aux schema v2は36 targetsを持つ。互換性維持のためのlegacy 4 targetsに加え、
+real-timeとplacementの各4区間について、attack / garbage received /
+self top out / opponent top outを記録する32 interval targetsを追加した。
 
-1. 近未来の攻撃量
-2. 近未来に受けたgarbage量
-3. 終局までの時間
-4. 8手以内のtop out
-
-これを、追加の自己対局を要求せず同じtrajectoryから抽出できる多段targetへ拡張する。
+追加の自己対局を要求せず、同じtrajectoryから多段targetを抽出する方針は維持する。
 
 ### 時間horizon
 
@@ -206,9 +212,9 @@ validation leakageを避けるため、splitは局面単位ではなく少なく
 
 target統計が不自然な場合は、aux headの実装へ進まない。
 
-## Phase 2b: 多段aux headとlossを接続する
+## Phase 2b: 多段aux headとlossを接続する — 基盤実装済み、ablation継続
 
-Phase 2aのtarget生成と統計が安定してから、PyTorch側へ多段aux headとlossを追加する。
+PyTorch側はaux schema v2を読み、valid mask付きloss、target統計、shared trunkのgradient norm/cosineを記録できる。残る課題は「学習できるか」ではなく、policy/search/Arenaに実益がある重みとtarget集合を固定データで切り分けることである。
 
 総損失は概念的に次の形とする。
 
@@ -363,7 +369,7 @@ Tokenizer改善、value head、aux headの効果を分離するため、最低�
 | E | 新 | あり | 多段aux |
 | F | 新 | あり | 多段aux + action-conditioned |
 
-計算量が限られる場合でも、現状でpolicy-onlyがvalue付きより高性能であるため、条件Bは省略しない。
+計算量が限られる場合でも、value/auxの寄与を切り分ける基準としてpolicy-only条件Bは省略しない。
 
 ### 比較時に固定または記録する量
 
@@ -401,6 +407,7 @@ Tokenizer改善、value head、aux headの効果を分離するため、最低�
 
 - 勝率
 - 95%信頼区間
+- VS Score（実装後は標準報告。win rateの代替ではない）
 - APM
 - APP
 - PPS
@@ -426,15 +433,14 @@ Tokenizer改善、value head、aux headの効果を分離するため、最低�
 - schemaが異なるshardをwidth一致だけで結合しない。
 - Google Apps Scriptをseed、label、dataset mergeの権威にしない。Colab shardのseedとschemaはmanifestおよびvalidatorで管理する。
 
-## 次セッションの開始手順
+## 次の実行順序
 
-1. `git status --short --branch`でTokenizer変更を確認する。
-2. `make test`を再実行する。
-3. Phase 1のparity fixtureとdataset round-tripテストを追加する。
-4. Tokenizer schema、observation schema hash、termination reasonをdataset contractへ追加する。
-5. `TrainingSample` / `GameRecorder`の終了理由を`terminated` / `truncated`へ分離する。
-6. 未来イベント集計を累積窓ではなく区間窓配列へ置き換える設計をコード上で確定する。
-7. Phase 2aを実装し、target統計とmask率を出力する。
-8. 旧4 targetとの比較用小規模datasetを生成する。
-9. policy-onlyを含む固定seed ablationを実行する。
-10. Phase 2aのtargetとsplitが妥当であることを確認してからaux headを接続する。
+1. `make test` とdataset/schema round-tripを維持し、現行36-target contractを壊さない。
+2. policy-only / WDL / legacy aux / multi-horizon auxを、同一dataset・split・minibatch schedule・複数seedで比較する。
+3. Arena出力へVS Scoreを追加し、APM/APP/PPSと同じpaired条件で記録する。
+4. VS Scoreをaux targetとして使う実験は、計算式・ruleset解釈・schemaを固定してから独立ablationとして行う。WDL rewardは変更しない。
+5. CNN/Transformer系の比較はADR 0013の方針に従い、held-out policy loss単独で結論しない。
+6. Phase 3のaction-conditioned targetを小規模overfit testから実装し、入力特徴の自己コピーになっていないことを確認する。
+7. self-play loopが安定したら、浅いsearch中心 + 少量の深いsearchという生成mixをprovenance別に試す。
+8. 基本的なstacking/Quad/T-spinが確認できてからtiming/相殺外しの探索を強め、delay action頻度・cancellation・VS Score・Arenaで検証する。
+9. MoE/SAEはADR 0016どおり、強いdense baselineの後段に置く。
