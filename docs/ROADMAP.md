@@ -1,160 +1,159 @@
-# Roadmap
+# ロードマップ
 
-This is the current execution view of the project. `SPEC.md` remains the original
-specification; accepted changes in direction are recorded in `adr/` and linked
-here.
+この文書は、プロジェクトの**現在の実行状況**を示します。`SPEC.md` は当初仕様として保存し、後の方向変更は `adr/` に記録します。
 
-## Milestone status
+## Milestone状況
 
-| Area | Status |
+| 領域 | 状態 |
 |---|---|
-| **M0 — rule core** | **Done.** Board, pieces, SRS/SRS+/180 kicks, spins, clears, attack, garbage, ruleset versioning, event log. |
-| **M1 — policy inputs / move generation** | **Done for the current contract.** Cobra legal placements, action timing/delay bins, masked observations, row/column/global tokens, bag and opponent-counter tokens, schema identifiers, and variable legal-action embeddings are implemented. |
-| **M2 — search / self-play / training** | **Done as an end-to-end loop.** Batched evaluators, PUCT/Gumbel search, determinization, replay/datasets, PyTorch training, C++ weight inference, GPU self-play, GPU Arena, resumable checkpoints, replay mixing, and guarded Candidate→Champion iteration exist. |
-| **M3 — garbage-aware self-play** | **Enabled.** Two boards advance by timestamp and route attacks through the same event machinery used by search/Arena. No-attack curricula remain available explicitly. |
-| **M4 — opponent-aware model** | **Core observation path enabled.** Opponent board/counters are tokenized and two-player search is implemented. Dedicated opponent-intent modelling and league training remain future work. |
-| **M5 — multimodal** | **Not started.** No image/video input path is part of the current priority stack. |
+| **M0 — rule core** | **完了。** Board、piece、SRS/SRS+/180 kick、spin、clear、attack、garbage、ruleset versioning、event logを実装済み。 |
+| **M1 — policy input / move generation** | **現行contractでは完了。** Cobra legal placement、action timing/delay bin、masked observation、row/column/global token、bag/opponent-counter token、schema identifier、variable legal-action embeddingを実装済み。 |
+| **M2 — search / self-play / training** | **end-to-end loop実装済み。** batched evaluator、PUCT/Gumbel、determinization、replay/dataset、PyTorch training、C++ weight inference、GPU self-play、GPU Arena、resumable checkpoint、replay mixing、Candidate→Champion guarded iterationが利用可能。 |
+| **M3 — garbage-aware self-play** | **有効。** 二盤面をtimestamp順に進め、search/Arenaと同じevent machineryでattack deliveryを行う。no-attack curriculumも明示的に選択可能。 |
+| **M4 — opponent-aware model** | **core observation pathは有効。** Opponent board/counterをtokenizeし、two-player searchも実装済み。Dedicated opponent-intent modellingとleague trainingは未実装。 |
+| **M5 — multimodal** | **未着手。** image/video inputは現在の優先順位外。 |
 
-## Current model status
+## 現在のモデル構造
 
-TetraFormer remains the reference/control architecture. CNN and CNN+Transformer
-families are experimental candidates using the same simulator and tensor
-contract.
+TetraFormerをreference/controlとして維持し、CNNとCNN+Transformerを同じsimulator・tensor contract上の実験候補として扱います。
 
-The 2026-08-08 ablation changed how architecture work is evaluated:
+2026-08-08のablationから、architecture選定方針を次のように変更しました。
 
-- the Transformer fit the Transformer-derived policy teacher slightly better;
-- the full CNN learned WDL/value substantially better on the corrected split;
-- the CNN's clearest repeatable advantage appeared inside search;
-- small bolt-on CNN hybrids did not reproduce that advantage and could overfit
-  value badly.
+- TransformerはTransformer由来teacher policyをわずかに良く模倣した。
+- corrected hashed splitではfull CNNがWDL/valueを大幅に良く学習した。
+- CNNの最も安定した優位はraw policy-onlyではなく**search内**に現れた。
+- 小型CNNを付け足したhybridはその優位を再現できず、value late-overfitも起こした。
 
-Therefore the next architecture experiment is **not** "replace Transformer with
-CNN" and is not another arbitrary head attachment. It should test a concrete
-shared-representation hypothesis, such as a full-capacity local CNN encoder
-shared by policy/value and combined with Transformer global context. See
-[ADR 0013](adr/0013-architecture-ablation-and-local-geometry.md) and
-[CNN_ABLATION_20260808.md](CNN_ABLATION_20260808.md).
+したがって次のarchitecture実験は「TransformerをCNNで置換する」でも「CNN headをまた足す」でもありません。
 
-## Active priority 1 — sample efficiency and objective diagnostics
+**具体的な表現仮説**を検証します。最有力候補は、full CNN相当のlocal encoderをpolicy/valueで共有し、その特徴をTransformerのglobal/opponent interactionへ接続するhybridです。
 
-The repository now has:
+関連: [ADR 0013](adr/0013-architecture-ablation-and-local-geometry.md)、[CNN_ABLATION_20260808.md](CNN_ABLATION_20260808.md)。
 
-- tokenizer/observation/action/auxiliary schema identifiers;
-- explicit `terminated` / `truncated` handling in the dataset contract;
-- bag and opponent-counter tokens;
-- 36 auxiliary targets: four legacy targets plus interval targets over real-time
-  and placement horizons for attack, garbage received, self top-out, and
-  opponent top-out;
-- valid masks for unknown future horizons;
-- trainer-side auxiliary target statistics;
-- shared-trunk gradient norms and policy/value / policy/auxiliary cosine
-  diagnostics.
+## 優先度1 — サンプル効率と目的関数の診断
 
-Next steps:
+現在 `main` には次が存在します。
 
-1. validate the multi-horizon targets on larger mixed-generation data and keep
-   split leakage checks explicit;
-2. run fixed-data/fixed-budget ablations of policy-only, WDL, and auxiliary
-   configurations rather than assuming the added heads help;
-3. add **VS Score** to match/Arena reporting alongside APM/APP/PPS;
-4. only after the reporting metric is pinned, test VS Score as an optional
-   auxiliary prediction target—never as a replacement for WDL reward;
-5. add action-conditioned consequence targets only where the engine can produce
-   exact labels without duplicating an input feature as its own target.
+- tokenizer / observation / action / auxiliary schema identifier
+- dataset contract上の `terminated` / `truncated` 区別
+- bag tokenとopponent-counter token
+- 36 auxiliary targets
+  - legacy 4 targets
+  - real-time 4区間 × attack / garbage received / self top-out / opponent top-out
+  - placement 4区間 × 同じ4 channel
+- unknown future horizon用valid mask
+- trainer-side auxiliary target statistics
+- shared-trunk gradient norm
+- policy/value、policy/aux gradient cosine diagnostics
 
-See [ADR 0014](adr/0014-objectives-auxiliary-targets-and-vs-score.md),
-[TRAINING_AND_EVALUATION.md](TRAINING_AND_EVALUATION.md), and
-[SAMPLE_EFFICIENCY_PLAN.md](SAMPLE_EFFICIENCY_PLAN.md).
+次の実行順:
 
-## Active priority 2 — close the self-play loop under controlled provenance
+1. multi-horizon targetをより大きなmixed-generation datasetで再検証し、split leakage checkを固定する。
+2. policy-only / WDL / legacy aux / multi-horizon auxを、同一dataset・split・training budget・複数seedで比較する。
+3. **VS Scoreをmatch/Arena reportへ実装する。** 計算式とruleset interpretationを文書・testで固定する。
+4. VS Scoreをauxiliary prediction targetとして試す場合は、report実装とは別のablationとして行う。WDL rewardは変更しない。
+5. action-conditioned consequence targetは、engineからexact labelを得られ、入力特徴の自己コピーにならないものから追加する。
 
-The local/Colab generation path and manifest validator exist. The remaining work
-is to turn the loop into a repeatable source of *comparable* generations rather
-than merely a way to produce more samples.
+関連: [ADR 0014](adr/0014-objectives-auxiliary-targets-and-vs-score.md)、[TRAINING_AND_EVALUATION.md](TRAINING_AND_EVALUATION.md)、[SAMPLE_EFFICIENCY_PLAN.md](SAMPLE_EFFICIENCY_PLAN.md)。
 
-1. Keep every shard attributable to commit, checkpoint, ruleset, schema, search
-   settings, and a non-overlapping seed interval.
-2. Compare local-only and mixed local/Colab generations under the same Arena
-   protocol before promotion.
-3. Prefer a search-strength mixture once generation is stable: mostly shallow
-   search for coverage plus a smaller deeper-search component for stronger
-   targets.
-4. Record position-start/recovery curricula as separate provenance classes if
-   introduced; do not silently mix them into ordinary self-play.
-5. Keep Champion immutable outside the configured Arena gate.
+## 優先度2 — provenanceを保った自己対局loopの運用
 
-Resumable Drive transport remains useful operational work, but Drive/GAS must
-remain transport/orchestration rather than the authority for seeds or labels.
-See [ADR 0015](adr/0015-selfplay-provenance-search-mixture-and-timing-curriculum.md).
+local/Colab generationとmanifest validatorは実装済みです。次の課題は「sampleを増やせること」から「generation間を正しく比較できること」へ移っています。
 
-## Active priority 3 — basic tactics before explicit timing curriculum
+1. すべてのshardをcommit、checkpoint、ruleset、schema、search setting、non-overlapping seed intervalへ結び付ける。
+2. local-only generationとlocal+Colab generationを、同じArena protocolで比較してからpromotionする。
+3. generationが安定したら、**浅いsearch中心 + 少量の深いsearch**というmixtureを試す。
+4. position-start / recovery curriculumを導入する場合は、manifest上で別provenance classとして記録する。
+5. Championはconfigured Arena gate以外から変更しない。
 
-Delay bins and `WAIT_FOR_EVENT` already exist, but early trained policies did
-not demonstrate meaningful use of them. The presence of timing actions is not
-evidence that cancellation timing (相殺外し) has been learned.
+Drive/GASのresumable transferは運用上有用ですが、seed・label・dataset mergeの権威にはしません。
 
-The staged plan is:
+関連: [ADR 0015](adr/0015-selfplay-provenance-search-mixture-and-timing-curriculum.md)。
 
-1. first obtain visibly competent stacking, Quads, T-spins, and ordinary attack
-   construction;
-2. use Arena, VS Score, qualitative play, and APP together to judge readiness;
-   APP around the flat-stack Quad baseline (~0.5) is only a rough diagnostic;
-3. then strengthen exploration/data coverage for delayed actions and garbage
-   timing;
-4. measure delayed-action frequency, `WAIT_FOR_EVENT` use, cancellation
-   interaction, VS Score, and paired wins before claiming the capability exists.
+## 優先度3 — 基本戦術の後にtiming / 相殺外し
 
-No positive reward for "waiting" is introduced. Search and actual game outcomes
-must determine when delay is useful. See ADR 0015.
+move generatorは `WAIT_FOR_EVENT` を含むdelay binをすでに表現できます。しかし初期trained policyはdelay actionをほぼ利用しておらず、**表現可能であることと学習済みであることは別**です。
 
-## Later — strong playing agents, teaching agents, and language mediation
+段階的に進めます。
 
-The long-term research target is an **AI→human learning pipeline**, not a
-particular interpretability architecture. It separates a maximally strong
-playing agent from a teaching/analysis agent whose job is to expose useful,
-checkable strategic knowledge. The teaching layer may interrogate or distill a
-stronger player rather than being architecturally identical to it.
+1. stable stacking、Quad、T-spin、通常attack constructionが明確に成立する状態を先に作る。
+2. Arena、qualitative play、APP、将来のVS Scoreを合わせてreadinessを見る。
+3. 平積みQuadの理論baselineであるAPP約0.5は粗いdiagnosticとしてのみ使い、hard gateにはしない。
+4. その後、delay action・garbage timing・相殺外しのexploration/data coverageを強める。
+5. delayed-action frequency、`WAIT_FOR_EVENT` usage、cancellation interaction、VS Score、paired winsを測り、能力の実在を確認する。
 
-Natural language should mediate in both directions: human strategic questions
-become reproducible game/model probes, and engine/model discoveries become
-human-readable explanations or curricula. Exact simulation, interventions, and
-provenance remain the evidence underneath the language layer.
+「waiting」自体へpositive rewardを与えません。delayの有用性はsearchとgame outcomeから学習させます。
 
-Sparse MoE and Sparse Autoencoders are candidate tools in this program. MoE is
-not the next scaling step and is deferred until a strong dense baseline exists;
-if tested, routing must be observable and broad regime labels remain hypotheses,
-not guarantees. SAE feature extraction is likewise downstream of strength and
-must survive counterexamples/interventions before a feature is used for
-teaching.
+## その後 — 強いplaying agent、teaching agent、自然言語媒介
 
-See [ADR 0016](adr/0016-defer-sparse-moe-and-build-for-interpretability.md).
+長期目標は、特定のinterpretability architectureそのものではなく、**AI→人間学習pipeline**です。
 
-## Engine correctness work that remains
+役割を分離します。
 
-### Lock delay and `reset_limit`
+- 最大限強く指す**playing agent**
+- 強いagentのknowledgeを抽出・検証・説明する**teaching/analysis agent**
 
-Gravity is enforced as a reachability constraint (ADR 0006), but the full
-lock-delay manoeuvring window with bounded resets is still a known gap. At high
-gravity the current model can conservatively reject placements that should be
-reachable.
+teaching agentはplaying agentと同一architectureである必要はありません。trace、search statistics、activation、learned feature、counterfactual probeなどを利用し、人間にとって有用な戦略概念へ変換できればよいとします。
 
-### TETR.IO parity questions
+自然言語は双方向の媒介層として使います。
 
-- **Kick-table provenance:** SRS+ and 180 tables are structurally tested but not
-  yet replay-diffed against legally obtained real TETR.IO replays.
-- **High B2B × high combo rounding:** the implementation follows the documented
-  formula; exact engine intermediates may differ in extreme combinations.
-- **Garbage messiness constants:** behaviour is configurable, but real constants
-  are not public.
-- **Surge variants:** reversed / QUICK PLAY modes are not fully modelled.
+- 人間の問い → reproducible game/model probe
+- engine/model discovery → human-readable explanation / curriculum
 
-These are correctness/parity questions, not reasons to loosen the deterministic
-ruleset/hash/schema contracts.
+exact simulator・intervention・provenanceを根拠として残し、fluentな説明だけで戦略を正しいとみなしません。
 
-## Documentation rule
+### Sparse MoE / Sparse Autoencoder
 
-Do not rewrite `SPEC.md` to match this roadmap. When direction changes, add an
-ADR, update this file and the relevant operational guide, and leave the original
-specification as the historical baseline. See [docs/README.md](README.md) for
-the document hierarchy.
+これらは候補手法であり、長期目標そのものではありません。
+
+Sparse MoEはstrong dense baselineができるまで延期します。将来試す場合はsmall expert count、shared trunk、observable routingから始めます。
+
+Sparse Autoencoderもstrong checkpoint後のfeature extraction候補です。candidate featureをteachingへ使う前に、counterexample・intervention・ablationで検証します。
+
+関連: [ADR 0016](adr/0016-defer-sparse-moe-and-build-for-interpretability.md)。
+
+## Tooling / CIの既知課題
+
+### Vendored Cobraと `-Werror`
+
+通常の `make test` はC++23で通りますが、`docs/ci.yml` のwarning-as-error条件をそのまま適用すると、vendored Cobra内部の `#pragma unroll` と `-Wshadow` warningがerrorへ昇格して失敗します。
+
+これは現在のproject-side sourceのcorrectness failureではなく、third-party codeを同じwarning policyでcompileしていることによるscope問題です。
+
+次に決めるべきなのは、Cobra sourceを無条件に書き換えることではなく、次のいずれかです。
+
+- project codeとvendored codeでwarning policyを分離する。
+- upstream-compatibleな最小patchを用意する。
+- compilerごとのpragma/warning扱いをCI側で明示する。
+
+この問題を解消するまでは `docs/ci.yml` を「そのままgreenになる完成workflow」とは扱いません。
+
+## 残っているengine correctness課題
+
+### Lock delayと `reset_limit`
+
+Gravityはreachability constraintとして実装済みですが、stackへ接触した後のfull lock-delay manoeuvring windowとbounded resetは未完成です。
+
+高gravityではこのwindowが主要な操作時間になるため、現在のmodelは一部の本来到達可能なplacementを保守的にrejectする可能性があります。
+
+### TETR.IO parityに関する未解決事項
+
+- **Kick-table provenance:** SRS+ / 180 tableはstructural test済みだが、合法的に取得したreal TETR.IO replayとのdiff testは未実施。
+- **High B2B × high combo rounding:** documented formulaに従うが、実ゲームの非整数intermediateと極端な組み合わせで差が出る可能性がある。
+- **Garbage messiness constants:** behaviourはconfigurableだがreal constantsは非公開。
+- **Surge variants:** reversed / QUICK PLAY系を完全にはmodelしていない。
+
+これらはrule parityの問題であり、deterministic ruleset/hash/schema contractを緩める理由にはしません。
+
+## ドキュメント更新規則
+
+このROADMAPへ合わせるために `SPEC.md` を書き換えません。
+
+方向が変わった場合は次の順で更新します。
+
+1. ADRを追加する。
+2. ROADMAPを更新する。
+3. 必要ならoperational guideを更新する。
+4. `SPEC.md` は当初仕様のhistorical baselineとして残す。
+
+文書間の役割分担は [docs/README.md](README.md) を参照してください。

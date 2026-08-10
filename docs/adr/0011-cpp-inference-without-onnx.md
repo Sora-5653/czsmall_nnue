@@ -1,51 +1,64 @@
-# ADR 0011: C++ inference without ONNX Runtime
+# ADR 0011: ONNX Runtimeを使わずC++でtrained-weight inferenceを行う
 
-## Status
-Accepted.
+## 状態
 
-## Context
-Training happens in PyTorch; play happens in the C++ search. Something has to
-run the trained weights inside the engine. Spec §17 nominates ONNX as the
-inference format.
+採用。
 
-## Decision
-Implement the forward pass directly in C++ (`nnue.hpp`), loading weights from a
-`.tetrawts` file written by `trainer/export_weights.py`. No third-party runtime.
+## 背景
 
-Reasons, in order of weight:
+trainingはPyTorch、実際のsearch/game loopはC++で動きます。したがって学習済みweightをengine内部で実行する方法が必要です。
 
-1. **`git clone && make` keeps working.** The engine has no dependencies today
-   and its 263 tests run anywhere with a C++17 compiler. Adding ONNX Runtime
-   would make the build, and CI, contingent on a large binary dependency.
-2. **The ROCm/RDNA 4 toolchain is still settling.** `gfx1201` only became
-   officially supported in ROCm 7.2. Coupling the *engine* to that stack would
-   make the whole project hostage to it; keeping inference dependency-free means
-   a toolchain problem blocks training only.
-3. **Self-play generation is latency-bound at small batch sizes**, where a
-   heavyweight runtime's dispatch overhead is a real cost.
+Spec §17はinference format候補としてONNXを挙げています。
 
-The trade is accepted deliberately: this path is scalar CPU code and will be
-slow for a spec-sized model. Training and large-scale evaluation belong on the
-GPU in Python.
+## 決定
 
-## The risk this creates, and the mitigation
+`nnue.hpp` にforward passを直接C++実装し、`trainer/export_weights.py` が出力する `.tetrawts` を読み込みます。
 
-A hand-written forward pass can silently disagree with the one that was trained.
-That failure is invisible — no crash, no error, just a bot mysteriously weaker
-than its validation loss implies.
+標準C++ engineにthird-party neural runtimeを追加しません。
 
-`cpp_matches_pytorch_exactly` pins the two together against a committed fixture
-(a small model plus a reference forward pass). Measured agreement: **3e-08**
-maximum absolute difference on the policy distribution. If anyone changes
-either implementation, that test fails before the divergence can reach a
-training run.
+主な理由:
 
-The loader also refuses weights whose `token_features` / `action_features` do
-not match the engine, so a token-layout change cannot be silently misread as
-valid data.
+### 1. dependency-free buildを維持できる
 
-## If this becomes the bottleneck
+この判断当時、`git clone && make` だけでengine/testを実行できました。ONNX Runtimeを追加するとbuildとCIがlarge binary dependencyへ依存します。
 
-An ONNX Runtime or libtorch backend can be added behind the same `Evaluator`
-interface without touching the search, exactly as `TetraFormerEvaluator` was.
-The parity fixture then serves both backends.
+当時は263 testsがC++17 compilerだけで動作していました。これはhistorical countです。現在のbuildはCobra要件により**C++23**、2026-08-10時点の通常 `make test` は282 testsです。
+
+### 2. GPU toolchain問題をengine全体へ波及させない
+
+training GPU stackに問題が起きても、rule engine・CPU inference・replay verificationまで同時にbuild不能になる構造を避けます。
+
+GPU large-scale training/evaluationはPython側に置き、C++ coreは独立にtest可能なまま保ちます。
+
+### 3. small-batch self-playではdispatch overheadも無視できない
+
+self-play searchはsmall batch・latency-sensitiveな場面があります。heavy runtimeの導入が常に有利とは限りません。
+
+代償も明示的に受け入れます。手書きC++ pathはscalar CPU implementationであり、spec-sized modelのlarge-scale evaluationには遅い可能性があります。現在その用途はPython GPU bridgeが担います。
+
+## 手書きforwardが生むrisk
+
+最大のriskは、**C++が学習したnetworkと微妙に違うnetworkを実行してもcrashしない**ことです。
+
+このfailureはvalidation lossには現れず、「なぜかengineだけ弱い」という形になります。
+
+そのため `cpp_matches_pytorch_exactly` でC++ / PyTorch forwardをfixture上に固定します。
+
+導入時の測定ではpolicy distributionのmaximum absolute differenceは **3e-08** でした。
+
+loaderはさらに、weightに記録された `token_features` / `action_features` がengineと一致しない場合にrejectします。
+
+後のschema workではfeature widthだけでなくtokenizer/observation/action/aux schema意味論も管理するようになっています。したがって新しいcheckpoint/dataset pipelineでは「幅が同じだから互換」と判断しないでください。
+
+## 現行の役割分担
+
+- `.pt`: PyTorch training / GPU self-play / GPU Arena向けcheckpoint
+- `.tetrawts`: dependency-free C++ evaluator向けexport weight
+- C++: rules、search、game mechanics、CPU reference inference
+- Python/PyTorch: GPU batched inference、training、architecture ablation
+
+## 将来bottleneckになった場合
+
+ONNX Runtimeやlibtorch backendを、同じ `Evaluator` interfaceの後ろへ追加できます。search側を変更する必要はありません。
+
+その場合もC++ scalar backendとPyTorch fixtureをreferenceとして残し、新backendのparityを同じcontractで検証します。

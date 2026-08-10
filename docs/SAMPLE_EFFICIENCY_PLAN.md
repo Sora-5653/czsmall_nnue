@@ -1,4 +1,4 @@
-# Sample-efficiency 実装計画
+# サンプル効率 実装計画
 
 最終更新: 2026-08-10
 
@@ -6,16 +6,16 @@
 > `SPEC.md`、後続の設計判断は ADR 0014/0015、短い運用契約は
 > `TRAINING_AND_EVALUATION.md` を参照する。`SPEC.md` は後から書き換えない。
 >
-> 2026-08-10 時点の `main` では Phase 1 と Phase 2a、および Phase 2b の
-> 基盤（aux schema v2、36 targets、valid mask、target統計、gradient
-> diagnostics）が実装済み。Phase 3 の action-conditioned target、VS Score
-> の実装/aux ablation、検索強度mixの本格運用は次段階である。
+> 2026-08-10時点の `main` ではPhase 1とPhase 2a、およびPhase 2bの
+> 基盤（aux schema v2、36補助目標、valid mask、target統計、gradient
+> diagnostics）が実装済み。Phase 3のaction-conditioned target、VS Score
+> の実装・auxiliary ablation、検索強度mixの本格運用は次段階である。
 
 ## 目的
 
 少ない自己対局から、政策・勝敗価値・攻撃タイミング・相手の危険度を同時に学習できる状態を作る。優先順位は、モデルを大きくすることではなく、1局面から得られる有効な教師信号を増やすことと、観測に存在する情報をTokenizerで落とさないことである。
 
-同時に、補助目標の追加によってpolicy学習を悪化させていないかを、損失値・勾配・Arena結果の三方向から検証できる実験系を作る。
+同時に、補助目標の追加によって方策学習を悪化させていないかを、損失値・勾配・Arena結果の三方向から検証できる実験系を作る。
 
 ## 現在の到達点
 
@@ -26,7 +26,7 @@
   - `TokenKind::Bag`: 7-bag / 14-bag の残り枚数をpieceごとのcountとして符号化。
   - `TokenKind::OpponentCounters`: 相手のpending garbage、combo、B2B、aliveを符号化。
 - Uniform / OnePieceではbag情報を「利用不能」としてmissing flagで表し、空bagと混同しない。
-- 新しい相手tokenを含むサンプルはCompact Replay形式へ誤って落とさず、既存どおりrectangular datasetへフォールバックする。
+- 新しい相手tokenを含むサンプルはCompact Replay形式へ誤って落とさず、現行どおりschema付きrectangular version 3へフォールバックする。
 - Tokenizer回帰テストを追加した。
   - bag内容の変更がtokenを変える。
   - 相手カウンタの変更がtokenを変える。

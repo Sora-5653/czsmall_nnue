@@ -1,103 +1,117 @@
-# ADR 0010: The C++/Python handover, and fixed-shape batching
+# ADR 0010: C++ / Python境界とfixed-shape batching
 
-## Status
-Accepted.
+## 状態
 
-## Context
-With the search, self-play loop and replay buffer in place, one structural gap
-remained before a Transformer could be attached: **everything upstream is ragged
-and a Transformer needs rectangles.**
+採用。
 
-Measured over 720 self-play samples:
+## 背景
+
+search、self-play loop、replay bufferができた後、Transformerを接続する前に1つ大きな構造問題が残っていました。
+
+**上流データはraggedだが、network backendはrectangular batchを必要とする。**
+
+当時720 self-play samplesを測定すると:
 
 | | min | max | mean |
-|---|---|---|---|
+|---|---:|---:|---:|
 | state tokens | 48 | 65 | 63.6 |
 | legal actions | 9 | 70 | 42.5 |
 
-Somewhere the ragged data has to be padded and masked. The question was where.
+どこかでpaddingとmaskを行う必要があります。問題は「どこをcontract boundaryにするか」でした。
 
-## Decision: pad and mask in the engine, once
+## 決定1: engine側で1度だけpad / maskする
 
-`TensorBatch` (in `batch.hpp`) produces the rectangular form, and the *same*
-structure serves three consumers: C++ inference, the on-disk training set, and
-the PyTorch trainer. Doing it here rather than in each backend means:
+`batch.hpp` の `TensorBatch` がrectangular formを生成し、同じstructureを次のconsumerで共有します。
 
-* the padding convention is defined and tested in one place,
-* masks are produced alongside the data, so a backend cannot forget them and
-  silently attend to padding, and
-* the trainer and the engine cannot drift apart on shapes or feature order.
+1. C++ inference
+2. on-disk training dataset
+3. PyTorch trainer
 
-Layout is row-major and contiguous, so numpy and libtorch wrap it without a
-copy:
+backendごとに別々のpadding ruleを実装しない理由:
 
-```
+- padding conventionを1か所で定義・testできる。
+- maskをdataと同時生成するため、backendがpaddingを誤ってattention対象にするfailureを減らせる。
+- trainerとengineのshape / feature order driftを防げる。
+
+layoutはrow-major contiguousです。
+
+```text
 tokens  [B, T, TOKEN_FEATURES]   token_mask  [B, T]
 actions [B, A, ACTION_FEATURES]  action_mask [B, A]
 ```
 
-`pad_tokens` / `pad_actions` force static dimensions for a fixed-shape backend
-(ONNX, TensorRT); left at zero the batch is sized to its contents, which is
-cheaper on CPU.
+`pad_tokens` / `pad_actions` を指定するとfixed-shape backend用のstatic dimensionを強制できます。0ならbatch内容に合わせて必要なsizeだけ使います。
 
-## Decision: `.tetradat`, a flat float32 dump
+## 決定2: `.tetradat` をC++/Python共通contractにする
 
-A small self-describing header followed by the batch buffers verbatim. Not
-Protobuf, for the same reason as ADR 0005: it costs a toolchain this environment
-cannot fetch, to buy cross-language compatibility nothing needs. The reader
-(`trainer/tetra_dataset.py`) needs only numpy, and validates on load —
-non-finite values, non-zero padding, policy rows that do not sum to 1, and
-policy mass on padded actions are all rejected rather than quietly trained on.
+初期versionでは、small self-describing headerの後ろにbatch bufferをflat float32で保存しました。
 
-The header records `token_features` and `action_features` and refuses to load a
-file whose widths disagree with the engine, which is the failure that would
-otherwise produce silently garbled training.
+Protobufを採用しなかった理由はADR 0005と同じです。当時のenvironmentではtoolchainを取得できず、必要のないcross-language dependencyを増やすより、simple binary contractを優先しました。
 
-## A bug this surfaced
+Python reader `trainer/tetra_dataset.py` はload時に次を検証します。
 
-The first end-to-end training run showed the auxiliary loss at **~150** against
-a policy loss of ~3: `time_to_terminal` was exported as a raw placement count
-reaching several hundred, so under MSE it dominated the total and the model was
-fitting essentially nothing else. Auxiliary targets are now squashed into
-roughly [0, 1] before leaving the engine, which is also what makes the loss
-weights in the trainer mean anything. Pinned by `aux_targets_are_normalised`.
+- non-finite value
+- non-zero padding
+- policy rowがdistributionになっているか
+- padded actionへpolicy massが乗っていないか
+- feature/schema compatibility
 
-## Result
+当初headerは `token_features` / `action_features` を記録しました。後のsample-efficiency workでは、**widthが同じでも意味が違う場合**を検出するため、tokenizer/observation/action/aux schema version/hashも追加されています。
 
-The whole chain runs from one command:
+## この境界が発見したbug
+
+最初のend-to-end trainingでは、policy lossが約3なのにauxiliary lossが**約150**になりました。
+
+原因は `time_to_terminal` を数百placementに達するraw countのままMSEへ入れていたことです。auxiliary lossがtotal lossを支配し、modelがほぼ他のtaskを学べない状態でした。
+
+そのためcount系aux targetをengineから出す前にbounded rangeへsquashし、loss weightが意味を持つscaleへ揃えました。`aux_targets_are_normalised` で固定しています。
+
+## 当時の結果
+
+初期chainは次でend-to-endに動きました。
 
 ```sh
 ./build/tetra_cli export train.tetradat 10 100 16
 python trainer/train.py train.tetradat --steps 300
 ```
 
-`trainer/tetraformer.py` implements the spec §9-10 network: pre-norm RMSNorm
-blocks with SwiGLU (§9.5), a **variable-length** policy head where each legal
-action cross-attends to the state tokens (§10.1), a WDL value head (§10.2) and
-auxiliary regressions. `tetraformer_s()` is the spec size (7.2M parameters);
-`tetraformer_dev()` (0.13M) trains at ~25 steps/s on this 2-core CPU.
+`trainer/tetraformer.py` はspec §9–10のnetworkを実装しました。
 
-Held-out loss on engine-generated data: **4.86 → 2.91** over 300 steps. Padded
-actions receive exactly probability zero, verified for both model sizes.
+- pre-norm RMSNorm block
+- SwiGLU
+- variable-length policy head
+- legal action queryからstate tokenへのcross-attention
+- WDL value head
+- auxiliary regression
 
-## What this does not claim
+当時の `tetraformer_s()` は約7.2M parameters、`tetraformer_dev()` は約0.13Mでした。
 
-The model is not *strong*. It is trained on a few hundred samples from a
-heuristic-guided search, on a CPU, purely to prove the handover is correct and
-that the loss decreases on held-out data. Real training belongs on a GPU, and
-strength evaluation needs the Arena and gating (spec §20) that M2 still lacks.
+engine-generated dataでheld-out total lossが300 stepsで **4.86 → 2.91** へ低下し、padded actionのprobabilityがexactly 0であることも確認しました。
 
-## Follow-up decisions (2026-08)
+## 当時このADRが主張していなかったこと
 
-The fixed tensor contract proved useful beyond TetraFormer: CNN and
-CNN+Transformer ablations reuse the same public input/output interface, allowing
-architecture comparisons without changing the simulator or dataset semantics.
-[ADR 0013](0013-architecture-ablation-and-local-geometry.md) records the rule
-that these architectures are selected with search/Arena evidence rather than
-held-out policy loss alone.
+この段階のmodelは「強い」とは主張していませんでした。少数のheuristic-guided samplesをCPUで学習し、C++↔Python handoverがcorrectでlossが減ることを確認しただけです。
 
-The auxiliary regressions introduced here also evolved into a larger
-sample-efficiency program. [ADR 0014](0014-objectives-auxiliary-targets-and-vs-score.md)
-keeps WDL as the objective anchor while permitting masked multi-horizon and
-action-conditioned auxiliary targets with explicit gradient-interference
-monitoring.
+原文では「Arena/gatingはM2にまだない」と記録していましたが、これは**当時の状態**です。現在はGPU Arena、Candidate/Champion gating、guarded iterationまで実装済みです。
+
+## 後続の形式変更
+
+ADR 0012で、再構成可能なsingle-board sampleにはcompact Replay+π version 2を追加しました。
+
+さらに現行 `DatasetHeader::VERSION = 3` では、rectangular datasetへschema・termination metadataを追加しています。two-board self-playはopponent event streamをcompact v2 metadataだけで再構成できないためversion 3を標準に使います。
+
+つまり本ADRの「1つのtensor contractを共有する」という判断は維持しつつ、**disk representation自体はversioned evolutionしている**と理解してください。
+
+## 2026-08の追補
+
+### アーキテクチャ比較実験
+
+fixed tensor contractはTetraFormer以外にも有効でした。CNN / CNN+Transformer ablationも同じpublic input/output interfaceを再利用できるため、simulatorやdataset semanticsを変えずにarchitectureを比較できます。
+
+[ADR 0013](0013-architecture-ablation-and-local-geometry.md) は、これらのmodelをheld-out policy loss単独ではなくsearch/Arena evidenceで選ぶ方針を記録します。
+
+### Sample efficiency
+
+ここで始めたauxiliary regressionは、後にmulti-horizon sample-efficiency programへ発展しました。
+
+[ADR 0014](0014-objectives-auxiliary-targets-and-vs-score.md) はWDLをobjective anchorに残しながら、valid mask付きmulti-horizon target、将来のaction-conditioned target、gradient interference monitoringを許容します。

@@ -1,129 +1,135 @@
-# ADR 0014: Keep WDL as the objective anchor; use dense auxiliary targets and VS Score as diagnostics
+# ADR 0014: WDLを目的の基準に残し、dense auxiliary targetとVS Scoreを診断へ使う
 
-## Status
-Accepted.
+## 状態
 
-## Context
+採用。
 
-ADR 0009 deliberately separated terminal outcome from attack/garbage statistics:
-self-play reward is the game result, while combat quantities are auxiliary data.
-That remains important because a hand-shaped reward can make locally attractive
-behaviour dominate the actual objective of winning.
+## 背景
 
-At the same time, early training exposed two limitations of a sparse WDL-only
-view:
+ADR 0009ではterminal outcomeとattack/garbage statisticsを意図的に分離しました。
 
-- a complete game supplies relatively few independent terminal outcomes compared
-  with the number of useful intermediate positions it contains;
-- policy, value, and auxiliary heads can interfere through the shared trunk, so
-  adding more supervision is not automatically beneficial.
+- self-play reward: actual game result
+- combat quantity: auxiliary data
 
-The sample-efficiency work therefore expanded trajectory-derived targets across
-multiple horizons and added explicit gradient diagnostics. Separately, Arena
-reporting used APM, APP, and PPS, but these statistics describe volume and speed
-more directly than combat effectiveness. The project decided to add TETR.IO's
-VS Score as an additional comparison metric because it is intended to summarize
-versus combat more directly than APM or APP alone.
+この分離は現在も重要です。hand-shaped rewardを加えると、局所的には魅力的でも「勝つ」という本来の目的とずれたbehaviorを強く学習する危険があるためです。
 
-The metric must still remain a proxy: no combat statistic is allowed to replace
-actual paired wins/losses as the promotion criterion.
+一方、初期trainingからWDL-only supervisionにも限界が見えました。
 
-## Decision
+1. 1 complete gameから得られるindependent terminal outcomeは少ないが、中間positionには大量の学習可能情報がある。
+2. policy/value/auxiliary headはshared trunkを通じて干渉するため、「教師信号を増やせば自動的に良くなる」とは限らない。
 
-### 1. Terminal game result remains the reward/value anchor
+そのためsample-efficiency workでは、trajectory-derived targetを複数horizonへ拡張し、gradient diagnosticsを追加しました。
 
-The outcome target is win/draw/loss from a fixed player perspective. Attack,
-stack shape, cancellation, survival time, VS Score, and similar statistics do
-not replace it and are not added directly as hand-shaped terminal reward.
+Arena report側ではAPM、APP、PPSを使っていましたが、これらはattack volumeやspeedを直接表す一方、versus combat effectiveness全体を1つで捉える指標ではありません。
 
-A piece-limit truncation is not converted into a synthetic win. Unknown future
-horizons in truncated trajectories are masked rather than trained as zero.
+そこで、TETR.IO文脈のVS Scoreをadditional combat diagnosticとして導入する方針を決めました。
 
-### 2. Use dense trajectory-derived supervision to improve representation
+ただしどのcombat statisticもproxyです。actual paired win/lossをpromotion criterionから置き換えません。
 
-The training objective may take the form
+## 決定
+
+### 1. Terminal game resultをreward/value anchorとして維持する
+
+outcome targetはfixed player perspectiveからのwin/draw/lossです。
+
+次の量で置換しません。
+
+- attack
+- stack shape
+- cancellation
+- survival time
+- VS Score
+- その他combat heuristic
+
+これらをhand-shaped terminal rewardとして直接加えません。
+
+piece limitによるtruncationもsynthetic winへ変換しません。`truncated` trajectoryで未知のfuture horizonは0 labelにせずmaskします。
+
+### 2. Dense trajectory-derived supervisionでrepresentationを改善する
+
+training objectiveは概念的に次です。
 
 \[
 L = L_{\pi} + \lambda_v L_v + \sum_i \lambda_i L_{\mathrm{aux},i}.
 \]
 
-Current or planned auxiliary families include:
+現行・計画中のauxiliary family:
 
-- future attack over several time or placement horizons;
-- future garbage received;
-- self/opponent top-out or survival horizons;
-- time-to-terminal / discrete time-to-event targets;
-- action-conditioned immediate consequences that can be computed exactly by
-  the engine;
-- VS Score or other combat summaries as explicitly ablated prediction targets.
+- 複数time/placement horizonのfuture attack
+- future garbage received
+- self/opponent top-out / survival horizon
+- time-to-terminal / discrete time-to-event
+- engineからexactに計算できるaction-conditioned immediate consequence
+- ablationを経たVS Scoreなどのcombat summary prediction
 
-Dense targets increase supervision per trajectory, but they do not create new
-independent games. Sample-efficiency claims therefore remain tied to fixed game
-counts or fixed generation compute.
+Dense targetは1 trajectoryから得られるsupervisionを増やしますが、independent gameを増やすわけではありません。
 
-### 3. Make VS Score a standard Arena/reporting metric
+したがってsample-efficiency claimは、fixed game countまたはfixed generation computeで比較します。
 
-Once the metric implementation is available and pinned to a documented ruleset
-interpretation, Arena and match reports should include VS Score alongside APM,
-APP, and PPS.
+### 3. VS ScoreをArena/reportingの標準診断へ追加する
 
-The evaluation hierarchy is:
+**実装とruleset interpretationをtest/documentで固定した後**、Arena/match reportへVS ScoreをAPM/APP/PPSと並べて追加します。
 
-1. paired Arena win rate and its confidence interval at the specified search
-   budget;
-2. VS Score as a combat-oriented explanatory metric;
-3. APM, APP, PPS, survival, cancellation, and timing statistics;
-4. held-out policy/value/auxiliary metrics.
+評価hierarchy:
 
-VS Score is intentionally below win rate. It can explain *why* a model is
-stronger or distinguish styles that APM/APP blur, but optimizing the proxy is not
-the project's terminal goal.
+1. specified search budgetでのpaired Arena win rate + confidence interval
+2. VS Score — combat-oriented explanatory metric
+3. APM / APP / PPS / survival / cancellation / timing statistics
+4. held-out policy/value/auxiliary metrics
 
-### 4. Treat VS Score as an auxiliary target only through ablation
+VS Scoreをwin rateより上位には置きません。
 
-Reporting VS Score does not automatically mean training on it. A VS auxiliary
-head is an experimental target and must be tested against an otherwise identical
-baseline.
+VS Scoreは「なぜstrongerなのか」を説明したり、APM/APPだけではblurするstyle差を見たりするためのproxyです。proxy自体をterminal objectiveにしません。
 
-The exact formula/version used to create a target must be recorded with the
-schema. If the project cannot reproduce the intended metric exactly, it should
-report the limitation rather than train against an undocumented approximation.
+### 4. VS Scoreをauxiliary targetにする場合は別ablationとする
 
-### 5. Monitor gradient interaction, not only scalar loss
+VS Scoreをreportへ出すことと、training targetに使うことは別判断です。
 
-Auxiliary weights are not selected from raw loss magnitudes alone. Training
-should expose, at a useful cadence, shared-trunk gradient norms and policy/value
-or policy/auxiliary gradient cosine similarities.
+VS auxiliary headはexperimental targetとして、otherwise identical baselineと比較します。
 
-A small auxiliary loss can still dominate or oppose policy gradients. Conversely,
-a numerically large loss can be harmless after weighting. Valid masks must
-remove both loss and gradient contribution from unknown targets.
+target生成に使うexact formula/version/ruleset interpretationはschemaとともに記録します。
 
-### 6. Require gameplay evidence before declaring an auxiliary target useful
+意図したmetricを正確に再現できない場合、undocumented approximationをlabelにせず、limitationを明記します。
 
-An auxiliary prediction can improve its own held-out loss without improving the
-representation used by policy/search. Therefore an auxiliary target is not
-considered strategically successful unless controlled experiments show policy
-and/or Arena benefit without an unacceptable compute cost.
+### 5. Scalar lossだけでなくgradient interactionを監視する
 
-Raw-policy and searched-policy evaluations should both be retained when they help
-separate representation quality from search interaction.
+auxiliary weightをraw loss magnitudeだけで選びません。
 
-## Consequences
+training logではshared trunk上の次を観測可能にします。
 
-- The trainer and dataset schema become more explicit and somewhat wider.
-- Arena reports gain a more combat-specific diagnostic without weakening the
-  Champion promotion rule.
-- Auxiliary objectives can be aggressively explored while remaining removable;
-  no target becomes part of the project's definition of "winning" merely
-  because it correlates with strength.
-- APM/APP remain useful. In particular, APP can help identify whether basic
-  attack construction is present before a timing curriculum, but it is not a
-  substitute for VS Score or win rate. See ADR 0015.
+- policy gradient norm
+- value gradient norm
+- auxiliary gradient norm
+- policy/value gradient cosine
+- policy/auxiliary gradient cosine
 
-## Related documents
+small auxiliary lossでもgradientがpolicyを支配・oppositionする場合があります。逆にnumerically large lossでもweight後のgradientが小さいことがあります。
 
-- ADR 0009 — terminal reward and determinized self-play.
-- `../SAMPLE_EFFICIENCY_PLAN.md` — target schema, masks, split rules, and
-  gradient diagnostics.
-- `../TRAINING_AND_EVALUATION.md` — experiment and Arena reporting protocol.
+valid mask=0のtargetはlossだけでなくgradientにも寄与させません。
+
+### 6. Auxiliary targetの有効性にはgameplay evidenceを要求する
+
+auxiliary prediction自身のheld-out lossが改善しても、policy/searchに有用なrepresentationを得たとは限りません。
+
+auxiliary targetを「strategically useful」と判断するには、controlled experimentで少なくとも次のどちらかを確認します。
+
+- policy metricの改善
+- Arena/gameplayの改善
+
+かつ追加computeが許容範囲であること。
+
+representation qualityとsearch interactionを切り分ける必要がある場合は、raw-policy / searched-policy双方を残します。
+
+## 帰結
+
+- trainerとdataset schemaはよりexplicitかつwideになる。
+- Arena reportへcombat-specific diagnosticを増やしても、Champion promotion ruleは弱めない。
+- auxiliary objectiveはaggressiveに試せるが、不要なら取り外せる。
+- strengthとcorrelateするという理由だけで、そのmetricをprojectにおける「winningの定義」へ格上げしない。
+- APM/APPは引き続き有用。特にAPPはtiming curriculum前にbasic attack constructionが存在するかを見るrough diagnosticになるが、VS Scoreやwin rateの代替ではない（ADR 0015）。
+
+## 関連文書
+
+- ADR 0009 — terminal rewardとdeterminized self-play
+- `../SAMPLE_EFFICIENCY_PLAN.md` — target schema、mask、split、gradient diagnosticの詳細
+- `../TRAINING_AND_EVALUATION.md` — experiment / Arena protocol

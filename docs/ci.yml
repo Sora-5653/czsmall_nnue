@@ -1,3 +1,7 @@
+# 注意: 2026-08-10時点では、このworkflowをそのまま有効化すると
+# warnings jobがvendored Cobraのunknown pragma / shadow warningで失敗する。
+# project codeとthird-party codeのwarning scopeを分離してから
+# .github/workflows/ へ移すこと。
 name: CI
 
 on:
