@@ -700,8 +700,8 @@ int cmd_gpu_play_protocol(int argc, char** argv) {
     SelfPlayWorker worker(ev, cfg);
     SelfPlayStats st;
     worker.play(rules, seed, &st);
-    write_gpu_game_result(stdout, st.pieces, st.lines_cleared, st.lines_sent,
-                          st.lines_received, st.survived, static_cast<int>(st.topout),
+    write_gpu_game_result(stdout, st.pieces, st.lines_cleared, st.garbage_lines_cleared,
+                          st.lines_sent, st.lines_received, st.survived, static_cast<int>(st.topout),
                           rules.tick_rate, st.outcome, st.duration, ev.positions_evaluated(),
                           ev.batches_issued());
     return 0;
@@ -723,6 +723,10 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
     const bool use_gumbel = (argc > 10) ? std::atoi(argv[10]) != 0 : true;
     const float root_noise_fraction =
         (argc > 11) ? std::strtof(argv[11], nullptr) : 0.25f;
+    const bool enable_timing_actions =
+        (argc > 12) ? std::atoi(argv[12]) != 0 : false;
+    const bool no_attack_delivery =
+        (argc > 13) ? std::atoi(argv[13]) != 0 : false;
     enable_gpu_protocol_stdio();
 
     const RulesetConfig rules = RulesetConfig::tetra_league();
@@ -737,7 +741,8 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
         std::max(0.0f, std::min(1.0f, root_noise_fraction));
     cfg.search.root_noise_alpha = 0.3f;
     cfg.search.determinizations = std::max(1, determinizations);
-    cfg.garbage_style = GarbageStyle::Steady;
+    cfg.search.enable_timing_actions = enable_timing_actions;
+    cfg.garbage_style = no_attack_delivery ? GarbageStyle::None : GarbageStyle::Steady;
     cfg.garbage_period = 8;
     cfg.garbage_lines = 2;
     cfg.truncation_is_draw = true;
@@ -749,10 +754,42 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
     for (int g = 0; g < std::max(1, games); ++g) {
         SelfPlayStats st;
         buffer.push_game(worker.play(rules, seed + static_cast<std::uint64_t>(g), &st));
-        write_gpu_game_result(stdout, st.pieces, st.lines_cleared, st.lines_sent,
-                              st.lines_received, st.survived,
+        write_gpu_game_result(stdout, st.pieces, st.lines_cleared, st.garbage_lines_cleared,
+                              st.lines_sent, st.lines_received, st.survived,
                               static_cast<int>(st.topout), rules.tick_rate, st.outcome,
                               st.duration, ev.positions_evaluated(), ev.batches_issued());
+    }
+
+    // Diagnose whether the policy target actually identifies the action the
+    // search selected. This is especially important for Gumbel sequential
+    // halving: the played action is the final survivor, while the historical
+    // training target is the normalised root visit count. Keep this diagnostic
+    // out of stdout because stdout is the binary GPU protocol stream.
+    std::size_t chosen_valid = 0;
+    std::size_t chosen_at_visit_max = 0;
+    double chosen_mass_sum = 0.0;
+    for (std::size_t i = 0; i < buffer.size(); ++i) {
+        const TrainingSample& sample = buffer.at(i);
+        if (sample.chosen_action < 0 ||
+            static_cast<std::size_t>(sample.chosen_action) >= sample.search_policy.size() ||
+            sample.search_policy.empty())
+            continue;
+        const float chosen_mass =
+            sample.search_policy[static_cast<std::size_t>(sample.chosen_action)];
+        const float max_mass =
+            *std::max_element(sample.search_policy.begin(), sample.search_policy.end());
+        ++chosen_valid;
+        chosen_mass_sum += static_cast<double>(chosen_mass);
+        if (chosen_mass + 1e-6f >= max_mass) ++chosen_at_visit_max;
+    }
+    if (chosen_valid > 0) {
+        std::fprintf(stderr,
+                     "search-target alignment: chosen_at_visit_max=%zu/%zu (%.2f%%), "
+                     "mean_chosen_mass=%.6f\n",
+                     chosen_at_visit_max, chosen_valid,
+                     100.0 * static_cast<double>(chosen_at_visit_max) /
+                         static_cast<double>(chosen_valid),
+                     chosen_mass_sum / static_cast<double>(chosen_valid));
     }
 
     // GPU self-play records both player perspectives while each side changes
@@ -789,6 +826,13 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
     const int candidate_gumbel = (argc > 11) ? std::atoi(argv[11]) : -1;
     const int champion_gumbel = (argc > 12) ? std::atoi(argv[12]) : -1;
     const float gumbel_c_scale = (argc > 13) ? std::strtof(argv[13], nullptr) : 0.01f;
+    const float gumbel_noise_scale = (argc > 14) ? std::strtof(argv[14], nullptr) : 0.05f;
+    const int candidate_timing_actions = (argc > 15) ? std::atoi(argv[15]) : -1;
+    const int champion_timing_actions = (argc > 16) ? std::atoi(argv[16]) : -1;
+    const float candidate_gumbel_noise_scale =
+        (argc > 17) ? std::strtof(argv[17], nullptr) : -1.0f;
+    const float champion_gumbel_noise_scale =
+        (argc > 18) ? std::strtof(argv[18], nullptr) : -1.0f;
     enable_gpu_protocol_stdio();
 
     RemoteGpuEvaluator candidate(stdin, stdout, std::max(1, batch), 0);
@@ -802,9 +846,14 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
     cfg.champion_simulations = champion_sims;
     cfg.candidate_gumbel = candidate_gumbel;
     cfg.champion_gumbel = champion_gumbel;
+    cfg.candidate_gumbel_noise_scale = candidate_gumbel_noise_scale;
+    cfg.champion_gumbel_noise_scale = champion_gumbel_noise_scale;
+    cfg.candidate_timing_actions = candidate_timing_actions;
+    cfg.champion_timing_actions = champion_timing_actions;
     cfg.search.max_depth = 6;
     cfg.search.use_gumbel = use_gumbel;
     cfg.search.gumbel_c_scale = std::max(0.0f, gumbel_c_scale);
+    cfg.search.gumbel_noise_scale = std::max(0.0f, gumbel_noise_scale);
     cfg.search.batch_size = std::max(1, batch);
     cfg.search.determinizations = std::max(1, determinizations);
 
@@ -814,7 +863,18 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
         stdout, static_cast<std::uint32_t>(r.games_played),
         static_cast<std::uint32_t>(r.candidate_wins),
         static_cast<std::uint32_t>(r.champion_wins), static_cast<std::uint32_t>(r.draws),
-        r.win_rate, r.ci_lower, r.ci_upper, r.promoted);
+        r.win_rate, r.ci_lower, r.ci_upper, r.candidate_vs, r.champion_vs,
+        r.candidate_apm, r.champion_apm, r.candidate_app, r.champion_app,
+        r.candidate_pps, r.champion_pps,
+        r.candidate_avg_pieces, r.champion_avg_pieces,
+        r.candidate_avg_seconds, r.champion_avg_seconds,
+        r.candidate_survival_rate, r.champion_survival_rate,
+        r.candidate_sent_per_game, r.champion_sent_per_game,
+        r.candidate_garbage_cleared_per_game, r.champion_garbage_cleared_per_game,
+        r.candidate_received_per_game, r.champion_received_per_game,
+        r.candidate_blockout_rate, r.champion_blockout_rate,
+        r.candidate_lockout_rate, r.champion_lockout_rate,
+        r.candidate_garbageout_rate, r.champion_garbageout_rate, r.promoted);
     return 0;
 }
 
@@ -855,18 +915,22 @@ int cmd_arena(int argc, char** argv) {
     const double secs =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
-    std::printf("%4s  %8s  %7s  %7s  %6s  %6s  %7s  %7s  %6s  %6s  %7s  %5s\n",
-                "pair", "seed", "c_pcs", "c_sent", "c_apm", "c_app", "h_pcs", "h_sent",
-                "h_apm", "h_app", "mirror", "score");
+    std::printf("%4s  %8s  %7s  %7s  %7s  %6s  %6s  %7s  %7s  %7s  %6s  %6s  %7s  %5s\n",
+                "pair", "seed", "c_pcs", "c_sent", "c_vs", "c_apm", "c_app", "h_pcs", "h_sent",
+                "h_vs", "h_apm", "h_app", "mirror", "score");
     for (size_t i = 0; i < r.games.size(); ++i) {
         const auto& g = r.games[i];
         const RulesetConfig stats_rules = RulesetConfig::tetra_league();
-        std::printf("%4d  %016llx  %7d  %7lld  %6.1f  %6.3f  %7d  %7lld  %6.1f  %6.3f  %7s  %5.1f\n",
+        std::printf("%4d  %016llx  %7d  %7lld  %7.1f  %6.1f  %6.3f  %7d  %7lld  %7.1f  %6.1f  %6.3f  %7s  %5.1f\n",
                     g.pair_index, static_cast<unsigned long long>(g.seed), g.candidate_pieces,
                     static_cast<long long>(g.candidate_sent),
+                    versus_score(g.candidate_sent, g.candidate_garbage_cleared,
+                                 g.candidate_pieces, g.candidate_duration, stats_rules),
                     attacks_per_minute(g.candidate_sent, g.candidate_duration, stats_rules),
                     attacks_per_piece(g.candidate_sent, g.candidate_pieces),
                     g.champion_pieces, static_cast<long long>(g.champion_sent),
+                    versus_score(g.champion_sent, g.champion_garbage_cleared,
+                                 g.champion_pieces, g.champion_duration, stats_rules),
                     attacks_per_minute(g.champion_sent, g.champion_duration, stats_rules),
                     attacks_per_piece(g.champion_sent, g.champion_pieces),
                     g.is_mirrored ? "yes" : "no", static_cast<double>(g.candidate_score));
@@ -876,6 +940,8 @@ int cmd_arena(int argc, char** argv) {
     std::printf("  Candidate wins : %d\n", r.candidate_wins);
     std::printf("  Champion wins  : %d\n", r.champion_wins);
     std::printf("  Draws          : %d\n", r.draws);
+    std::printf("  VS             : %.1f / %.1f (candidate/champion)\n",
+                r.candidate_vs, r.champion_vs);
     std::printf("  Win Rate       : %.1f%% (95%% CI: %.1f%% - %.1f%%)\n", r.win_rate * 100.0f,
                 r.ci_lower * 100.0f, r.ci_upper * 100.0f);
     std::printf("  Threshold      : %.1f%%\n", cfg.promotion_threshold * 100.0f);
@@ -939,7 +1005,10 @@ void usage() {
         "  gpu-play-protocol [pieces] [sims] [batch] [seed] [determinizations] [gumbel]\n"
         "  gpu-export-protocol <file> [games] [pieces] [sims] [batch] [seed] [model_version] "
         "[determinizations] [gumbel]\n"
-        "  gpu-arena-protocol [pairs] [sims] [pieces] [batch] [determinizations] [gumbel] [seed]\n"
+        "  gpu-arena-protocol [pairs] [sims] [pieces] [batch] [determinizations] [gumbel] [seed] "
+        "[candidate_sims] [champion_sims] [candidate_gumbel] [champion_gumbel] "
+        "[gumbel_c_scale] [gumbel_noise_scale] [candidate_timing] [champion_timing] "
+        "[candidate_gumbel_noise_scale] [champion_gumbel_noise_scale]\n"
         "  arena <candidate> [champion=heuristic] [pairs] [sims] [pieces]\n"
         "  decode-dataset <input.tetradat> [output.tetradat]\n"
         "  bench [iterations]\n"

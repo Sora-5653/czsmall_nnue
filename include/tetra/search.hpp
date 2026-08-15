@@ -79,6 +79,14 @@ struct SearchConfig {
     std::uint64_t seed = 0;
     bool use_transposition_table = true;
 
+    // Experimental timing branches. Off by default so existing checkpoints,
+    // datasets and Arena results keep the historical action contract. When
+    // enabled, positions with pending garbage branch each placement into
+    // FASTEST and WAIT_FOR_EVENT variants, which is enough to represent the
+    // core "cancel now vs deliberately receive first" decision without
+    // multiplying every ordinary position's action count.
+    bool enable_timing_actions = false;
+
     // Chance nodes / determinization (spec 11.3).
     //
     // The simulator's queue holds the true future, but the player may only see
@@ -99,6 +107,18 @@ struct SearchCandidate {
     float q_value = 0.0f;
 };
 
+struct SearchTelemetry {
+    // LC3-style pipeline counters. These are observability only: changing or
+    // reading them must never affect search decisions.
+    int gather_attempts = 0;
+    int gathered_leaves = 0;
+    int selection_steps = 0;
+    int terminal_backups = 0;
+    int depth_cutoffs = 0;
+    int evaluation_flushes = 0;
+    int max_edge_inflight = 0;
+};
+
 struct SearchResult {
     int best_action = -1;
     ValueWDL value;
@@ -110,12 +130,26 @@ struct SearchResult {
     int positions_evaluated = 0;
     int transposition_hits = 0;
     double mean_batch_size = 0.0;
+    SearchTelemetry telemetry;
 };
 
 // ---------------------------------------------------------------------------
 // Tree
 // ---------------------------------------------------------------------------
 namespace detail {
+
+struct SearchEdge {
+    // LC3 keeps the complete edge state together. P, Q, N and N_inflight are
+    // therefore one cache-friendly unit instead of several parallel vectors.
+    float prior = 0.0f;              // P
+    float value_sum = 0.0f;          // Q numerator, root-player perspective
+    int visits = 0;                  // N
+    int inflight = 0;                // N_inflight / virtual loss
+    std::int32_t child = -1;
+
+    float q() const { return visits > 0 ? value_sum / static_cast<float>(visits) : 0.0f; }
+    int effective_visits() const { return visits + inflight; }
+};
 
 struct SearchNode {
     // Game state at this node. Copying a Player costs ~0.24 us, which is
@@ -127,11 +161,7 @@ struct SearchNode {
     Player opponent;
     bool has_opponent = false;
     std::vector<PlacementAction> actions;
-
-    std::vector<float> prior;
-    std::vector<int> child_visits;
-    std::vector<float> child_value_sum;
-    std::vector<std::int32_t> children;  // node index, or -1
+    std::vector<SearchEdge> edges;
 
     int visits = 0;
     float value_sum = 0.0f;
@@ -139,10 +169,6 @@ struct SearchNode {
     bool expanded = false;
     bool terminal = false;
     float terminal_value = 0.0f;
-
-    // Virtual loss, so that leaves collected into the same batch do not all
-    // follow the identical path (spec 11.1 batched leaf evaluation).
-    std::vector<int> child_pending;
 
     size_t size() const { return actions.size(); }
 };
@@ -245,12 +271,70 @@ inline std::uint64_t search_position_key(const Player& p, const Player* opponent
 }  // namespace detail
 
 // ---------------------------------------------------------------------------
+// Search policy
+// ---------------------------------------------------------------------------
+// LC3 separates tree orchestration from edge scoring. Keeping this as a small
+// policy object makes it possible to change selection/calibration without
+// entangling node construction, inference batching or backup semantics.
+class SearchPolicy {
+public:
+    explicit SearchPolicy(const SearchConfig& cfg) : cfg_(&cfg) {}
+
+    int select_puct(const detail::SearchNode& n, int root_player_index) const {
+        const float sqrt_total = std::sqrt(static_cast<float>(std::max(1, n.visits)));
+        const float parent_q =
+            n.visits > 0 ? n.value_sum / static_cast<float>(n.visits) : 0.0f;
+        const bool root_to_move = !n.has_opponent || n.state.index() == root_player_index;
+
+        int best = 0;
+        float best_score = -1e30f;
+        for (size_t a = 0; a < n.edges.size(); ++a) {
+            const detail::SearchEdge& edge = n.edges[a];
+            float mover_q;
+            if (edge.visits > 0) {
+                mover_q = detail::puct_value_for_mover(edge.q(), root_to_move);
+            } else {
+                const float mover_parent_q =
+                    detail::puct_value_for_mover(parent_q, root_to_move);
+                mover_q = mover_parent_q - cfg_->fpu_reduction;
+            }
+            const float u = cfg_->c_puct * edge.prior * sqrt_total /
+                            (1.0f + static_cast<float>(edge.effective_visits()));
+            const float score = mover_q + u;
+            if (score > best_score) {
+                best_score = score;
+                best = static_cast<int>(a);
+            }
+        }
+        return best;
+    }
+
+    float gumbel_score(const detail::SearchNode& root, int action,
+                       const std::vector<float>& logits,
+                       const std::vector<float>& gumbel,
+                       int max_child_visits) const {
+        const detail::SearchEdge& edge = root.edges[static_cast<size_t>(action)];
+        const float parent_q = root.visits > 0
+                                   ? root.value_sum / static_cast<float>(root.visits)
+                                   : root.leaf_value;
+        const float q = edge.visits > 0 ? edge.q() : parent_q;
+        const float sigma =
+            (cfg_->gumbel_c_visit + static_cast<float>(max_child_visits)) *
+            cfg_->gumbel_c_scale * q;
+        return gumbel[static_cast<size_t>(action)] + logits[static_cast<size_t>(action)] + sigma;
+    }
+
+private:
+    const SearchConfig* cfg_;
+};
+
+// ---------------------------------------------------------------------------
 // The searcher
 // ---------------------------------------------------------------------------
 class Searcher {
 public:
     Searcher(Evaluator& evaluator, const SearchConfig& cfg = {})
-        : eval_(evaluator), cfg_(cfg), rng_(cfg.seed) {}
+        : eval_(evaluator), cfg_(cfg), policy_(cfg_), rng_(cfg.seed) {}
 
     // Run a search from `root_state` and return the improved policy.
     //
@@ -271,8 +355,15 @@ public:
 
         SearchResult combined;
         std::vector<double> policy_sum;
+        std::vector<int> best_votes;
         double value_sum = 0.0;
         int runs = 0;
+        int simulations_sum = 0;
+        int nodes_sum = 0;
+        int evaluator_calls_sum = 0;
+        int positions_sum = 0;
+        int transposition_hits_sum = 0;
+        SearchTelemetry telemetry_sum;
 
         for (int d = 0; d < cfg_.determinizations; ++d) {
             const SearchResult r = search_once(
@@ -281,12 +372,29 @@ public:
             if (r.best_action < 0) continue;
             if (policy_sum.empty()) {
                 policy_sum.assign(r.search_policy.size(), 0.0);
+                best_votes.assign(r.search_policy.size(), 0);
                 combined = r;
             }
             if (r.search_policy.size() != policy_sum.size()) continue;
             for (size_t i = 0; i < policy_sum.size(); ++i)
                 policy_sum[i] += r.search_policy[i];
+            if (r.best_action >= 0 &&
+                static_cast<size_t>(r.best_action) < best_votes.size())
+                ++best_votes[static_cast<size_t>(r.best_action)];
             value_sum += r.value.scalar();
+            simulations_sum += r.simulations_run;
+            nodes_sum += r.nodes_created;
+            evaluator_calls_sum += r.evaluator_calls;
+            positions_sum += r.positions_evaluated;
+            transposition_hits_sum += r.transposition_hits;
+            telemetry_sum.gather_attempts += r.telemetry.gather_attempts;
+            telemetry_sum.gathered_leaves += r.telemetry.gathered_leaves;
+            telemetry_sum.selection_steps += r.telemetry.selection_steps;
+            telemetry_sum.terminal_backups += r.telemetry.terminal_backups;
+            telemetry_sum.depth_cutoffs += r.telemetry.depth_cutoffs;
+            telemetry_sum.evaluation_flushes += r.telemetry.evaluation_flushes;
+            telemetry_sum.max_edge_inflight =
+                std::max(telemetry_sum.max_edge_inflight, r.telemetry.max_edge_inflight);
             ++runs;
         }
         if (runs == 0) return search_once(root_state, opponent_state, cfg_.seed);
@@ -298,8 +406,34 @@ public:
             if (combined.search_policy[i] > combined.search_policy[static_cast<size_t>(best)])
                 best = static_cast<int>(i);
         }
+        if (cfg_.use_gumbel && !best_votes.empty()) {
+            // Each particle's Gumbel survivor is the action that search_once()
+            // would actually play. Root visit counts can tie at sequential-
+            // halving budgets, so averaging visits and taking argmax can throw
+            // away a unanimous survivor and fall back to action-index order.
+            // Preserve the averaged visit distribution as the training target,
+            // but aggregate the executed action by survivor vote. Average visit
+            // mass is the deterministic tie-break between equal vote counts.
+            best = 0;
+            for (size_t i = 1; i < best_votes.size(); ++i) {
+                const size_t current = static_cast<size_t>(best);
+                if (best_votes[i] > best_votes[current] ||
+                    (best_votes[i] == best_votes[current] &&
+                     policy_sum[i] > policy_sum[current]))
+                    best = static_cast<int>(i);
+            }
+        }
         combined.best_action = best;
         combined.value = ValueWDL::from_scalar(static_cast<float>(value_sum / runs));
+        combined.simulations_run = simulations_sum;
+        combined.nodes_created = nodes_sum;
+        combined.evaluator_calls = evaluator_calls_sum;
+        combined.positions_evaluated = positions_sum;
+        combined.transposition_hits = transposition_hits_sum;
+        combined.mean_batch_size = evaluator_calls_sum
+                                       ? static_cast<double>(positions_sum) / evaluator_calls_sum
+                                       : 0.0;
+        combined.telemetry = telemetry_sum;
         return combined;
     }
 
@@ -308,6 +442,7 @@ private:
                              std::uint64_t seed) {
         nodes_.clear();
         tt_.clear();
+        telemetry_ = SearchTelemetry{};
         rng_.reseed(seed);
         SearchResult result;
 
@@ -402,6 +537,16 @@ private:
                                       state.visible_next().empty() ? Piece::None
                                                                    : state.visible_next()[0],
                                       cfg);
+        const Tick next_activation = state.garbage().next_activation(state.now());
+        if (cfg_.enable_timing_actions && next_activation != TICK_NEVER &&
+            !n.actions.empty()) {
+            const std::vector<DelayBin> timing_bins{
+                DelayBin::Fastest, DelayBin::WaitForEvent
+            };
+            n.actions = MoveGenerator::expand_delay_bins(
+                n.actions, cfg, state.now(), next_activation, TICK_NEVER,
+                timing_bins);
+        }
         if (n.actions.empty()) {
             n.terminal = true;
             n.terminal_value = terminal_value_for(state, other,
@@ -418,6 +563,7 @@ private:
                                                 : observe(n.state);
         const Evaluation ev = evaluator_for(n)->evaluate_one(obs, n.actions);
         ++eval_calls_;
+        ++telemetry_.evaluation_flushes;
         positions_evaluated_ += 1;
         apply_evaluation(idx, ev);
     }
@@ -435,52 +581,19 @@ private:
 
     void apply_evaluation(std::int32_t idx, const Evaluation& ev) {
         detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
-        n.prior = ev.policy;
-        if (n.prior.size() != n.actions.size())
-            n.prior.assign(n.actions.size(),
-                           n.actions.empty() ? 0.0f : 1.0f / static_cast<float>(n.actions.size()));
-        n.child_visits.assign(n.actions.size(), 0);
-        n.child_value_sum.assign(n.actions.size(), 0.0f);
-        n.child_pending.assign(n.actions.size(), 0);
-        n.children.assign(n.actions.size(), -1);
+        std::vector<float> prior = ev.policy;
+        if (prior.size() != n.actions.size())
+            prior.assign(n.actions.size(),
+                         n.actions.empty() ? 0.0f : 1.0f / static_cast<float>(n.actions.size()));
+        n.edges.assign(n.actions.size(), detail::SearchEdge{});
+        for (size_t a = 0; a < n.edges.size(); ++a) n.edges[a].prior = prior[a];
         n.expanded = true;
         n.leaf_value = ev.value.scalar();
     }
 
     // --- selection ---------------------------------------------------------
     int select_puct(const detail::SearchNode& n) const {
-        const float sqrt_total =
-            std::sqrt(static_cast<float>(std::max(1, n.visits)));
-        const float parent_q = n.visits > 0 ? n.value_sum / static_cast<float>(n.visits) : 0.0f;
-        const bool root_to_move =
-            !n.has_opponent || n.state.index() == root_player_index_;
-
-        int best = 0;
-        float best_score = -1e30f;
-        for (size_t a = 0; a < n.actions.size(); ++a) {
-            const int visits = n.child_visits[a] + n.child_pending[a];
-            float mover_q;
-            if (n.child_visits[a] > 0) {
-                const float root_q =
-                    n.child_value_sum[a] / static_cast<float>(n.child_visits[a]);
-                mover_q = detail::puct_value_for_mover(root_q, root_to_move);
-            } else {
-                // Stored values are always in the root player's perspective.
-                // Convert to the mover's perspective before applying FPU so an
-                // opponent node minimizes root value rather than cooperating.
-                const float mover_parent_q =
-                    detail::puct_value_for_mover(parent_q, root_to_move);
-                mover_q = mover_parent_q - cfg_.fpu_reduction;
-            }
-            const float u = cfg_.c_puct * n.prior[a] * sqrt_total /
-                            (1.0f + static_cast<float>(visits));
-            const float score = mover_q + u;
-            if (score > best_score) {
-                best_score = score;
-                best = static_cast<int>(a);
-            }
-        }
-        return best;
+        return policy_.select_puct(n, root_player_index_);
     }
 
     // --- one simulation, stopping at a leaf that needs evaluation ----------
@@ -489,22 +602,27 @@ private:
         std::vector<std::pair<std::int32_t, int>> path;  // (node, action)
         Observation obs;
         Evaluator* evaluator = nullptr;
+        float evaluated_value = 0.0f;
+        bool has_evaluated_value = false;
     };
 
     // Walk from the root to a leaf, applying virtual loss along the way.
     // Returns false when the walk finished at a terminal node (already backed
     // up) rather than at a node needing evaluation.
     bool descend(std::int32_t root, Pending& out) {
+        ++telemetry_.gather_attempts;
         std::int32_t idx = root;
         int depth = 0;
 
         while (true) {
             detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
             if (n.terminal) {
+                ++telemetry_.terminal_backups;
                 backup(out.path, n.terminal_value);
                 return false;
             }
             if (!n.expanded) {
+                ++telemetry_.gathered_leaves;
                 out.leaf = idx;
                 out.obs = n.has_opponent ? observe(n.state, &n.opponent)
                                          : observe(n.state);
@@ -512,18 +630,22 @@ private:
                 return true;
             }
             if (depth >= cfg_.max_depth) {
+                ++telemetry_.depth_cutoffs;
                 backup(out.path, root_perspective_value(n, n.leaf_value));
                 return false;
             }
 
             const int a = select_puct(n);
+            ++telemetry_.selection_steps;
             out.path.emplace_back(idx, a);
-            n.child_pending[static_cast<size_t>(a)] += 1;
+            detail::SearchEdge& edge = n.edges[static_cast<size_t>(a)];
+            edge.inflight += 1;
+            telemetry_.max_edge_inflight = std::max(telemetry_.max_edge_inflight, edge.inflight);
 
-            std::int32_t child = n.children[static_cast<size_t>(a)];
+            std::int32_t child = edge.child;
             if (child < 0) {
                 child = apply_action(idx, a);
-                nodes_[static_cast<size_t>(idx)].children[static_cast<size_t>(a)] = child;
+                nodes_[static_cast<size_t>(idx)].edges[static_cast<size_t>(a)].child = child;
             }
             idx = child;
             ++depth;
@@ -592,10 +714,10 @@ private:
         // single-board path representation.
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             detail::SearchNode& n = nodes_[static_cast<size_t>(it->first)];
-            const size_t a = static_cast<size_t>(it->second);
-            n.child_visits[a] += 1;
-            n.child_value_sum[a] += value;
-            n.child_pending[a] = std::max(0, n.child_pending[a] - 1);
+            detail::SearchEdge& edge = n.edges[static_cast<size_t>(it->second)];
+            edge.visits += 1;
+            edge.value_sum += value;
+            edge.inflight = std::max(0, edge.inflight - 1);
             n.visits += 1;
             n.value_sum += value;
         }
@@ -603,9 +725,9 @@ private:
 
     void revert_virtual_loss(const std::vector<std::pair<std::int32_t, int>>& path) {
         for (const auto& [node, action] : path) {
-            detail::SearchNode& n = nodes_[static_cast<size_t>(node)];
-            const size_t a = static_cast<size_t>(action);
-            n.child_pending[a] = std::max(0, n.child_pending[a] - 1);
+            detail::SearchEdge& edge =
+                nodes_[static_cast<size_t>(node)].edges[static_cast<size_t>(action)];
+            edge.inflight = std::max(0, edge.inflight - 1);
         }
     }
 
@@ -637,8 +759,9 @@ private:
         result.simulations_run = done;
     }
 
-    // Evaluate a batch of leaves and back the results up.
-    void flush(std::vector<Pending>& batch) {
+    // LC3 pipeline stage 2: evaluate gathered leaves. No tree backup occurs in
+    // this stage, which keeps inference batching independent of backup policy.
+    void evaluate_batch(std::vector<Pending>& batch) {
         struct Group {
             Evaluator* evaluator = nullptr;
             std::vector<size_t> items;
@@ -667,22 +790,43 @@ private:
             std::vector<Evaluation> out;
             group.evaluator->evaluate(requests, out);
             ++eval_calls_;
+            ++telemetry_.evaluation_flushes;
             positions_evaluated_ += static_cast<int>(group.items.size());
 
             for (size_t j = 0; j < group.items.size(); ++j) {
                 const size_t item = group.items[j];
-                const std::int32_t leaf = batch[item].leaf;
+                Pending& pending = batch[item];
+                const std::int32_t leaf = pending.leaf;
                 // The same leaf can appear twice in one batch via a
-                // transposition; applying the evaluation twice is harmless but
-                // wasteful, so skip.
+                // transposition; initialise its node once but preserve the
+                // evaluator result associated with every gathered path.
                 if (!nodes_[static_cast<size_t>(leaf)].expanded && j < out.size())
                     apply_evaluation(leaf, out[j]);
-                const float v = (j < out.size()) ? out[j].value.scalar()
-                                                 : nodes_[static_cast<size_t>(leaf)].leaf_value;
-                backup(batch[item].path,
-                       root_perspective_value(nodes_[static_cast<size_t>(leaf)], v));
+                pending.evaluated_value =
+                    (j < out.size()) ? out[j].value.scalar()
+                                     : nodes_[static_cast<size_t>(leaf)].leaf_value;
+                pending.has_evaluated_value = true;
             }
         }
+    }
+
+    // LC3 pipeline stage 3: backpropagate completed evaluations. This is kept
+    // separate from evaluate_batch so a future streaming scheduler can overlap
+    // Gather(N+1) with Eval(N) without changing edge semantics.
+    void backpropagate_batch(std::vector<Pending>& batch) {
+        for (Pending& pending : batch) {
+            if (!pending.has_evaluated_value) {
+                revert_virtual_loss(pending.path);
+                continue;
+            }
+            const detail::SearchNode& leaf = nodes_[static_cast<size_t>(pending.leaf)];
+            backup(pending.path, root_perspective_value(leaf, pending.evaluated_value));
+        }
+    }
+
+    void flush(std::vector<Pending>& batch) {
+        evaluate_batch(batch);
+        backpropagate_batch(batch);
     }
 
     // --- Gumbel sequential halving (spec 11.2) -----------------------------
@@ -701,7 +845,7 @@ private:
         std::vector<float> logits(static_cast<size_t>(n_actions));
         std::vector<float> gumbel(static_cast<size_t>(n_actions));
         for (int a = 0; a < n_actions; ++a) {
-            const float p = std::max(1e-9f, r.prior[static_cast<size_t>(a)]);
+            const float p = std::max(1e-9f, r.edges[static_cast<size_t>(a)].prior);
             logits[static_cast<size_t>(a)] = std::log(p);
             gumbel[static_cast<size_t>(a)] = cfg_.gumbel_noise_scale * sample_gumbel();
         }
@@ -769,14 +913,19 @@ private:
 
     // Descend from the root having already committed to `action`.
     bool visit_root_action(std::int32_t root, int action, Pending& out) {
+        ++telemetry_.gather_attempts;
         detail::SearchNode& r = nodes_[static_cast<size_t>(root)];
         out.path.emplace_back(root, action);
-        r.child_pending[static_cast<size_t>(action)] += 1;
+        detail::SearchEdge& root_edge = r.edges[static_cast<size_t>(action)];
+        root_edge.inflight += 1;
+        telemetry_.max_edge_inflight =
+            std::max(telemetry_.max_edge_inflight, root_edge.inflight);
+        ++telemetry_.selection_steps;
 
-        std::int32_t child = r.children[static_cast<size_t>(action)];
+        std::int32_t child = root_edge.child;
         if (child < 0) {
             child = apply_action(root, action);
-            nodes_[static_cast<size_t>(root)].children[static_cast<size_t>(action)] = child;
+            nodes_[static_cast<size_t>(root)].edges[static_cast<size_t>(action)].child = child;
         }
 
         // Continue down normally from the child.
@@ -785,10 +934,12 @@ private:
         while (true) {
             detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
             if (n.terminal) {
+                ++telemetry_.terminal_backups;
                 backup(out.path, n.terminal_value);
                 return false;
             }
             if (!n.expanded) {
+                ++telemetry_.gathered_leaves;
                 out.leaf = idx;
                 out.obs = n.has_opponent ? observe(n.state, &n.opponent)
                                          : observe(n.state);
@@ -796,16 +947,20 @@ private:
                 return true;
             }
             if (depth >= cfg_.max_depth) {
+                ++telemetry_.depth_cutoffs;
                 backup(out.path, root_perspective_value(n, n.leaf_value));
                 return false;
             }
             const int a = select_puct(n);
+            ++telemetry_.selection_steps;
             out.path.emplace_back(idx, a);
-            n.child_pending[static_cast<size_t>(a)] += 1;
-            std::int32_t next = n.children[static_cast<size_t>(a)];
+            detail::SearchEdge& edge = n.edges[static_cast<size_t>(a)];
+            edge.inflight += 1;
+            telemetry_.max_edge_inflight = std::max(telemetry_.max_edge_inflight, edge.inflight);
+            std::int32_t next = edge.child;
             if (next < 0) {
                 next = apply_action(idx, a);
-                nodes_[static_cast<size_t>(idx)].children[static_cast<size_t>(a)] = next;
+                nodes_[static_cast<size_t>(idx)].edges[static_cast<size_t>(a)].child = next;
             }
             idx = next;
             ++depth;
@@ -833,22 +988,13 @@ private:
     float gumbel_score(std::int32_t root, int a, const std::vector<float>& logits,
                        const std::vector<float>& gumbel) const {
         const detail::SearchNode& r = nodes_[static_cast<size_t>(root)];
-        const int v = r.child_visits[static_cast<size_t>(a)];
-        const float parent_q =
-            r.visits > 0 ? r.value_sum / static_cast<float>(r.visits) : r.leaf_value;
-        const float q = v > 0
-                            ? r.child_value_sum[static_cast<size_t>(a)] / static_cast<float>(v)
-                            : parent_q;
-        const float sigma =
-            (cfg_.gumbel_c_visit + static_cast<float>(max_child_visits(root))) *
-            cfg_.gumbel_c_scale * q;
-        return gumbel[static_cast<size_t>(a)] + logits[static_cast<size_t>(a)] + sigma;
+        return policy_.gumbel_score(r, a, logits, gumbel, max_child_visits(root));
     }
 
     int max_child_visits(std::int32_t idx) const {
         const detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
         int m = 0;
-        for (int v : n.child_visits) m = std::max(m, v);
+        for (const detail::SearchEdge& edge : n.edges) m = std::max(m, edge.visits);
         return m;
     }
 
@@ -868,9 +1014,9 @@ private:
 
     void add_root_noise(std::int32_t root) {
         detail::SearchNode& n = nodes_[static_cast<size_t>(root)];
-        if (n.prior.empty()) return;
+        if (n.edges.empty()) return;
         // Gamma(alpha,1) samples normalised to a Dirichlet draw.
-        std::vector<float> noise(n.prior.size());
+        std::vector<float> noise(n.edges.size());
         float sum = 0.0f;
         for (auto& v : noise) {
             const double u =
@@ -880,8 +1026,8 @@ private:
         }
         if (sum <= 0.0f) return;
         const float f = cfg_.root_noise_fraction;
-        for (size_t i = 0; i < n.prior.size(); ++i)
-            n.prior[i] = (1.0f - f) * n.prior[i] + f * (noise[i] / sum);
+        for (size_t i = 0; i < n.edges.size(); ++i)
+            n.edges[i].prior = (1.0f - f) * n.edges[i].prior + f * (noise[i] / sum);
     }
 
     // --- results -----------------------------------------------------------
@@ -890,19 +1036,18 @@ private:
         result.candidates.reserve(n.actions.size());
 
         int total_visits = 0;
-        for (size_t a = 0; a < n.actions.size(); ++a) total_visits += n.child_visits[a];
+        for (const detail::SearchEdge& edge : n.edges) total_visits += edge.visits;
 
         result.search_policy.assign(n.actions.size(), 0.0f);
         int best = -1;
         int best_visits = -1;
         for (size_t a = 0; a < n.actions.size(); ++a) {
+            const detail::SearchEdge& edge = n.edges[a];
             SearchCandidate c;
             c.action_index = static_cast<int>(a);
-            c.prior = n.prior[a];
-            c.visits = n.child_visits[a];
-            c.q_value = n.child_visits[a] > 0
-                            ? n.child_value_sum[a] / static_cast<float>(n.child_visits[a])
-                            : 0.0f;
+            c.prior = edge.prior;
+            c.visits = edge.visits;
+            c.q_value = edge.q();
             result.candidates.push_back(c);
             if (total_visits > 0)
                 result.search_policy[a] =
@@ -918,11 +1063,14 @@ private:
         if (cfg_.use_gumbel && gumbel_selected_ >= 0) best = gumbel_selected_;
 
         // If nothing was searched at all, fall back to the prior.
-        if (best_visits <= 0 && !n.prior.empty()) {
+        if (best_visits <= 0 && !n.edges.empty()) {
             best = 0;
-            for (size_t a = 1; a < n.prior.size(); ++a)
-                if (n.prior[a] > n.prior[static_cast<size_t>(best)]) best = static_cast<int>(a);
-            result.search_policy = n.prior;
+            for (size_t a = 1; a < n.edges.size(); ++a)
+                if (n.edges[a].prior > n.edges[static_cast<size_t>(best)].prior)
+                    best = static_cast<int>(a);
+            result.search_policy.resize(n.edges.size());
+            for (size_t a = 0; a < n.edges.size(); ++a)
+                result.search_policy[a] = n.edges[a].prior;
         }
 
         result.best_action = best;
@@ -934,15 +1082,18 @@ private:
         result.transposition_hits = tt_hits_;
         result.mean_batch_size =
             eval_calls_ ? static_cast<double>(positions_evaluated_) / eval_calls_ : 0.0;
+        result.telemetry = telemetry_;
 
         eval_calls_ = 0;
         positions_evaluated_ = 0;
         tt_hits_ = 0;
+        telemetry_ = SearchTelemetry{};
         gumbel_selected_ = -1;
     }
 
     Evaluator& eval_;
     SearchConfig cfg_;
+    SearchPolicy policy_;
     Rng rng_;
     MoveGenerator movegen_;
     std::vector<detail::SearchNode> nodes_;
@@ -952,6 +1103,7 @@ private:
     int eval_calls_ = 0;
     int positions_evaluated_ = 0;
     int tt_hits_ = 0;
+    SearchTelemetry telemetry_;
     int root_player_index_ = 0;
     bool has_opponent_ = false;
     bool deliver_attacks_ = false;

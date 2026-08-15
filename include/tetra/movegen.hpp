@@ -60,8 +60,14 @@ public:
             for (const DelayBin bin : bins) {
                 Tick wait = delay_bin_ticks(bin);
                 if (bin == DelayBin::WaitForEvent) {
-                    wait = resolve_wait_for_event(now, next_garbage_activation,
-                                                  opponent_next_lock, h);
+                    // WAIT_FOR_EVENT is an *extra* delay on top of the base
+                    // execution time. Target the placement's lock at the next
+                    // event rather than waiting until the event and only then
+                    // beginning the movement. If the fastest execution already
+                    // reaches/passes the event, there is no distinct wait action.
+                    const Tick event_offset = resolve_wait_for_event(
+                        now, next_garbage_activation, opponent_next_lock, h);
+                    wait = std::max<Tick>(0, event_offset - base.base_duration);
                     if (wait <= 0) continue;
                 }
                 if (std::find(seen_waits.begin(), seen_waits.end(), wait) != seen_waits.end())

@@ -416,6 +416,83 @@ TEST(game_recorder_converts_outcome_to_each_sample_perspective) {
     CHECK_EQ(samples[1].future_attack_1s, 5.0f);
 }
 
+TEST(game_recorder_tracks_future_garbage_clears_for_vs_aux) {
+    GameRecorder rec;
+    Tokenizer tok;
+    const RulesetConfig cfg = league();
+    Player p;
+    p.reset(cfg, 23, 0);
+    MoveGenerator gen;
+    HeuristicEvaluator ev;
+    SearchConfig sc;
+    sc.simulations = 4;
+    sc.max_depth = 1;
+    Searcher searcher(ev, sc);
+
+    const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
+                                   p.visible_next().empty() ? Piece::None
+                                                            : p.visible_next()[0],
+                                   cfg);
+    const Observation obs = observe(p);
+    const SearchResult result = searcher.search(p);
+    rec.add(obs, acts, result, tok, /*value_perspective=*/1,
+            /*player_index=*/0, /*timestamp=*/0);
+    rec.note_outcome_of_last(/*attack_sent=*/1, /*garbage_received=*/0,
+                             /*garbage_cleared=*/2);
+    const auto samples = rec.finalize(1.0f);
+
+    CHECK_EQ(samples.size(), static_cast<size_t>(1));
+    const auto& sample = samples[0];
+    CHECK_EQ(sample.aux_target_schema_version, schema::AUX_TARGET_SCHEMA_VERSION);
+    CHECK_EQ(sample.aux_targets[static_cast<size_t>(
+                 schema::real_garbage_cleared_aux_index(0))], 2.0f);
+    CHECK_EQ(sample.aux_targets[static_cast<size_t>(
+                 schema::placement_garbage_cleared_aux_index(0))], 2.0f);
+    CHECK_EQ(sample.aux_valid[static_cast<size_t>(
+                 schema::real_garbage_cleared_aux_index(0))], 1);
+    CHECK_EQ(sample.aux_valid[static_cast<size_t>(
+                 schema::placement_garbage_cleared_aux_index(0))], 1);
+}
+
+TEST(game_recorder_tracks_future_garbage_cancellation) {
+    GameRecorder rec;
+    Tokenizer tok;
+    const RulesetConfig cfg = league();
+    Player p;
+    p.reset(cfg, 29, 0);
+    MoveGenerator gen;
+    HeuristicEvaluator ev;
+    SearchConfig sc;
+    sc.simulations = 4;
+    sc.max_depth = 1;
+    Searcher searcher(ev, sc);
+
+    const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
+                                   p.visible_next().empty() ? Piece::None
+                                                            : p.visible_next()[0],
+                                   cfg);
+    const Observation obs = observe(p);
+    const SearchResult result = searcher.search(p);
+    rec.add(obs, acts, result, tok, /*value_perspective=*/1,
+            /*player_index=*/0, /*timestamp=*/0);
+    rec.note_outcome_of_last(/*attack_sent=*/1, /*garbage_received=*/0,
+                             /*garbage_cleared=*/0, /*garbage_cancelled=*/3,
+                             /*timestamp=*/0, /*topped_out=*/false);
+    const auto samples = rec.finalize(1.0f);
+
+    CHECK_EQ(samples.size(), static_cast<size_t>(1));
+    const auto& sample = samples[0];
+    CHECK_EQ(sample.aux_target_schema_version, schema::AUX_TARGET_SCHEMA_VERSION);
+    CHECK_EQ(sample.aux_targets[static_cast<size_t>(
+                 schema::real_garbage_cancelled_aux_index(0))], 3.0f);
+    CHECK_EQ(sample.aux_targets[static_cast<size_t>(
+                 schema::placement_garbage_cancelled_aux_index(0))], 3.0f);
+    CHECK_EQ(sample.aux_valid[static_cast<size_t>(
+                 schema::real_garbage_cancelled_aux_index(0))], 1);
+    CHECK_EQ(sample.aux_valid[static_cast<size_t>(
+                 schema::placement_garbage_cancelled_aux_index(0))], 1);
+}
+
 TEST(selfplay_feeds_a_buffer_end_to_end) {
     // The whole pipeline: search -> samples -> buffer -> training batch.
     // With this in place, attaching a network is an Evaluator change alone.

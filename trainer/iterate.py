@@ -109,16 +109,51 @@ def main() -> int:
                     help="use batched PUCT for self-play instead of Gumbel search")
     ap.add_argument("--train-steps", type=int, default=5000)
     ap.add_argument("--train-batch", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=2e-5,
+                    help="production fine-tuning learning rate; passed explicitly to train.py")
     ap.add_argument("--new-data-repeat", type=int, default=4)
+    ap.add_argument("--reset-optimizer", action="store_true",
+                    help="start a fresh optimizer when the champion came from a different training objective")
+    ap.add_argument("--reset-sampling", action="store_true",
+                    help="restart training-sample RNG from --seed instead of restoring checkpoint sampling state")
     ap.add_argument("--model", choices=("dev", "s"), default="s")
+    # A promoted checkpoint may have been produced by an ablation with unusual
+    # stored loss weights (for example hard-rank-only training).  The guarded
+    # generation loop must therefore define its training objective explicitly
+    # instead of silently inheriting experiment-specific weights from --resume.
+    ap.add_argument("--policy-weight", type=float, default=1.0)
+    ap.add_argument("--value-weight", type=float, default=0.05)
+    ap.add_argument("--aux-weight", type=float, default=1.0)
+    ap.add_argument("--chosen-action-weight", type=float, default=0.0)
+    ap.add_argument("--chosen-disagreement-weight", type=float, default=0.0)
+    ap.add_argument("--policy-rank-weight", type=float, default=1.0,
+                    help="production ranking-loss weight; Gen14 rank=1.0 preserved Gen12 safety and promoted")
+    ap.add_argument("--policy-target-temperature", type=float, default=1.0)
+    ap.add_argument("--policy-pair-rank-weight", type=float, default=0.0)
+    ap.add_argument("--vs-aux-weight", type=float, default=0.0)
+    ap.add_argument("--cancellation-aux-weight", type=float, default=0.0)
+    ap.add_argument("--timing-pair-weight", type=float, default=0.0,
+                    help="experimental FASTEST/WAIT soft pair loss; production default stays off")
+    ap.add_argument("--timing-rank-weight", type=float, default=0.0,
+                    help="experimental FASTEST/WAIT pair ranking loss; production default stays off")
+    ap.add_argument("--factor-timing-policy", action="store_true",
+                    help="experimental timing factorization; production default stays off")
+    ap.add_argument("--timing-wait-bias", type=float, default=0.0,
+                    help="experimental WAIT bias; requires --factor-timing-policy")
+    ap.add_argument("--topout-aux-weight", type=float, default=0.0)
     ap.add_argument("--arena-pairs", type=int, default=10)
     ap.add_argument("--arena-sims", type=int, default=32)
     ap.add_argument("--arena-pieces", type=int, default=300)
-    ap.add_argument("--arena-determinizations", type=int, default=1)
+    ap.add_argument("--arena-determinizations", type=int, default=0,
+                    help="root futures used by Arena; 0 inherits --determinizations")
     ap.add_argument("--arena-seed", type=int, default=42,
                     help="base seed for the GPU Arena trial")
-    ap.add_argument("--arena-gumbel", action="store_true",
-                    help="use Gumbel search in the GPU Arena")
+    arena_search = ap.add_mutually_exclusive_group()
+    arena_search.add_argument("--arena-gumbel", dest="arena_gumbel", action="store_true",
+                              help="force Gumbel search in the GPU Arena")
+    arena_search.add_argument("--arena-no-gumbel", dest="arena_gumbel", action="store_false",
+                              help="force PUCT search in the GPU Arena")
+    ap.set_defaults(arena_gumbel=None)
     ap.add_argument("--cpu-arena", action="store_true",
                     help="use the legacy C++ CPU Arena instead of GPU Arena")
     ap.add_argument("--model-version", type=int, default=-1)
@@ -155,6 +190,14 @@ def main() -> int:
 
     py = sys.executable
     started = time.time()
+    arena_determinizations = (
+        args.determinizations if args.arena_determinizations <= 0
+        else args.arena_determinizations
+    )
+    arena_use_gumbel = (
+        not args.no_gumbel if args.arena_gumbel is None
+        else args.arena_gumbel
+    )
 
     selfplay_cmd = [
         py, str(root / "trainer/gpu_selfplay.py"), str(champion), str(new_data),
@@ -175,11 +218,30 @@ def main() -> int:
         py, str(root / "trainer/train.py"), *train_inputs,
         "--resume", str(champion), "--steps", str(max(0, args.train_steps)),
         "--batch", str(max(1, args.train_batch)), "--model", args.model,
-        "--device", args.device, "--require-gpu", "--value-weight", "1.0",
+        "--device", args.device, "--require-gpu", "--lr", str(args.lr),
+        "--policy-weight", str(args.policy_weight),
+        "--value-weight", str(args.value_weight),
+        "--aux-weight", str(args.aux_weight),
+        "--chosen-action-weight", str(args.chosen_action_weight),
+        "--chosen-disagreement-weight", str(args.chosen_disagreement_weight),
+        "--policy-rank-weight", str(args.policy_rank_weight),
+        "--policy-target-temperature", str(args.policy_target_temperature),
+        "--policy-pair-rank-weight", str(args.policy_pair_rank_weight),
+        "--vs-aux-weight", str(args.vs_aux_weight),
+        "--cancellation-aux-weight", str(args.cancellation_aux_weight),
+        "--timing-pair-weight", str(args.timing_pair_weight),
+        "--timing-rank-weight", str(args.timing_rank_weight),
+        "--timing-wait-bias", str(args.timing_wait_bias),
+        "--factor-timing-policy" if args.factor_timing_policy else "--no-factor-timing-policy",
+        "--topout-aux-weight", str(args.topout_aux_weight),
         "--new-data-repeat", str(max(1, args.new_data_repeat)),
         "--checkpoint-every", str(max(0, args.train_steps // 5)),
         "--best-save", str(candidate_best), "--save", str(candidate),
     ]
+    if args.reset_optimizer:
+        train_cmd.append("--reset-optimizer")
+    if args.reset_sampling:
+        train_cmd.append("--reset-sampling")
     run_checked(train_cmd, root)
 
     export_cmd = [py, str(root / "trainer/export_weights.py"), str(candidate), str(candidate_weights)]
@@ -204,11 +266,11 @@ def main() -> int:
             "--sims", str(max(1, args.arena_sims)),
             "--pieces", str(max(1, args.arena_pieces)),
             "--batch", str(max(1, args.inference_batch)),
-            "--determinizations", str(max(1, args.arena_determinizations)),
+            "--determinizations", str(max(1, arena_determinizations)),
             "--seed", str(max(0, args.arena_seed)),
             "--precision", args.precision,
         ]
-        if args.arena_gumbel:
+        if arena_use_gumbel:
             arena_cmd.append("--gumbel")
     arena_output = run_checked(arena_cmd, root, capture=True)
     print(arena_output, end="", flush=True)
@@ -236,6 +298,35 @@ def main() -> int:
         "new_data": str(new_data),
         "candidate": str(candidate),
         "candidate_weights": str(candidate_weights),
+        "selfplay": {
+            "games": max(1, args.games),
+            "pieces": max(1, args.pieces),
+            "simulations": max(1, args.sims),
+            "inference_batch": max(1, args.inference_batch),
+            "determinizations": max(1, args.determinizations),
+            "use_gumbel": not args.no_gumbel,
+            "precision": args.precision,
+            "seed": args.seed,
+        },
+        "training": {
+            "steps": max(0, args.train_steps),
+            "batch": max(1, args.train_batch),
+            "lr": args.lr,
+            "new_data_repeat": max(1, args.new_data_repeat),
+            "reset_optimizer": args.reset_optimizer,
+            "reset_sampling": args.reset_sampling,
+            "policy_weight": args.policy_weight,
+            "value_weight": args.value_weight,
+            "aux_weight": args.aux_weight,
+            "chosen_action_weight": args.chosen_action_weight,
+            "chosen_disagreement_weight": args.chosen_disagreement_weight,
+            "policy_rank_weight": args.policy_rank_weight,
+            "policy_target_temperature": args.policy_target_temperature,
+            "policy_pair_rank_weight": args.policy_pair_rank_weight,
+            "vs_aux_weight": args.vs_aux_weight,
+            "cancellation_aux_weight": args.cancellation_aux_weight,
+            "topout_aux_weight": args.topout_aux_weight,
+        },
         "arena_backend": arena_backend,
         "candidate_step": checkpoint_step(candidate),
         "arena": arena,

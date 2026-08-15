@@ -193,13 +193,15 @@ inline void enable_gpu_protocol_stdio() {
 // Final frame for the Python wrapper.  All game counters come from the C++
 // simulator; Python only formats them and calculates display metrics.
 inline void write_gpu_game_result(FILE* output, int pieces, int lines_cleared,
-                                  int lines_sent, int lines_received, bool survived,
+                                  int garbage_lines_cleared, int lines_sent,
+                                  int lines_received, bool survived,
                                   int topout, int tick_rate, float outcome, Tick duration,
                                   std::uint64_t positions, std::uint64_t batches) {
     gpu_protocol::write_exact(output, gpu_protocol::RESULT_MAGIC,
                               sizeof(gpu_protocol::RESULT_MAGIC));
     gpu_protocol::write_u32(output, static_cast<std::uint32_t>(pieces));
     gpu_protocol::write_u32(output, static_cast<std::uint32_t>(lines_cleared));
+    gpu_protocol::write_u32(output, static_cast<std::uint32_t>(garbage_lines_cleared));
     gpu_protocol::write_u32(output, static_cast<std::uint32_t>(lines_sent));
     gpu_protocol::write_u32(output, static_cast<std::uint32_t>(lines_received));
     gpu_protocol::write_u32(output, survived ? 1u : 0u);
@@ -233,6 +235,21 @@ inline void write_gpu_arena_result(FILE* output, std::uint32_t games_played,
                                    std::uint32_t candidate_wins,
                                    std::uint32_t champion_wins, std::uint32_t draws,
                                    float win_rate, float ci_lower, float ci_upper,
+                                   float candidate_vs, float champion_vs,
+                                   float candidate_apm, float champion_apm,
+                                   float candidate_app, float champion_app,
+                                   float candidate_pps, float champion_pps,
+                                   float candidate_avg_pieces, float champion_avg_pieces,
+                                   float candidate_avg_seconds, float champion_avg_seconds,
+                                   float candidate_survival_rate, float champion_survival_rate,
+                                   float candidate_sent_per_game, float champion_sent_per_game,
+                                   float candidate_garbage_cleared_per_game,
+                                   float champion_garbage_cleared_per_game,
+                                   float candidate_received_per_game,
+                                   float champion_received_per_game,
+                                   float candidate_blockout_rate, float champion_blockout_rate,
+                                   float candidate_lockout_rate, float champion_lockout_rate,
+                                   float candidate_garbageout_rate, float champion_garbageout_rate,
                                    bool promoted) {
     gpu_protocol::write_exact(output, gpu_protocol::ARENA_MAGIC,
                               sizeof(gpu_protocol::ARENA_MAGIC));
@@ -243,6 +260,32 @@ inline void write_gpu_arena_result(FILE* output, std::uint32_t games_played,
     gpu_protocol::write_float(output, win_rate);
     gpu_protocol::write_float(output, ci_lower);
     gpu_protocol::write_float(output, ci_upper);
+    gpu_protocol::write_float(output, candidate_vs);
+    gpu_protocol::write_float(output, champion_vs);
+    gpu_protocol::write_float(output, candidate_apm);
+    gpu_protocol::write_float(output, champion_apm);
+    gpu_protocol::write_float(output, candidate_app);
+    gpu_protocol::write_float(output, champion_app);
+    gpu_protocol::write_float(output, candidate_pps);
+    gpu_protocol::write_float(output, champion_pps);
+    gpu_protocol::write_float(output, candidate_avg_pieces);
+    gpu_protocol::write_float(output, champion_avg_pieces);
+    gpu_protocol::write_float(output, candidate_avg_seconds);
+    gpu_protocol::write_float(output, champion_avg_seconds);
+    gpu_protocol::write_float(output, candidate_survival_rate);
+    gpu_protocol::write_float(output, champion_survival_rate);
+    gpu_protocol::write_float(output, candidate_sent_per_game);
+    gpu_protocol::write_float(output, champion_sent_per_game);
+    gpu_protocol::write_float(output, candidate_garbage_cleared_per_game);
+    gpu_protocol::write_float(output, champion_garbage_cleared_per_game);
+    gpu_protocol::write_float(output, candidate_received_per_game);
+    gpu_protocol::write_float(output, champion_received_per_game);
+    gpu_protocol::write_float(output, candidate_blockout_rate);
+    gpu_protocol::write_float(output, champion_blockout_rate);
+    gpu_protocol::write_float(output, candidate_lockout_rate);
+    gpu_protocol::write_float(output, champion_lockout_rate);
+    gpu_protocol::write_float(output, candidate_garbageout_rate);
+    gpu_protocol::write_float(output, champion_garbageout_rate);
     gpu_protocol::write_u32(output, promoted ? 1u : 0u);
     if (std::fflush(output) != 0) throw std::runtime_error("GPU Arena flush failed");
 }

@@ -22,6 +22,28 @@ from ablation_models import load_ablation_checkpoint
 from train import split_indices_by_game
 
 
+def _splitmix64(value: int) -> int:
+    mask = (1 << 64) - 1
+    x = (value + 0x9E3779B97F4A7C15) & mask
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+    return (x ^ (x >> 31)) & mask
+
+
+def split_indices_by_game_hashed(ds: tetra_dataset.Dataset) -> tuple[np.ndarray, np.ndarray]:
+    seeds = np.asarray(ds.game_seed, dtype=np.uint64)
+    unique = sorted({int(seed) for seed in seeds.tolist() if int(seed) != 0})
+    if len(unique) < 2:
+        return split_indices_by_game(ds)
+    validation_seeds = {seed for seed in unique if _splitmix64(seed) % 5 == 0}
+    if not validation_seeds:
+        validation_seeds.add(unique[-1])
+    if len(validation_seeds) == len(unique):
+        validation_seeds.remove(unique[0])
+    validation = np.asarray([int(seed) in validation_seeds for seed in seeds], dtype=bool)
+    return np.flatnonzero(~validation), np.flatnonzero(validation)
+
+
 def default_dataset_paths() -> list[str]:
     paths = sorted(glob.glob("data/production/gen4_bootstrap_20260807.part*.tetradat"))
     paths += sorted(glob.glob("data/production/gen4_search32_[a-f]_20260807.part*.tetradat"))
@@ -55,6 +77,7 @@ def main() -> int:
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--expect-samples", type=int, default=47693)
+    ap.add_argument("--split", choices=("ordered", "hashed"), default="ordered")
     ap.add_argument("--output", default="models/ablation_cnn_20260808/policy_ranking.json")
     args = ap.parse_args()
 
@@ -73,7 +96,10 @@ def main() -> int:
         raise SystemExit(
             f"sample-count mismatch: expected {args.expect_samples}, got {len(dataset)}"
         )
-    _, val_np = split_indices_by_game(dataset)
+    if args.split == "hashed":
+        _, val_np = split_indices_by_game_hashed(dataset)
+    else:
+        _, val_np = split_indices_by_game(dataset)
     val_idx = torch.as_tensor(val_np, dtype=torch.long)
     data = dataset.torch()
     print(f"held-out      {len(val_idx)} samples", flush=True)
@@ -118,6 +144,10 @@ def main() -> int:
         teacher_regret_sum = 0.0
         model_top1_prob_sum = 0.0
         model_prob_teacher_best_sum = 0.0
+        chosen_valid_count = 0
+        chosen_top1_correct = 0
+        chosen_rank_sum = 0.0
+        model_prob_chosen_sum = 0.0
         entropy_bins = [
             {"count": 0, "ce_sum": 0.0, "top1": 0, "rank_sum": 0.0,
              "argmax_teacher_mass_sum": 0.0}
@@ -150,6 +180,27 @@ def main() -> int:
                 teacher_best_logit = logits.gather(1, teacher_best[:, None])
                 rank = 1 + ((logits > teacher_best_logit) & legal_b).sum(dim=-1)
                 agreement = model_best == teacher_best
+
+                chosen = batch.get("chosen_action")
+                if chosen is not None:
+                    chosen = chosen.long()
+                    chosen_valid = (chosen >= 0) & (chosen < logits.shape[1])
+                    safe_chosen = chosen.clamp(0, max(0, logits.shape[1] - 1))
+                    chosen_valid = chosen_valid & legal_b.gather(
+                        1, safe_chosen[:, None]
+                    ).squeeze(1)
+                    if chosen_valid.any():
+                        chosen_logit = logits.gather(1, safe_chosen[:, None])
+                        chosen_rank = 1 + ((logits > chosen_logit) & legal_b).sum(dim=-1)
+                        chosen_prob = prob.gather(1, safe_chosen[:, None]).squeeze(1)
+                        chosen_valid_count += int(chosen_valid.sum().item())
+                        chosen_top1_correct += int(
+                            ((model_best == safe_chosen) & chosen_valid).sum().item()
+                        )
+                        chosen_rank_sum += float(
+                            chosen_rank[chosen_valid].float().sum().item()
+                        )
+                        model_prob_chosen_sum += float(chosen_prob[chosen_valid].sum().item())
 
                 # top-k uses logits directly. k is clipped to the rectangular action
                 # dimension; padded actions are already -inf in every ablation model.
@@ -205,6 +256,10 @@ def main() -> int:
             "mean_teacher_mass_regret": teacher_regret_sum / total_count,
             "mean_model_top1_probability": model_top1_prob_sum / total_count,
             "mean_model_probability_teacher_best": model_prob_teacher_best_sum / total_count,
+            "chosen_action_valid_count": chosen_valid_count,
+            "chosen_action_top1_accuracy": chosen_top1_correct / max(1, chosen_valid_count),
+            "mean_chosen_action_rank": chosen_rank_sum / max(1, chosen_valid_count),
+            "mean_model_probability_chosen_action": model_prob_chosen_sum / max(1, chosen_valid_count),
             "mean_normalized_teacher_entropy": teacher_entropy_sum / total_count,
             "entropy_bins": [],
         }
@@ -227,6 +282,7 @@ def main() -> int:
             f"top1 {metrics['top1_teacher_argmax_accuracy']:.4f}  "
             f"top3 {metrics['top3_teacher_best_recall']:.4f}  "
             f"MRR {metrics['mean_reciprocal_rank_teacher_best']:.4f}  "
+            f"chosen1 {metrics['chosen_action_top1_accuracy']:.4f}  "
             f"teacher-mass@argmax {metrics['mean_teacher_mass_at_model_argmax']:.4f}  "
             f"regret {metrics['mean_teacher_mass_regret']:.4f}",
             flush=True,

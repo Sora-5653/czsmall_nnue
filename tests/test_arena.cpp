@@ -51,6 +51,62 @@ TEST(arena_paired_games_run_normal_and_mirrored) {
     CHECK_EQ(r.candidate_wins, r.champion_wins);
 }
 
+TEST(arena_reports_aggregate_diagnostics_from_game_counters) {
+    HeuristicEvaluator ev1;
+    HeuristicEvaluator ev2;
+    const RulesetConfig rules = league();
+    Arena arena(ev1, ev2, quick_arena(2, 4, 15));
+    const ArenaResult r = arena.evaluate(rules, 4242);
+
+    std::int64_t candidate_sent = 0;
+    std::int64_t champion_sent = 0;
+    std::int64_t candidate_gc = 0;
+    std::int64_t champion_gc = 0;
+    std::int64_t candidate_received = 0;
+    std::int64_t champion_received = 0;
+    std::int64_t candidate_pieces = 0;
+    std::int64_t champion_pieces = 0;
+    Tick candidate_duration = 0;
+    Tick champion_duration = 0;
+    int candidate_survived = 0;
+    int champion_survived = 0;
+    for (const auto& game : r.games) {
+        candidate_sent += game.candidate_sent;
+        champion_sent += game.champion_sent;
+        candidate_gc += game.candidate_garbage_cleared;
+        champion_gc += game.champion_garbage_cleared;
+        candidate_received += game.candidate_received;
+        champion_received += game.champion_received;
+        candidate_pieces += game.candidate_pieces;
+        champion_pieces += game.champion_pieces;
+        candidate_duration += game.candidate_duration;
+        champion_duration += game.champion_duration;
+        candidate_survived += game.candidate_survived ? 1 : 0;
+        champion_survived += game.champion_survived ? 1 : 0;
+    }
+    const float games = static_cast<float>(r.games_played);
+    CHECK(std::abs(r.candidate_avg_pieces - static_cast<float>(candidate_pieces) / games) < 1e-5f);
+    CHECK(std::abs(r.champion_avg_pieces - static_cast<float>(champion_pieces) / games) < 1e-5f);
+    CHECK(std::abs(r.candidate_survival_rate - static_cast<float>(candidate_survived) / games) < 1e-5f);
+    CHECK(std::abs(r.champion_survival_rate - static_cast<float>(champion_survived) / games) < 1e-5f);
+    CHECK(std::abs(r.candidate_sent_per_game - static_cast<float>(candidate_sent) / games) < 1e-5f);
+    CHECK(std::abs(r.champion_sent_per_game - static_cast<float>(champion_sent) / games) < 1e-5f);
+    CHECK(std::abs(r.candidate_garbage_cleared_per_game - static_cast<float>(candidate_gc) / games) < 1e-5f);
+    CHECK(std::abs(r.champion_garbage_cleared_per_game - static_cast<float>(champion_gc) / games) < 1e-5f);
+    CHECK(std::abs(r.candidate_received_per_game - static_cast<float>(candidate_received) / games) < 1e-5f);
+    CHECK(std::abs(r.champion_received_per_game - static_cast<float>(champion_received) / games) < 1e-5f);
+    CHECK(std::abs(
+        r.candidate_survival_rate + r.candidate_blockout_rate + r.candidate_lockout_rate +
+        r.candidate_garbageout_rate - 1.0f) < 1e-5f);
+    CHECK(std::abs(
+        r.champion_survival_rate + r.champion_blockout_rate + r.champion_lockout_rate +
+        r.champion_garbageout_rate - 1.0f) < 1e-5f);
+    CHECK(std::abs(r.candidate_vs - static_cast<float>(versus_score(
+        candidate_sent, candidate_gc, static_cast<int>(candidate_pieces), candidate_duration, rules))) < 1e-4f);
+    CHECK(std::abs(r.champion_vs - static_cast<float>(versus_score(
+        champion_sent, champion_gc, static_cast<int>(champion_pieces), champion_duration, rules))) < 1e-4f);
+}
+
 TEST(arena_identifies_win_draw_loss) {
     HeuristicEvaluator ev1;
     HeuristicEvaluator ev2;

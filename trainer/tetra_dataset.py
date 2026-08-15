@@ -17,7 +17,8 @@ blocks::
     value_target  [N]
     aux_target    [N, aux_targets]
     aux_valid_mask [N, aux_targets] (v3)
-    provenance    per-sample perspective/termination/game seed (v3)
+    provenance    per-sample perspective/termination/game seed (v3+)
+    chosen_action [N] int32, -1 when unavailable (v4+)
 
 Only numpy is required to read it; torch is optional and used lazily.
 """
@@ -33,7 +34,8 @@ import numpy as np
 MAGIC = b"TETRADAT"
 LEGACY_VERSION = 1
 COMPACT_VERSION = 2
-VERSION = 3
+RECTANGULAR_V3 = 3
+VERSION = 4
 CONTRACT_VERSION = 1
 BASE_HEADER = struct.Struct("<8s7IQI")
 CONTRACT_HEADER = struct.Struct("<IIQQIIIIQQ")
@@ -43,7 +45,13 @@ TOKENIZER_SCHEMA_HASH = 0x5F1E2C9A7B43D816
 OBSERVATION_SCHEMA_HASH = 0x8C74B1E2D6093A5F
 ACTION_SCHEMA_VERSION = 1
 LEGACY_AUX_TARGET_SCHEMA_VERSION = 1
-AUX_TARGET_SCHEMA_VERSION = 2
+INTERVAL_AUX_TARGET_SCHEMA_VERSION = 2
+GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION = 3
+AUX_TARGET_SCHEMA_VERSION = 4
+LEGACY_AUX_TARGET_COUNT = 4
+INTERVAL_AUX_TARGET_COUNT_V2 = 36
+AUX_TARGET_COUNT_V3 = 44
+AUX_TARGET_COUNT = 52
 
 
 @dataclass
@@ -86,6 +94,7 @@ class Dataset:
     termination_reason: Optional[np.ndarray] = None  # [N], enum value
     game_seed: Optional[np.ndarray] = None  # [N], zero for legacy files
     move_number: Optional[np.ndarray] = None  # [N]
+    chosen_action: Optional[np.ndarray] = None  # [N], -1 for pre-v4 data
 
     def __len__(self) -> int:
         return self.header.samples
@@ -118,22 +127,44 @@ class Dataset:
                     "cannot mix datasets with different ruleset hashes: "
                     f"{h0.ruleset_hash:016x} vs {h.ruleset_hash:016x}"
                 )
+            if h.version not in (RECTANGULAR_V3, VERSION) or h0.version not in (RECTANGULAR_V3, VERSION):
+                raise ValueError("cannot mix non-rectangular dataset versions")
             contract_fields = (
-                "version", "contract_version", "token_features", "action_features", "aux_targets",
+                "contract_version", "token_features", "action_features",
                 "tokenizer_schema_version", "tokenizer_schema_hash",
                 "observation_schema_hash", "action_schema_version",
-                "aux_target_schema_version", "token_kind_order_hash",
+                "token_kind_order_hash",
             )
             for field in contract_fields:
                 if getattr(h, field) != getattr(h0, field):
                     raise ValueError(f"cannot mix datasets with different {field}")
+
+        # Auxiliary schemas are append-only by contract: v1=4, v2=36,
+        # v3=44, v4=52. Older rows can therefore be widened safely by padding
+        # the appended targets with validity=0. This is especially useful for
+        # policy-only replay across historical generations; no unavailable
+        # auxiliary label is ever fabricated.
+        aux_contract = {
+            LEGACY_AUX_TARGET_SCHEMA_VERSION: LEGACY_AUX_TARGET_COUNT,
+            INTERVAL_AUX_TARGET_SCHEMA_VERSION: INTERVAL_AUX_TARGET_COUNT_V2,
+            GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION: AUX_TARGET_COUNT_V3,
+            AUX_TARGET_SCHEMA_VERSION: AUX_TARGET_COUNT,
+        }
+        for ds in datasets:
+            expected = aux_contract.get(ds.header.aux_target_schema_version)
+            if expected is None or ds.header.aux_targets != expected:
+                raise ValueError(
+                    "cannot mix dataset with unsupported auxiliary schema: "
+                    f"v{ds.header.aux_target_schema_version}/{ds.header.aux_targets}"
+                )
 
         total = sum(len(ds) for ds in datasets)
         max_tokens = max(ds.tokens.shape[1] for ds in datasets)
         max_actions = max(ds.actions.shape[1] for ds in datasets)
         ftok = h0.token_features
         fact = h0.action_features
-        faux = h0.aux_targets
+        faux = max(ds.header.aux_targets for ds in datasets)
+        faux_schema = max(ds.header.aux_target_schema_version for ds in datasets)
 
         tokens = np.zeros((total, max_tokens, ftok), dtype=np.float32)
         token_mask = np.zeros((total, max_tokens), dtype=np.float32)
@@ -147,6 +178,7 @@ class Dataset:
         termination_reason = np.zeros((total,), dtype=np.int32)
         game_seed = np.zeros((total,), dtype=np.uint64)
         move_number = np.zeros((total,), dtype=np.uint32)
+        chosen_action = np.full((total,), -1, dtype=np.int32)
 
         at = 0
         for ds in datasets:
@@ -160,16 +192,18 @@ class Dataset:
             action_mask[sl, :a] = ds.action_mask
             policy_target[sl, :a] = ds.policy_target
             value_target[sl] = ds.value_target
-            aux_target[sl] = ds.aux_target
-            aux_valid_mask[sl] = ds.aux_valid_mask
+            aux_width = ds.header.aux_targets
+            aux_target[sl, :aux_width] = ds.aux_target
+            aux_valid_mask[sl, :aux_width] = ds.aux_valid_mask
             player_perspective[sl] = ds.player_perspective
             termination_reason[sl] = ds.termination_reason
             game_seed[sl] = ds.game_seed
             move_number[sl] = ds.move_number
+            chosen_action[sl] = ds.chosen_action
             at += n
 
         header = Header(
-            version=h0.version,
+            version=max(ds.header.version for ds in datasets),
             samples=total,
             max_tokens=max_tokens,
             max_actions=max_actions,
@@ -183,7 +217,7 @@ class Dataset:
             tokenizer_schema_hash=h0.tokenizer_schema_hash,
             observation_schema_hash=h0.observation_schema_hash,
             action_schema_version=h0.action_schema_version,
-            aux_target_schema_version=h0.aux_target_schema_version,
+            aux_target_schema_version=faux_schema,
             randomizer_type=h0.randomizer_type,
             termination_reason=h0.termination_reason,
             self_play_seed=0,
@@ -191,7 +225,8 @@ class Dataset:
         )
         return Dataset(header, tokens, token_mask, actions, action_mask,
                        policy_target, value_target, aux_target, aux_valid_mask,
-                       player_perspective, termination_reason, game_seed, move_number)
+                       player_perspective, termination_reason, game_seed, move_number,
+                       chosen_action)
 
     def torch(self, device: Optional[str] = None):
         """Return the arrays as torch tensors, moved to `device` if given."""
@@ -213,12 +248,13 @@ class Dataset:
             "value_target": t(self.value_target),
             "aux_target": t(self.aux_target),
             "aux_valid_mask": t(self.aux_valid_mask),
+            "chosen_action": t(self.chosen_action),
         }
 
     def sanity_check(self) -> None:
         """Fail loudly on the mistakes that silently ruin training."""
         h = self.header
-        if h.version == VERSION:
+        if h.version in (RECTANGULAR_V3, VERSION):
             if h.contract_version != CONTRACT_VERSION:
                 raise ValueError(f"unsupported dataset contract version {h.contract_version}")
             if (h.tokenizer_schema_version != TOKENIZER_SCHEMA_VERSION or
@@ -228,13 +264,20 @@ class Dataset:
                     h.action_schema_version != ACTION_SCHEMA_VERSION):
                 raise ValueError("tokenizer/observation/action schema mismatch")
             if (h.aux_target_schema_version == AUX_TARGET_SCHEMA_VERSION and
-                    h.aux_targets != 36):
+                    h.aux_targets != AUX_TARGET_COUNT):
+                raise ValueError("aux target width does not match schema v4")
+            if (h.aux_target_schema_version == GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION and
+                    h.aux_targets != AUX_TARGET_COUNT_V3):
+                raise ValueError("aux target width does not match schema v3")
+            if (h.aux_target_schema_version == INTERVAL_AUX_TARGET_SCHEMA_VERSION and
+                    h.aux_targets != INTERVAL_AUX_TARGET_COUNT_V2):
                 raise ValueError("aux target width does not match schema v2")
             if (h.aux_target_schema_version == LEGACY_AUX_TARGET_SCHEMA_VERSION and
-                    h.aux_targets != 4):
+                    h.aux_targets != LEGACY_AUX_TARGET_COUNT):
                 raise ValueError("legacy aux target width does not match schema v1")
             if h.aux_target_schema_version not in (
-                    AUX_TARGET_SCHEMA_VERSION, LEGACY_AUX_TARGET_SCHEMA_VERSION):
+                    AUX_TARGET_SCHEMA_VERSION, GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION,
+                    INTERVAL_AUX_TARGET_SCHEMA_VERSION, LEGACY_AUX_TARGET_SCHEMA_VERSION):
                 raise ValueError("unknown aux target schema")
         assert self.tokens.shape == (h.samples, h.max_tokens, h.token_features), self.tokens.shape
         assert self.actions.shape == (h.samples, h.max_actions, h.action_features)
@@ -251,6 +294,8 @@ class Dataset:
             self.game_seed = np.zeros((h.samples,), dtype=np.uint64)
         if self.move_number is None:
             self.move_number = np.zeros((h.samples,), dtype=np.uint32)
+        if self.chosen_action is None:
+            self.chosen_action = np.full((h.samples,), -1, dtype=np.int32)
         if self.aux_valid_mask.shape != (h.samples, h.aux_targets):
             raise ValueError(f"aux_valid_mask has shape {self.aux_valid_mask.shape}")
         for name, arr, shape in (
@@ -258,6 +303,7 @@ class Dataset:
             ("termination_reason", self.termination_reason, (h.samples,)),
             ("game_seed", self.game_seed, (h.samples,)),
             ("move_number", self.move_number, (h.samples,)),
+            ("chosen_action", self.chosen_action, (h.samples,)),
         ):
             if arr.shape != shape:
                 raise ValueError(f"{name} has shape {arr.shape}, expected {shape}")
@@ -359,7 +405,7 @@ def load(path: str) -> Dataset:
             check=True,
         )
         blob = proc.stdout
-    elif ver == VERSION:
+    elif ver in (RECTANGULAR_V3, VERSION):
         with open(path, "rb") as fh:
             blob = fh.read()
     else:
@@ -368,7 +414,7 @@ def load(path: str) -> Dataset:
     magic, version, samples, max_tokens, max_actions, token_features, action_features, aux_targets, ruleset_hash, model_version = BASE_HEADER.unpack_from(blob, 0)
     off = BASE_HEADER.size
 
-    if version == VERSION:
+    if version in (RECTANGULAR_V3, VERSION):
         if len(blob) < off + CONTRACT_HEADER.size:
             raise ValueError("truncated dataset contract header")
         (contract_version, tokenizer_schema_version, tokenizer_schema_hash,
@@ -427,7 +473,7 @@ def load(path: str) -> Dataset:
     value_target = take(n, (n,))
     aux_target = take(n * faux, (n, faux))
 
-    if version == VERSION:
+    if version in (RECTANGULAR_V3, VERSION):
         aux_valid_mask = take(n * faux, (n, faux))
         def take_raw(count, dtype, shape):
             nonlocal off
@@ -439,12 +485,17 @@ def load(path: str) -> Dataset:
         termination_per_sample = take_raw(n, "<i4", (n,))
         game_seed = take_raw(n, "<u8", (n,))
         move_number = take_raw(n, "<u4", (n,))
+        if version == VERSION:
+            chosen_action = take_raw(n, "<i4", (n,))
+        else:
+            chosen_action = np.full((n,), -1, dtype=np.int32)
     else:
         aux_valid_mask = np.ones_like(aux_target, dtype=np.float32)
         player_perspective = np.ones((n,), dtype=np.int32)
         termination_per_sample = np.zeros((n,), dtype=np.int32)
         game_seed = np.zeros((n,), dtype=np.uint64)
         move_number = np.zeros((n,), dtype=np.uint32)
+        chosen_action = np.full((n,), -1, dtype=np.int32)
 
     return Dataset(
         header=header,
@@ -460,6 +511,7 @@ def load(path: str) -> Dataset:
         termination_reason=termination_per_sample,
         game_seed=game_seed,
         move_number=move_number,
+        chosen_action=chosen_action,
     )
 
 

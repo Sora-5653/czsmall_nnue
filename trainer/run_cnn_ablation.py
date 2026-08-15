@@ -29,7 +29,7 @@ from tetraformer import losses
 from train import split_indices_by_game
 
 
-LOSS_WEIGHTS = {"policy": 1.0, "value": 1.0, "aux": 0.1}
+LOSS_WEIGHTS = {"policy": 1.0, "value": 1.0, "aux": 0.1, "timing_pair": 0.0, "timing_rank": 0.0}
 
 
 def default_dataset_paths() -> list[str]:
@@ -62,7 +62,8 @@ def split_indices_by_game_hashed(ds: tetra_dataset.Dataset) -> tuple[np.ndarray,
 
 
 def save_model(path: Path, architecture: str, model: torch.nn.Module, step: int,
-               args: argparse.Namespace, metrics: dict[str, float]) -> None:
+               args: argparse.Namespace, metrics: dict[str, float],
+               optimizer: torch.optim.Optimizer | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
     torch.save(
@@ -79,6 +80,7 @@ def save_model(path: Path, architecture: str, model: torch.nn.Module, step: int,
             "loss_weights": dict(LOSS_WEIGHTS),
             "metrics": dict(metrics),
             "state_dict": state,
+            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         },
         path,
     )
@@ -87,15 +89,30 @@ def save_model(path: Path, architecture: str, model: torch.nn.Module, step: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--datasets", nargs="*", default=None)
+    ap.add_argument("--dataset-result-json", default=None,
+                    help="reuse the exact dataset path list stored in a prior ablation result JSON")
+    ap.add_argument("--replace-dataset-prefix", nargs=2, action="append", default=[],
+                    metavar=("OLD", "NEW"),
+                    help="replace a dataset path prefix after loading --dataset-result-json; repeatable")
     ap.add_argument(
-        "--architectures", nargs="+", choices=("transformer", "cnn", "hybrid", "split_hybrid", "fusion_hybrid", "dual_policy_hybrid"),
+        "--architectures", nargs="+", choices=("transformer", "cnn", "hybrid", "spatial_hybrid", "pooled_spatial_hybrid", "augmented_pooled_hybrid", "split_hybrid", "fusion_hybrid", "dual_policy_hybrid"),
         default=("transformer", "cnn", "hybrid"),
     )
     ap.add_argument("--expect-samples", type=int, default=47693)
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--microbatch", type=int, default=0,
+                    help="split each sampled training batch for gradient accumulation; 0 uses --batch")
+    ap.add_argument("--eval-batch", type=int, default=0,
+                    help="validation batch size; 0 uses --batch")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--timing-pair-weight", type=float, default=0.0,
+                    help="experimental soft FASTEST-vs-WAIT conditional policy loss; 0 preserves baseline")
+    ap.add_argument("--timing-rank-weight", type=float, default=0.0,
+                    help="experimental margin-weighted FASTEST-vs-WAIT ranking loss; 0 preserves baseline")
+    ap.add_argument("--factor-timing-policy", action="store_true",
+                    help="factor FASTEST/WAIT logits so timing only splits base-placement prior mass")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--split", choices=("ordered", "hashed"), default="ordered",
                     help="ordered preserves train.py behaviour; hashed distributes games across seed ranges")
@@ -104,7 +121,17 @@ def main() -> int:
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--output-dir", default="models/ablation_cnn_20260808")
     ap.add_argument("--result-json", default="models/ablation_cnn_20260808/results.json")
+    ap.add_argument("--resume-training", default=None,
+                    help="resume model+AdamW state and continue from checkpoint step to --steps")
+    ap.add_argument("--pooled-cnn-channels", type=int, default=192,
+                    help="CNN width for pooled_spatial_hybrid")
+    ap.add_argument("--pooled-cnn-blocks", type=int, default=10,
+                    help="residual CNN blocks for pooled_spatial_hybrid")
     args = ap.parse_args()
+    if args.timing_pair_weight < 0.0 or args.timing_rank_weight < 0.0:
+        raise SystemExit("timing loss weights must be non-negative")
+    LOSS_WEIGHTS["timing_pair"] = args.timing_pair_weight
+    LOSS_WEIGHTS["timing_rank"] = args.timing_rank_weight
 
     torch.set_num_threads(args.threads)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -113,7 +140,18 @@ def main() -> int:
     if device.type == "cuda":
         print(f"device        {torch.cuda.get_device_name(device)}", flush=True)
 
-    paths = list(args.datasets) if args.datasets else default_dataset_paths()
+    if args.dataset_result_json:
+        if args.datasets:
+            raise SystemExit("--dataset-result-json and --datasets are mutually exclusive")
+        prior = json.loads(Path(args.dataset_result_json).read_text(encoding="utf-8"))
+        paths = list(prior["dataset"]["paths"])
+    else:
+        paths = list(args.datasets) if args.datasets else default_dataset_paths()
+    for old_prefix, new_prefix in args.replace_dataset_prefix:
+        replaced = sum(old_prefix in p for p in paths)
+        if replaced == 0:
+            raise SystemExit(f"dataset prefix not found: {old_prefix}")
+        paths = [p.replace(old_prefix, new_prefix, 1) if old_prefix in p else p for p in paths]
     if not paths:
         raise SystemExit("no ablation datasets found")
     print(f"inputs        {len(paths)} shards", flush=True)
@@ -163,13 +201,16 @@ def main() -> int:
             "value": 0.0,
             "value_accuracy": 0.0,
             "value_scalar_mse": 0.0,
+            "timing_pair": 0.0,
+            "timing_rank": 0.0,
         }
         count_total = 0
         aux_num = 0.0
         aux_den = 0.0
+        eval_batch = args.eval_batch if args.eval_batch > 0 else args.batch
         with torch.inference_mode():
-            for offset in range(0, len(val_idx), args.batch):
-                idx = val_idx[offset:offset + args.batch]
+            for offset in range(0, len(val_idx), eval_batch):
+                idx = val_idx[offset:offset + eval_batch]
                 batch = batch_at(idx)
                 _, parts = losses(model, batch, weights=LOSS_WEIGHTS)
                 count = len(idx)
@@ -186,6 +227,8 @@ def main() -> int:
             LOSS_WEIGHTS["policy"] * result["policy"]
             + LOSS_WEIGHTS["value"] * result["value"]
             + LOSS_WEIGHTS["aux"] * result["aux"]
+            + LOSS_WEIGHTS["timing_pair"] * result["timing_pair"]
+            + LOSS_WEIGHTS["timing_rank"] * result["timing_rank"]
         )
         return result
 
@@ -202,12 +245,17 @@ def main() -> int:
             "optimizer": "AdamW",
             "steps": args.steps,
             "batch": args.batch,
+            "microbatch": args.microbatch if args.microbatch > 0 else args.batch,
+            "eval_batch": args.eval_batch if args.eval_batch > 0 else args.batch,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
             "seed": args.seed,
             "split": args.split,
             "loss_weights": dict(LOSS_WEIGHTS),
             "device": str(device),
+            "pooled_cnn_channels": args.pooled_cnn_channels,
+            "pooled_cnn_blocks": args.pooled_cnn_blocks,
+            "factor_timing_policy": args.factor_timing_policy,
         },
         "architectures": {},
     }
@@ -225,31 +273,75 @@ def main() -> int:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
         model = build_ablation_model(
-            architecture, header.token_features, header.action_features, header.aux_targets
+            architecture, header.token_features, header.action_features, header.aux_targets,
+            pooled_cnn_channels=args.pooled_cnn_channels,
+            pooled_cnn_blocks=args.pooled_cnn_blocks,
+            factor_timing_policy=args.factor_timing_policy,
         ).to(device)
         parameter_count = sum(parameter.numel() for parameter in model.parameters())
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=args.lr, weight_decay=args.weight_decay
         )
+        start_step = 0
+        if args.resume_training is not None:
+            if len(args.architectures) != 1:
+                raise SystemExit("--resume-training requires exactly one architecture")
+            resume = torch.load(args.resume_training, map_location="cpu", weights_only=False)
+            if resume.get("architecture") != architecture:
+                raise SystemExit(
+                    f"resume architecture mismatch: {resume.get('architecture')} != {architecture}"
+                )
+            if int(resume.get("seed", args.seed)) != args.seed:
+                raise SystemExit("resume seed mismatch")
+            model.load_state_dict(resume["state_dict"])
+            optimizer_state = resume.get("optimizer_state_dict")
+            if optimizer_state is None:
+                raise SystemExit("resume checkpoint has no optimizer_state_dict")
+            optimizer.load_state_dict(optimizer_state)
+            start_step = int(resume.get("step", 0))
+            if start_step >= args.steps:
+                raise SystemExit(
+                    f"resume step {start_step} must be smaller than target --steps {args.steps}"
+                )
+            print(f"resume        {args.resume_training} @ step {start_step}", flush=True)
         start = evaluate(model)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
         print(
             f"\n[{architecture}] params {parameter_count:,}  "
             f"val-start policy {start['policy']:.6f} total {start['total']:.6f}",
             flush=True,
         )
         best_policy = start["policy"]
-        best_step = 0
+        best_step = start_step
         best_metrics = dict(start)
-        save_model(output_dir / f"{architecture}.best.pt", architecture, model, 0, args, start)
+        save_model(
+            output_dir / f"{architecture}.best.pt", architecture, model,
+            start_step, args, start, optimizer
+        )
 
         model.train()
         t0 = time.time()
-        log_every = max(1, args.steps // 10)
-        for local_step in range(1, args.steps + 1):
+        remaining_steps = args.steps - start_step
+        log_every = max(1, remaining_steps // 10)
+        microbatch = args.microbatch if args.microbatch > 0 else sample_width
+        microbatch = min(max(1, microbatch), sample_width)
+        for local_step in range(start_step + 1, args.steps + 1):
             pick = train_idx[batch_schedule[local_step - 1]]
-            total, parts = losses(model, batch_at(pick), weights=LOSS_WEIGHTS)
             optimizer.zero_grad(set_to_none=True)
-            total.backward()
+            parts_accum: dict[str, float] = {}
+            pick_count = len(pick)
+            for micro_offset in range(0, pick_count, microbatch):
+                micro_pick = pick[micro_offset:micro_offset + microbatch]
+                total, micro_parts = losses(model, batch_at(micro_pick), weights=LOSS_WEIGHTS)
+                scale = len(micro_pick) / max(1, pick_count)
+                (total * scale).backward()
+                for key, value in micro_parts.items():
+                    if key.startswith("_") or not isinstance(value, (int, float)):
+                        continue
+                    parts_accum[key] = parts_accum.get(key, 0.0) + float(value) * scale
+            parts = parts_accum
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
@@ -279,9 +371,15 @@ def main() -> int:
                         local_step,
                         args,
                         metrics,
+                        optimizer,
                     )
 
         elapsed = time.time() - t0
+        peak_allocated = 0.0
+        peak_reserved = 0.0
+        if device.type == "cuda":
+            peak_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            peak_reserved = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
         final = evaluate(model)
         save_model(
             output_dir / f"{architecture}.final.pt",
@@ -290,10 +388,12 @@ def main() -> int:
             args.steps,
             args,
             final,
+            optimizer,
         )
         print(
             f"[{architecture}] FINAL policy {final['policy']:.6f} total {final['total']:.6f} "
-            f"best-policy {best_policy:.6f}@{best_step}  {elapsed:.1f}s",
+            f"best-policy {best_policy:.6f}@{best_step}  {elapsed:.1f}s "
+            f"peak-alloc {peak_allocated:.2f}GiB peak-reserved {peak_reserved:.2f}GiB",
             flush=True,
         )
         results["architectures"][architecture] = {
@@ -303,6 +403,8 @@ def main() -> int:
             "best": best_metrics,
             "best_step": best_step,
             "seconds": elapsed,
+            "peak_allocated_gib": peak_allocated,
+            "peak_reserved_gib": peak_reserved,
             "final_checkpoint": str(output_dir / f"{architecture}.final.pt"),
             "best_checkpoint": str(output_dir / f"{architecture}.best.pt"),
         }

@@ -15,8 +15,9 @@
 //     policy_target float32 [N, A]
 //     value_target  float32 [N]
 //     aux_target    float32 [N, AUX_TARGETS]
-//     aux_valid_mask float32 [N, AUX_TARGETS] (v3)
-//     provenance    int/uint arrays (v3)
+//     aux_valid_mask float32 [N, AUX_TARGETS] (v3+)
+//     provenance    int/uint arrays (v3+)
+//     chosen_action int32 [N] (v4+; -1 when unavailable)
 //
 // Everything is little-endian float32 (or int32 for the header), which is what
 // both numpy and libtorch expect natively on the platforms this runs on.
@@ -44,7 +45,8 @@ struct DatasetHeader {
     static constexpr char MAGIC[8] = {'T', 'E', 'T', 'R', 'A', 'D', 'A', 'T'};
     static constexpr std::uint32_t VERSION_LEGACY = 1;
     static constexpr std::uint32_t VERSION_COMPACT = 2;
-    static constexpr std::uint32_t VERSION = 3;
+    static constexpr std::uint32_t VERSION_RECTANGULAR_V3 = 3;
+    static constexpr std::uint32_t VERSION = 4;
     static constexpr std::uint32_t CONTRACT_VERSION = 1;
 
     std::uint32_t version = VERSION;
@@ -57,7 +59,7 @@ struct DatasetHeader {
     std::uint64_t ruleset_hash = 0;
     std::uint32_t model_version = 0;
 
-    // Version-3 contract extension.  The human-readable names and ordered
+    // Version-3+ contract extension.  The human-readable names and ordered
     // lists are emitted by the manifest; the binary header carries their
     // stable hashes so a shard cannot pass validation on width alone.
     std::uint32_t contract_version = 0;
@@ -187,6 +189,13 @@ inline std::vector<std::uint8_t> serialize_dataset(const TensorBatch& batch,
                 : 0;
         detail::put32(out, value);
     }
+    for (int i = 0; i < batch.batch; ++i) {
+        const std::int32_t value =
+            i < static_cast<int>(batch.chosen_action.size())
+                ? batch.chosen_action[static_cast<size_t>(i)]
+                : -1;
+        detail::put_i32(out, value);
+    }
     return out;
 }
 
@@ -196,10 +205,14 @@ inline DatasetContract default_dataset_contract(const TensorBatch& batch) {
                                  ? batch.aux_target.size() /
                                        static_cast<size_t>(batch.batch)
                                  : static_cast<size_t>(TensorBatch::AUX_TARGETS);
-    contract.aux_target_schema_version =
-        aux_width == static_cast<size_t>(schema::LEGACY_AUX_TARGET_COUNT)
-            ? schema::LEGACY_AUX_TARGET_SCHEMA_VERSION
-            : schema::AUX_TARGET_SCHEMA_VERSION;
+    if (aux_width == static_cast<size_t>(schema::LEGACY_AUX_TARGET_COUNT))
+        contract.aux_target_schema_version = schema::LEGACY_AUX_TARGET_SCHEMA_VERSION;
+    else if (aux_width == static_cast<size_t>(schema::INTERVAL_AUX_TARGET_COUNT_V2))
+        contract.aux_target_schema_version = schema::INTERVAL_AUX_TARGET_SCHEMA_VERSION;
+    else if (aux_width == static_cast<size_t>(schema::AUX_TARGET_COUNT_V3))
+        contract.aux_target_schema_version = schema::GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION;
+    else
+        contract.aux_target_schema_version = schema::AUX_TARGET_SCHEMA_VERSION;
     if (!batch.termination_reason.empty()) {
         const std::int32_t first = batch.termination_reason.front();
         bool same = true;
@@ -251,7 +264,7 @@ inline bool can_export_compact(const std::vector<const TrainingSample*>& samples
     for (const auto* s : samples) {
         if (!s || s->ruleset_hash == 0 || s->chosen_action < 0)
             return false;
-        if (s->aux_target_schema_version >= schema::AUX_TARGET_SCHEMA_VERSION)
+        if (s->aux_target_schema_version >= schema::INTERVAL_AUX_TARGET_SCHEMA_VERSION)
             return false;
         // Compact Replay+ reconstruction only contains player 0's replay
         // stream. A two-board sample also contains the opponent board token
@@ -592,7 +605,10 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
     if (h.version == DatasetHeader::VERSION_COMPACT) {
         return deserialize_compact_dataset(bytes, at);
     }
-    if (h.version != DatasetHeader::VERSION && h.version != DatasetHeader::VERSION_LEGACY) {
+    const bool rectangular_contract =
+        h.version == DatasetHeader::VERSION ||
+        h.version == DatasetHeader::VERSION_RECTANGULAR_V3;
+    if (!rectangular_contract && h.version != DatasetHeader::VERSION_LEGACY) {
         res.error = "unsupported version";
         return res;
     }
@@ -605,7 +621,7 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
     h.ruleset_hash = rd64();
     h.model_version = rd32();
 
-    if (h.version == DatasetHeader::VERSION) {
+    if (rectangular_contract) {
         if (bytes.size() < at + detail::CONTRACT_BYTES) {
             res.error = "truncated contract header";
             return res;
@@ -634,15 +650,27 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
         }
         if (h.aux_target_schema_version == schema::AUX_TARGET_SCHEMA_VERSION &&
             h.aux_targets != static_cast<std::uint32_t>(schema::AUX_TARGET_COUNT)) {
-            res.error = "aux target width does not match its schema";
+            res.error = "aux target width does not match schema v4";
+            return res;
+        }
+        if (h.aux_target_schema_version == schema::GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION &&
+            h.aux_targets != static_cast<std::uint32_t>(schema::AUX_TARGET_COUNT_V3)) {
+            res.error = "aux target width does not match schema v3";
+            return res;
+        }
+        if (h.aux_target_schema_version == schema::INTERVAL_AUX_TARGET_SCHEMA_VERSION &&
+            h.aux_targets != static_cast<std::uint32_t>(schema::INTERVAL_AUX_TARGET_COUNT_V2)) {
+            res.error = "aux target width does not match schema v2";
             return res;
         }
         if (h.aux_target_schema_version == schema::LEGACY_AUX_TARGET_SCHEMA_VERSION &&
             h.aux_targets != static_cast<std::uint32_t>(schema::LEGACY_AUX_TARGET_COUNT)) {
-            res.error = "legacy aux target width does not match its schema";
+            res.error = "legacy aux target width does not match schema v1";
             return res;
         }
         if (h.aux_target_schema_version != schema::AUX_TARGET_SCHEMA_VERSION &&
+            h.aux_target_schema_version != schema::GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION &&
+            h.aux_target_schema_version != schema::INTERVAL_AUX_TARGET_SCHEMA_VERSION &&
             h.aux_target_schema_version != schema::LEGACY_AUX_TARGET_SCHEMA_VERSION) {
             res.error = "unknown aux target schema";
             return res;
@@ -660,11 +688,12 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
     const size_t float_count =
         n * t * TOKEN_FEATURES + n * t + n * a * ACTION_FEATURES + n * a +
         n * a + n + n * h.aux_targets +
-        (h.version == DatasetHeader::VERSION ? n * h.aux_targets : 0);
+        (rectangular_contract ? n * h.aux_targets : 0);
     const size_t metadata_bytes =
-        h.version == DatasetHeader::VERSION
+        rectangular_contract
             ? n * sizeof(std::int32_t) + n * sizeof(std::int32_t) +
-                  n * sizeof(std::uint64_t) + n * sizeof(std::uint32_t)
+                  n * sizeof(std::uint64_t) + n * sizeof(std::uint32_t) +
+                  (h.version == DatasetHeader::VERSION ? n * sizeof(std::int32_t) : 0)
             : 0;
     const size_t need = float_count * sizeof(float) + metadata_bytes;
     if (bytes.size() < at + need) {
@@ -690,7 +719,7 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
     rdf(b.value_target, n);
     rdf(b.aux_target, n * h.aux_targets);
 
-    if (h.version == DatasetHeader::VERSION) {
+    if (rectangular_contract) {
         rdf(b.aux_valid_mask, n * h.aux_targets);
         auto rdi32 = [&]() {
             const std::uint32_t value = rd32();
@@ -704,6 +733,12 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
         for (size_t i = 0; i < n; ++i) b.game_seed[i] = rd64();
         b.move_number.resize(n);
         for (size_t i = 0; i < n; ++i) b.move_number[i] = rd32();
+        if (h.version == DatasetHeader::VERSION) {
+            b.chosen_action.resize(n);
+            for (size_t i = 0; i < n; ++i) b.chosen_action[i] = rdi32();
+        } else {
+            b.chosen_action.assign(n, -1);
+        }
     } else {
         b.aux_valid_mask.assign(n * h.aux_targets, 1.0f);
         b.player_perspective.assign(n, 1);
@@ -711,6 +746,7 @@ inline DatasetReadResult deserialize_dataset(const std::vector<std::uint8_t>& by
             n, static_cast<std::int32_t>(TerminationReason::Unknown));
         b.game_seed.assign(n, 0);
         b.move_number.assign(n, 0);
+        b.chosen_action.assign(n, -1);
     }
 
     res.ok = true;

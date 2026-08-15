@@ -177,11 +177,28 @@ public:
     // auxiliary targets are ground truth rather than predictions.
     void note_outcome_of_last(int attack_sent, int garbage_received) {
         const Tick timestamp = timestamps_.empty() ? 0 : timestamps_.back();
-        note_outcome_of_last(attack_sent, garbage_received, timestamp, false);
+        note_outcome_of_last(attack_sent, garbage_received, 0, 0, timestamp, false);
+    }
+
+    void note_outcome_of_last(int attack_sent, int garbage_received, int garbage_cleared) {
+        const Tick timestamp = timestamps_.empty() ? 0 : timestamps_.back();
+        note_outcome_of_last(attack_sent, garbage_received, garbage_cleared, 0,
+                             timestamp, false);
     }
 
     void note_outcome_of_last(int attack_sent, int garbage_received,
                               Tick timestamp, bool topped_out) {
+        note_outcome_of_last(attack_sent, garbage_received, 0, 0, timestamp, topped_out);
+    }
+
+    void note_outcome_of_last(int attack_sent, int garbage_received, int garbage_cleared,
+                              Tick timestamp, bool topped_out) {
+        note_outcome_of_last(attack_sent, garbage_received, garbage_cleared, 0,
+                             timestamp, topped_out);
+    }
+
+    void note_outcome_of_last(int attack_sent, int garbage_received, int garbage_cleared,
+                              int garbage_cancelled, Tick timestamp, bool topped_out) {
         if (attack_at_.empty()) return;
         const size_t index = attack_at_.size() - 1;
         attack_at_[index] = static_cast<float>(attack_sent);
@@ -193,6 +210,12 @@ public:
         if (garbage_received > 0)
             events_.push_back(TraceEvent{timestamp, index, actor, TraceKind::Garbage,
                                          garbage_received});
+        if (garbage_cleared > 0)
+            events_.push_back(TraceEvent{timestamp, index, actor, TraceKind::GarbageCleared,
+                                         garbage_cleared});
+        if (garbage_cancelled > 0)
+            events_.push_back(TraceEvent{timestamp, index, actor, TraceKind::GarbageCancelled,
+                                         garbage_cancelled});
         if (topped_out) note_topout(actor, timestamp, index);
     }
 
@@ -294,6 +317,8 @@ public:
                 const int end_seconds = horizon_seconds[h];
                 float attack_value = 0.0f;
                 float garbage_value = 0.0f;
+                float garbage_cleared_value = 0.0f;
+                float garbage_cancelled_value = 0.0f;
                 bool self_topout = false;
                 bool opponent_topout = false;
                 for (const TraceEvent& event : events_) {
@@ -306,6 +331,10 @@ public:
                         attack_value += static_cast<float>(event.amount);
                     else if (event.kind == TraceKind::Garbage && self)
                         garbage_value += static_cast<float>(event.amount);
+                    else if (event.kind == TraceKind::GarbageCleared && self)
+                        garbage_cleared_value += static_cast<float>(event.amount);
+                    else if (event.kind == TraceKind::GarbageCancelled && self)
+                        garbage_cancelled_value += static_cast<float>(event.amount);
                     else if (event.kind == TraceKind::Topout) {
                         if (self) self_topout = true;
                         else opponent_topout = true;
@@ -327,9 +356,19 @@ public:
                 s.aux_valid[static_cast<size_t>(garbage_index)] = valid ? 1 : 0;
                 s.aux_valid[static_cast<size_t>(self_topout_index)] = valid ? 1 : 0;
                 s.aux_valid[static_cast<size_t>(opponent_topout_index)] = valid ? 1 : 0;
+                const int garbage_cleared_index = schema::real_garbage_cleared_aux_index(h);
+                s.aux_targets[static_cast<size_t>(garbage_cleared_index)] =
+                    garbage_cleared_value;
+                s.aux_valid[static_cast<size_t>(garbage_cleared_index)] = valid ? 1 : 0;
+                const int garbage_cancelled_index = schema::real_garbage_cancelled_aux_index(h);
+                s.aux_targets[static_cast<size_t>(garbage_cancelled_index)] =
+                    garbage_cancelled_value;
+                s.aux_valid[static_cast<size_t>(garbage_cancelled_index)] = valid ? 1 : 0;
 
                 float placement_attack = 0.0f;
                 float placement_garbage = 0.0f;
+                float placement_garbage_cleared = 0.0f;
+                float placement_garbage_cancelled = 0.0f;
                 bool placement_self_topout = false;
                 bool placement_opponent_topout = false;
                 for (const TraceEvent& event : events_) {
@@ -342,6 +381,10 @@ public:
                         placement_attack += static_cast<float>(event.amount);
                     else if (event.kind == TraceKind::Garbage && self)
                         placement_garbage += static_cast<float>(event.amount);
+                    else if (event.kind == TraceKind::GarbageCleared && self)
+                        placement_garbage_cleared += static_cast<float>(event.amount);
+                    else if (event.kind == TraceKind::GarbageCancelled && self)
+                        placement_garbage_cancelled += static_cast<float>(event.amount);
                     else if (event.kind == TraceKind::Topout) {
                         if (self) placement_self_topout = true;
                         else placement_opponent_topout = true;
@@ -366,6 +409,16 @@ public:
                 s.aux_valid[static_cast<size_t>(p_garbage_index)] = pvalid ? 1 : 0;
                 s.aux_valid[static_cast<size_t>(p_self_topout_index)] = pvalid ? 1 : 0;
                 s.aux_valid[static_cast<size_t>(p_opponent_topout_index)] = pvalid ? 1 : 0;
+                const int p_garbage_cleared_index =
+                    schema::placement_garbage_cleared_aux_index(h);
+                s.aux_targets[static_cast<size_t>(p_garbage_cleared_index)] =
+                    placement_garbage_cleared;
+                s.aux_valid[static_cast<size_t>(p_garbage_cleared_index)] = pvalid ? 1 : 0;
+                const int p_garbage_cancelled_index =
+                    schema::placement_garbage_cancelled_aux_index(h);
+                s.aux_targets[static_cast<size_t>(p_garbage_cancelled_index)] =
+                    placement_garbage_cancelled;
+                s.aux_valid[static_cast<size_t>(p_garbage_cancelled_index)] = pvalid ? 1 : 0;
             }
         }
         std::vector<TrainingSample> out;
@@ -399,7 +452,9 @@ public:
     }
 
 private:
-    enum class TraceKind : std::uint8_t { Attack, Garbage, Topout };
+    enum class TraceKind : std::uint8_t {
+        Attack, Garbage, GarbageCleared, GarbageCancelled, Topout
+    };
     struct TraceEvent {
         Tick timestamp = 0;
         size_t trajectory_index = 0;
