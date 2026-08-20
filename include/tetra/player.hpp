@@ -298,17 +298,10 @@ private:
     bool spawn_next() { return spawn_specific(queue_.pop()); }
 
     bool spawn_specific(Piece p) {
-        active_ = spawn_piece(p, cfg_);
+        active_ = spawn_piece_with_clutch(board_, p, cfg_, state_.combo >= 0);
         if (collides(board_, active_)) {
-            // Guideline block-out: try nudging up once (TETR.IO's clutch spawn).
-            ActivePiece up = active_;
-            up.y += 1;
-            if (cfg_.movement.spawn_above_stack && !collides(board_, up)) {
-                active_ = up;
-            } else {
-                die(TopoutReason::BlockOut);
-                return false;
-            }
+            die(TopoutReason::BlockOut);
+            return false;
         }
         log(EventType::PieceSpawn, active_.type, SpinType::None, 0, 0);
         return true;

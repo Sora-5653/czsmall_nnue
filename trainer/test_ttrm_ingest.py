@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trainer.ttrm_ingest import normalize_document, normalize_file, render_games
+from trainer.ttrm_ingest import _tetrio_7bag_sequence, normalize_document, normalize_file, render_games
 
 
 def empty_board() -> list[list[None]]:
@@ -111,6 +111,42 @@ class TtrmIngestTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(games), 1)
         self.assertEqual(games[0].samples, 2)
+
+    def test_tetrio_seeded_7bag_matches_known_reference_vector(self) -> None:
+        self.assertEqual(
+            _tetrio_7bag_sequence(794425179, 14),
+            list("TIOZLJSOSJZTLI"),
+        )
+
+    def test_real_fresh_full_prefers_seeded_bag_over_falling_placeholder(self) -> None:
+        seed = 794425179
+        first_bag = _tetrio_7bag_sequence(seed, 7)
+        left = stream("i", first_bag, winner=True, frame=10)
+        right = stream("i", first_bag, winner=False, frame=12)
+        for player_stream in (left, right):
+            full = player_stream["events"][0]
+            full["data"]["game"]["bag"] = [piece.lower() for piece in first_bag]
+            full["data"]["stats"] = {"piecesplaced": 0, "combo": 0, "btb": 0}
+            end = player_stream["events"][-1]
+            end["data"]["options"] = {"seed": seed}
+        games, errors = normalize_document({"replay": {"rounds": [{"replays": [left, right]}]}}, "fixture")
+        self.assertEqual(errors, [])
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0].initial[0].current, "T")
+        self.assertTrue(games[0].initial[0].queue.startswith("IOZLJS"))
+        self.assertGreater(len(games[0].initial[0].queue), 7)
+
+    def test_seed_bag_mismatch_rejects_round(self) -> None:
+        seed = 794425179
+        left = stream("i", ["z", "z", "z"], winner=True, frame=10)
+        right = stream("i", ["z", "z", "z"], winner=False, frame=12)
+        for player_stream in (left, right):
+            player_stream["events"][0]["data"]["stats"] = {"piecesplaced": 0}
+            player_stream["events"][-1]["data"]["options"] = {"seed": seed}
+        games, errors = normalize_document({"replay": {"rounds": [{"replays": [left, right]}]}}, "fixture")
+        self.assertEqual(games, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("seed/bag mismatch", errors[0])
 
     def test_bad_round_is_reported_without_poisoning_good_round(self) -> None:
         root = document()

@@ -27,7 +27,7 @@ try:
 except ImportError:  # direct `python trainer/import_human_replays.py`
     from ttrm_ingest import normalize_file, render_game
 
-CACHE_VERSION = 1
+CACHE_VERSION = 5
 IMPORT_RE = re.compile(
     r"games=(?P<games>\d+) turns=(?P<turns>\d+) imported=(?P<imported>\d+) "
     r"invalid=(?P<invalid>\d+) execution=(?P<execution>\d+) unmatched=(?P<unmatched>\d+)"
@@ -114,7 +114,7 @@ def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[li
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             pass
 
-    games, errors, _source_id = normalize_file(path)
+    games, errors, _source_id = normalize_file(path, require_exact=True)
     cached = [CachedGame(str(path), source_hash, game.round_index, game.samples, render_game(game)) for game in games]
     report.games = len(cached)
     report.turns = sum(game.samples for game in cached)
@@ -131,7 +131,13 @@ def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[li
     )
     meta_cache.write_text(
         json.dumps(
-            {"cache_version": CACHE_VERSION, "source": str(path), "source_hash": source_hash, "errors": errors},
+            {
+                "cache_version": CACHE_VERSION,
+                "source": str(path),
+                "source_hash": source_hash,
+                "exact_replay_required": True,
+                "errors": errors,
+            },
             ensure_ascii=False,
             indent=2,
         ) + "\n",
@@ -320,6 +326,7 @@ def main() -> int:
     )
     imported = sum(report.imported for report in shard_reports)
     skipped = sum(report.invalid + report.execution + report.unmatched for report in shard_reports)
+    import_fraction = (imported / total_turns) if total_turns else 0.0
 
     manifest = {
         "format": "tetra-human-replay-manifest-v1",
@@ -334,12 +341,16 @@ def main() -> int:
             "normalized_turns": total_turns,
             "imported_samples": imported,
             "skipped_during_cpp_validation": skipped,
+            "import_fraction": import_fraction,
         },
     }
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {len(shard_reports)} shards / {imported} validated samples; manifest={manifest_path}")
+    print(
+        f"wrote {len(shard_reports)} shards / {imported} validated samples "
+        f"({import_fraction:.1%} of normalized turns); manifest={manifest_path}"
+    )
     if imported == 0:
         return 1
     return 0

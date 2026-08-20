@@ -56,7 +56,22 @@ def build_model(kind: str, header: tetra_dataset.Header) -> TetraFormer:
             ffn=768,
             aux_targets=header.aux_targets,
         )
-    else:
+    elif kind == "teacher1m":
+        # Distillation teacher: deliberately keeps the exact same observation,
+        # action-query and policy/value heads as XS. Only representational
+        # capacity changes, making teacher->student comparisons interpretable.
+        # With the current 32/24 feature contract and 52 aux targets this is
+        # ~0.95M parameters.
+        cfg = TetraFormerConfig(
+            token_features=header.token_features,
+            action_features=header.action_features,
+            width=128,
+            layers=4,
+            heads=4,
+            ffn=384,
+            aux_targets=header.aux_targets,
+        )
+    elif kind in {"dev", "xs"}:
         cfg = TetraFormerConfig(
             token_features=header.token_features,
             action_features=header.action_features,
@@ -66,6 +81,8 @@ def build_model(kind: str, header: tetra_dataset.Header) -> TetraFormer:
             ffn=192,
             aux_targets=header.aux_targets,
         )
+    else:
+        raise ValueError(f"unknown model preset: {kind}")
     return TetraFormer(cfg)
 
 
@@ -202,13 +219,18 @@ def main() -> int:
                     help="training/model seed; keep fixed for paired ablations")
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--model", choices=("dev", "s"), default="dev")
+    ap.add_argument(
+        "--model",
+        choices=("dev", "xs", "teacher1m", "s"),
+        default="dev",
+        help="model preset; xs is the 64x2 lightweight evaluator, teacher1m is the ~0.95M distillation teacher",
+    )
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument(
         "--device",
         default="cpu",
-        help="cpu, or cuda for a GPU. ROCm reports AMD cards through the cuda API, "
-        "so an RX 9070 XT is also --device cuda.",
+        help="cpu, cuda/cuda:N for a GPU, or auto to choose the visible GPU with the most memory. "
+        "ROCm reports AMD cards through the cuda API.",
     )
     ap.add_argument("--resume", default="", help="resume model and optimizer state from a .pt checkpoint")
     ap.add_argument("--reset-optimizer", action="store_true",
@@ -322,6 +344,17 @@ def main() -> int:
     torch.set_num_threads(args.threads)
 
     device = args.device
+    if device == "auto":
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            best = max(
+                range(torch.cuda.device_count()),
+                key=lambda index: torch.cuda.get_device_properties(index).total_memory,
+            )
+            device = f"cuda:{best}"
+        elif args.require_gpu:
+            raise SystemExit("GPU requested but no CUDA/ROCm device is visible to torch")
+        else:
+            device = "cpu"
     if device.startswith("cuda") and not torch.cuda.is_available():
         if args.require_gpu:
             raise SystemExit("GPU requested but no CUDA/ROCm device is visible to torch")

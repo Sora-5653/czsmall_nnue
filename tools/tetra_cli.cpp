@@ -1293,6 +1293,8 @@ int cmd_import_human_replay(int argc, char** argv) {
         stats.games, stats.turns, stats.imported,
         stats.skipped_invalid_state, stats.skipped_execution,
         stats.skipped_no_legal_match);
+    for (const std::string& detail : stats.unmatched_examples)
+        std::printf("unmatched exact: %s\n", detail.c_str());
     std::printf("wrote %s under ruleset %s (%s), model_version=%u\n",
                 argv[3], rules.id.c_str(), rules.hash_hex().c_str(), model_version);
     return 0;

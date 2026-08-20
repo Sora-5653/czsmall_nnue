@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
@@ -35,7 +36,27 @@ class NormalizedState:
 class NormalizedTurn:
     frame: int
     player: int
-    keys: tuple[str, ...]
+    keys: tuple[str, ...] = ()
+    time10: int = -1
+    exact: bool = False
+    pre_rows: tuple[int, ...] = ()
+    pre_garbage_rows: tuple[int, ...] = ()
+    current: str = "-"
+    hold: str = "-"
+    queue: str = ""
+    combo: int = 0
+    b2b: int = 0
+    used_hold: bool = False
+    final_piece: str = "-"
+    final_x: int = 0
+    final_y: int = 0
+    final_rotation: int = 0
+    placement_rows: tuple[int, ...] = ()
+    placement_garbage_rows: tuple[int, ...] = ()
+    post_rows: tuple[int, ...] = ()
+    post_garbage_rows: tuple[int, ...] = ()
+    combo_after: int = 0
+    b2b_after: int = 0
 
 
 @dataclass(frozen=True)
@@ -154,7 +175,57 @@ def _game_from_full(event: dict[str, Any]) -> dict[str, Any]:
     return _first_mapping(data, ("full", "state", "snapshot"))
 
 
-def _extract_state(full_event: dict[str, Any]) -> NormalizedState:
+def _tetrio_7bag_sequence(seed: int, count: int) -> list[str]:
+    """Generate TETR.IO's seeded 7-bag sequence for replay reconstruction.
+
+    TETR.IO replay seeds use MINSTD (16807 mod 2147483647) and Fisher-Yates
+    over the canonical ZLOSIJT input order.  This implementation is local and
+    deliberately tiny; move legality and board mechanics still remain in C++.
+    """
+    if count <= 0:
+        return []
+    modulus = 2147483647
+    state = seed % modulus
+    if state <= 0:
+        state += modulus - 1
+
+    def next_float() -> float:
+        nonlocal state
+        state = (16807 * state) % modulus
+        return (state - 1) / 2147483646
+
+    out: list[str] = []
+    while len(out) < count:
+        bag = list("ZLOSIJT")
+        for index in range(len(bag) - 1, 0, -1):
+            chosen = int(next_float() * (index + 1))
+            bag[index], bag[chosen] = bag[chosen], bag[index]
+        out.extend(bag)
+    return out[:count]
+
+
+def _seed_from_events(events: Sequence[dict[str, Any]]) -> int | None:
+    for event in reversed(events):
+        data = _dict(event.get("data"))
+        candidates = (
+            _dict(data.get("options")).get("seed"),
+            _dict(_dict(data.get("game")).get("options")).get("seed"),
+            data.get("seed"),
+        )
+        for value in candidates:
+            try:
+                if value is not None:
+                    return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _extract_state(
+    full_event: dict[str, Any],
+    *,
+    seeded_sequence: Sequence[str] | None = None,
+) -> NormalizedState:
     game = _game_from_full(full_event)
     if not game:
         raise ValueError("full event has no game snapshot")
@@ -181,6 +252,24 @@ def _extract_state(full_event: dict[str, Any]) -> NormalizedState:
         stats = _dict(_dict(full_event.get("data")).get("stats"))
     combo = _int(stats.get("combo", game.get("combo", -1)), -1)
     b2b = _int(stats.get("btb", stats.get("b2b", game.get("b2b", 0))), 0)
+    pieces_placed = _int(stats.get("piecesplaced", stats.get("pieces_placed", 0)), 0)
+
+    # A fresh TETR.IO multiplayer `full` snapshot contains a placeholder
+    # `falling` object, while `bag` is the actual seeded piece stream beginning
+    # with the first playable piece.  For league replays, prefer the verified
+    # seed stream and require its visible prefix to agree with the snapshot.
+    if seeded_sequence is not None and pieces_placed == 0:
+        seeded = [piece for piece in seeded_sequence if piece in PIECES]
+        if not seeded:
+            raise ValueError("seeded replay produced an empty piece sequence")
+        if q and seeded[: len(q)] != q:
+            raise ValueError(
+                "replay seed/bag mismatch: "
+                f"snapshot={''.join(q)} generated={''.join(seeded[:len(q)])}"
+            )
+        current = seeded[0]
+        q = seeded[1:]
+
     if current == "-":
         raise ValueError("full event has no active/current tetromino")
     return NormalizedState(rows, current, hold, "".join(q), combo, b2b)
@@ -311,15 +400,106 @@ def normalize_round(round_data: Any, source_id: str, round_index: int) -> Normal
     streams = [_events(replay) for replay in replays]
     if any(not stream for stream in streams):
         raise ValueError(f"round {round_index}: empty replay stream")
-    initial = tuple(_extract_state(_first_full(stream)) for stream in streams)
-    turns = [*list(_turns_for_player(streams[0], 0)), *list(_turns_for_player(streams[1], 1))]
+    player_turns = [list(_turns_for_player(streams[0], 0)), list(_turns_for_player(streams[1], 1))]
+    seeds = [_seed_from_events(stream) for stream in streams]
+    common_seed: int | None = None
+    present_seeds = [seed for seed in seeds if seed is not None]
+    if present_seeds:
+        if len(present_seeds) != 2 or present_seeds[0] != present_seeds[1]:
+            raise ValueError(f"round {round_index}: player replay seeds disagree: {seeds}")
+        common_seed = present_seeds[0]
+
+    # Holds can consume one extra queue item, so reserve a generous tail beyond
+    # the observed hard-drop count.  The generated prefix is cross-checked
+    # against each player's snapshot before it is trusted.
+    sequence_count = max(len(player_turns[0]), len(player_turns[1])) + 32
+    sequence = _tetrio_7bag_sequence(common_seed, sequence_count) if common_seed is not None else None
+    initial = tuple(
+        _extract_state(_first_full(stream), seeded_sequence=sequence)
+        for stream in streams
+    )
+    turns = [*player_turns[0], *player_turns[1]]
     turns.sort(key=lambda turn: (turn.frame, turn.player))
     if not turns:
         raise ValueError(f"round {round_index}: no hard-drop turns")
     return NormalizedGame(source_id, round_index, _outcome(streams), initial, tuple(turns))  # type: ignore[arg-type]
 
 
-def normalize_document(root: Any, source_id: str) -> tuple[list[NormalizedGame], list[str]]:
+def normalize_round_exact(round_data: Any, source_id: str, round_index: int) -> NormalizedGame:
+    """Normalize only after both player streams pass exact v19 reconstruction."""
+    try:
+        from .ttrm_exact_replay import reconstruct_round
+    except ImportError:
+        from ttrm_exact_replay import reconstruct_round
+
+    replays = _round_replays(round_data)
+    if len(replays) != 2:
+        raise ValueError(f"round {round_index}: expected exactly two replay streams, got {len(replays)}")
+    streams = [_events(replay) for replay in replays]
+    if any(not stream for stream in streams):
+        raise ValueError(f"round {round_index}: empty replay stream")
+
+    run0, run1 = reconstruct_round(round_data, garbage_column_mode="seed")
+    runs = (run0, run1)
+    turns: list[NormalizedTurn] = []
+    for player, run in enumerate(runs):
+        for placement in run.placements:
+            turns.append(
+                NormalizedTurn(
+                    frame=placement.frame,
+                    player=player,
+                    time10=placement.subframe,
+                    exact=True,
+                    pre_rows=placement.pre_rows,
+                    pre_garbage_rows=placement.pre_garbage_rows,
+                    current=placement.current_before,
+                    hold=placement.hold_before or "-",
+                    queue="".join(placement.queue_before),
+                    combo=placement.combo_before,
+                    b2b=placement.b2b_before,
+                    used_hold=placement.used_hold,
+                    final_piece=placement.piece,
+                    final_x=placement.center_x,
+                    final_y=int(math.floor(placement.center_y + 1e-9)),
+                    final_rotation=placement.rotation,
+                    placement_rows=placement.placement_rows,
+                    placement_garbage_rows=placement.placement_garbage_rows,
+                    post_rows=placement.post_rows,
+                    post_garbage_rows=placement.post_garbage_rows,
+                    combo_after=placement.combo_after,
+                    b2b_after=placement.b2b_after,
+                )
+            )
+    turns.sort(key=lambda turn: (turn.time10, turn.player))
+    if not turns:
+        raise ValueError(f"round {round_index}: exact replay produced no hard-drop turns")
+
+    # INIT is retained for the opponent-state cache before either player acts.
+    first_by_player = []
+    for player, run in enumerate(runs):
+        if not run.placements:
+            raise ValueError(f"round {round_index}: player {player} has no exact placements")
+        first = run.placements[0]
+        first_by_player.append(
+            NormalizedState(
+                rows=first.pre_rows,
+                current=first.current_before,
+                hold=first.hold_before or "-",
+                queue="".join(first.queue_before),
+                combo=first.combo_before,
+                b2b=first.b2b_before,
+            )
+        )
+    initial = (first_by_player[0], first_by_player[1])
+    return NormalizedGame(source_id, round_index, _outcome(streams), initial, tuple(turns))
+
+
+def normalize_document(
+    root: Any,
+    source_id: str,
+    *,
+    require_exact: bool = False,
+) -> tuple[list[NormalizedGame], list[str]]:
     games: list[NormalizedGame] = []
     errors: list[str] = []
     rounds = _rounds(root)
@@ -327,7 +507,11 @@ def normalize_document(root: Any, source_id: str) -> tuple[list[NormalizedGame],
         return [], ["document contains no multiplayer replay rounds"]
     for index, round_data in enumerate(rounds):
         try:
-            games.append(normalize_round(round_data, source_id, index))
+            games.append(
+                normalize_round_exact(round_data, source_id, index)
+                if require_exact
+                else normalize_round(round_data, source_id, index)
+            )
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(str(exc))
     return games, errors
@@ -338,7 +522,11 @@ def source_id_for(path: Path, data: bytes) -> str:
     return f"{path.stem}:{digest}"
 
 
-def normalize_file(path: str | Path) -> tuple[list[NormalizedGame], list[str], str]:
+def normalize_file(
+    path: str | Path,
+    *,
+    require_exact: bool = False,
+) -> tuple[list[NormalizedGame], list[str], str]:
     path = Path(path)
     data = path.read_bytes()
     try:
@@ -346,7 +534,7 @@ def normalize_file(path: str | Path) -> tuple[list[NormalizedGame], list[str], s
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         return [], [f"{path}: invalid JSON: {exc}"], source_id_for(path, data)
     source_id = source_id_for(path, data)
-    games, errors = normalize_document(root, source_id)
+    games, errors = normalize_document(root, source_id, require_exact=require_exact)
     return games, errors, source_id
 
 
@@ -368,7 +556,37 @@ def render_game(game: NormalizedGame) -> str:
         _state_line(1, game.initial[1]),
     ]
     for turn in game.turns:
-        lines.append("\t".join(("TURN", str(turn.frame), str(turn.player), ",".join(turn.keys))))
+        if turn.exact:
+            lines.append(
+                "\t".join(
+                    (
+                        "XTURN",
+                        str(turn.time10),
+                        str(turn.frame),
+                        str(turn.player),
+                        _rows_text(turn.pre_rows),
+                        _rows_text(turn.pre_garbage_rows),
+                        turn.current,
+                        turn.hold,
+                        turn.queue or "-",
+                        str(turn.combo),
+                        str(turn.b2b),
+                        "1" if turn.used_hold else "0",
+                        turn.final_piece,
+                        str(turn.final_x),
+                        str(turn.final_y),
+                        str(turn.final_rotation),
+                        _rows_text(turn.placement_rows),
+                        _rows_text(turn.placement_garbage_rows),
+                        _rows_text(turn.post_rows),
+                        _rows_text(turn.post_garbage_rows),
+                        str(turn.combo_after),
+                        str(turn.b2b_after),
+                    )
+                )
+            )
+        else:
+            lines.append("\t".join(("TURN", str(turn.frame), str(turn.player), ",".join(turn.keys))))
     lines.append("END")
     return "\n".join(lines) + "\n"
 
@@ -382,9 +600,10 @@ def main() -> int:
     parser.add_argument("input", type=Path, help="input .ttrm JSON")
     parser.add_argument("output", type=Path, nargs="?", help="normalized line-protocol output")
     parser.add_argument("--strict", action="store_true", help="fail if any round cannot be normalized")
+    parser.add_argument("--exact", action="store_true", help="require fail-closed exact replay reconstruction")
     args = parser.parse_args()
 
-    games, errors, source_id = normalize_file(args.input)
+    games, errors, source_id = normalize_file(args.input, require_exact=args.exact)
     for error in errors:
         print(f"warning: {error}")
     if not games or (args.strict and errors):

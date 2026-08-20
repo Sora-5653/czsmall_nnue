@@ -45,6 +45,19 @@ struct HumanReplayTurn {
     Tick frame = 0;
     int player = 0;
     std::vector<std::string> keys;
+
+    // Exact-v19 path. Legacy TURN records leave these at defaults and retain
+    // the historical key re-execution adapter for backwards compatibility.
+    std::int64_t order_time10 = 0;
+    bool exact = false;
+    HumanReplayState exact_before;
+    HumanReplayState exact_after;
+    Board exact_placement_board;
+    bool exact_used_hold = false;
+    Piece exact_final_piece = Piece::None;
+    int exact_final_x = 0;   // diagnostic only; Python uses centre coordinates
+    int exact_final_y = 0;   // diagnostic only; board match is authoritative
+    Rot exact_final_rotation = Rot::N;
 };
 
 struct HumanReplayGame {
@@ -62,6 +75,7 @@ struct HumanReplayImportStats {
     std::size_t skipped_invalid_state = 0;
     std::size_t skipped_execution = 0;
     std::size_t skipped_no_legal_match = 0;
+    std::vector<std::string> unmatched_examples;
 };
 
 namespace human_detail {
@@ -115,6 +129,34 @@ inline bool parse_rows(std::string_view text, Board& board, const RulesetConfig&
         }
     }
     board = std::move(parsed);
+    return true;
+}
+
+inline bool parse_rows_with_garbage(std::string_view occupied_text,
+                                    std::string_view garbage_text,
+                                    Board& board,
+                                    const RulesetConfig& rules) {
+    Board occupied;
+    Board garbage;
+    if (!parse_rows(occupied_text, occupied, rules) ||
+        !parse_rows(garbage_text, garbage, rules))
+        return false;
+    for (int y = 0; y < rules.geometry.internal_height; ++y) {
+        const std::uint32_t occ = occupied.row(y);
+        const std::uint32_t gar = garbage.row(y);
+        if ((gar & ~occ) != 0u) return false;
+        occupied.set_garbage_row(y, occ, gar);
+    }
+    board = std::move(occupied);
+    return true;
+}
+
+inline bool same_board(const Board& a, const Board& b) {
+    if (a.width() != b.width() || a.height() != b.height()) return false;
+    for (int y = 0; y < a.height(); ++y) {
+        if (a.row(y) != b.row(y) || a.garbage_row(y) != b.garbage_row(y))
+            return false;
+    }
     return true;
 }
 
@@ -394,6 +436,7 @@ inline bool read_human_replay_protocol(const std::string& path,
             try {
                 turn.frame = static_cast<Tick>(std::stoll(fields[1]));
                 turn.player = std::stoi(fields[2]);
+                turn.order_time10 = static_cast<std::int64_t>(turn.frame) * 10;
             } catch (...) {
                 if (error) *error = "invalid TURN numbers at line " + std::to_string(line_number);
                 return false;
@@ -406,6 +449,51 @@ inline bool read_human_replay_protocol(const std::string& path,
             current.turns.push_back(std::move(turn));
             continue;
         }
+        if (fields[0] == "XTURN") {
+            if (fields.size() != 22) {
+                if (error) *error = "invalid XTURN width at line " + std::to_string(line_number);
+                return false;
+            }
+            HumanReplayTurn turn;
+            turn.exact = true;
+            try {
+                turn.order_time10 = std::stoll(fields[1]);
+                turn.frame = static_cast<Tick>(std::stoll(fields[2]));
+                turn.player = std::stoi(fields[3]);
+                turn.exact_before.combo = std::stoi(fields[9]);
+                turn.exact_before.b2b = std::stoi(fields[10]);
+                turn.exact_used_hold = std::stoi(fields[11]) != 0;
+                turn.exact_final_x = std::stoi(fields[13]);
+                turn.exact_final_y = std::stoi(fields[14]);
+                const int rotation = std::stoi(fields[15]);
+                if (rotation < 0 || rotation > 3) throw std::out_of_range("rotation");
+                turn.exact_final_rotation = static_cast<Rot>(rotation);
+                turn.exact_after.combo = std::stoi(fields[20]);
+                turn.exact_after.b2b = std::stoi(fields[21]);
+            } catch (...) {
+                if (error) *error = "invalid XTURN numbers at line " + std::to_string(line_number);
+                return false;
+            }
+            if (turn.player < 0 || turn.player > 1 ||
+                !human_detail::parse_rows_with_garbage(fields[4], fields[5], turn.exact_before.board, rules) ||
+                !human_detail::parse_rows_with_garbage(fields[16], fields[17], turn.exact_placement_board, rules) ||
+                !human_detail::parse_rows_with_garbage(fields[18], fields[19], turn.exact_after.board, rules)) {
+                if (error) *error = "invalid XTURN board/player at line " + std::to_string(line_number);
+                return false;
+            }
+            turn.exact_before.current = human_detail::parse_piece(fields[6]);
+            turn.exact_before.hold = human_detail::parse_piece(fields[7]);
+            turn.exact_before.queue = human_detail::parse_queue(fields[8]);
+            turn.exact_final_piece = human_detail::parse_piece(fields[12]);
+            turn.exact_before.valid = turn.exact_before.current != Piece::None;
+            turn.exact_after.valid = true;  // only board/combo/B2B are used as opponent context
+            if (!turn.exact_before.valid || turn.exact_final_piece == Piece::None) {
+                if (error) *error = "invalid XTURN pieces at line " + std::to_string(line_number);
+                return false;
+            }
+            current.turns.push_back(std::move(turn));
+            continue;
+        }
         if (fields[0] == "END") {
             if (!current.initial[0].valid || !current.initial[1].valid) {
                 if (error) *error = "GAME missing INIT before END at line " + std::to_string(line_number);
@@ -413,7 +501,11 @@ inline bool read_human_replay_protocol(const std::string& path,
             }
             std::stable_sort(current.turns.begin(), current.turns.end(),
                              [](const HumanReplayTurn& a, const HumanReplayTurn& b) {
-                                 if (a.frame != b.frame) return a.frame < b.frame;
+                                 const std::int64_t at = a.exact ? a.order_time10
+                                                                  : static_cast<std::int64_t>(a.frame) * 10;
+                                 const std::int64_t bt = b.exact ? b.order_time10
+                                                                  : static_cast<std::int64_t>(b.frame) * 10;
+                                 if (at != bt) return at < bt;
                                  return a.player < b.player;
                              });
             games.push_back(std::move(current));
@@ -450,6 +542,169 @@ inline HumanReplayImportStats build_human_replay_samples(
             ++stats.turns;
             const int player = turn.player;
             const int opponent = 1 - player;
+
+            if (turn.exact) {
+                const HumanReplayState& active_state = turn.exact_before;
+                if (!active_state.valid || active_state.current == Piece::None) {
+                    ++stats.skipped_invalid_state;
+                    state[static_cast<std::size_t>(player)] = turn.exact_after;
+                    continue;
+                }
+
+                const Observation obs = human_detail::observation_from_state(
+                    active_state, state[static_cast<std::size_t>(opponent)], turn.frame, rules);
+                const Piece next_after_hold = active_state.queue.empty()
+                                                  ? Piece::None
+                                                  : active_state.queue.front();
+                const std::vector<PlacementAction> actions = movegen.generate(
+                    active_state.board, active_state.current, active_state.hold,
+                    next_after_hold, rules, active_state.combo >= 0);
+                int chosen = -1;
+                Tick best_duration = TICK_NEVER;
+                for (std::size_t i = 0; i < actions.size(); ++i) {
+                    const PlacementAction& action = actions[i];
+                    const bool same_piece_hold_is_canonical_no_hold =
+                        turn.exact_used_hold && !action.use_hold &&
+                        active_state.hold == active_state.current &&
+                        action.final_piece == active_state.current;
+                    if ((!same_piece_hold_is_canonical_no_hold &&
+                         action.use_hold != turn.exact_used_hold) ||
+                        action.final_piece != turn.exact_final_piece)
+                        continue;
+                    const PlacementOutcome candidate =
+                        evaluate_placement(active_state.board, action.piece_state(), rules);
+                    if (!human_detail::same_board(candidate.board, turn.exact_placement_board))
+                        continue;
+                    if (chosen < 0 || action.base_duration < best_duration) {
+                        chosen = static_cast<int>(i);
+                        best_duration = action.base_duration;
+                    }
+                }
+                if (chosen < 0) {
+                    ++stats.skipped_no_legal_match;
+                    if (stats.unmatched_examples.size() < 16) {
+                        int best_diff = 1'000'000;
+                        const PlacementAction* best_action = nullptr;
+                        bool replay_origin_present = false;
+                        int replay_origin_diff = -1;
+                        for (const PlacementAction& action : actions) {
+                            const bool same_piece_hold_is_canonical_no_hold =
+                                turn.exact_used_hold && !action.use_hold &&
+                                active_state.hold == active_state.current &&
+                                action.final_piece == active_state.current;
+                            if ((!same_piece_hold_is_canonical_no_hold &&
+                                 action.use_hold != turn.exact_used_hold) ||
+                                action.final_piece != turn.exact_final_piece)
+                                continue;
+                            const PlacementOutcome candidate =
+                                evaluate_placement(active_state.board, action.piece_state(), rules);
+                            int diff = 0;
+                            for (int y = 0; y < candidate.board.height(); ++y) {
+                                diff += std::popcount(candidate.board.row(y) ^ turn.exact_placement_board.row(y));
+                                diff += std::popcount(candidate.board.garbage_row(y) ^
+                                                      turn.exact_placement_board.garbage_row(y));
+                            }
+                            if (turn.exact_final_piece != Piece::I &&
+                                turn.exact_final_piece != Piece::O &&
+                                action.final_x == turn.exact_final_x - 1 &&
+                                action.final_y == turn.exact_final_y - 1 &&
+                                action.final_rotation == turn.exact_final_rotation) {
+                                replay_origin_present = true;
+                                replay_origin_diff = diff;
+                            }
+                            if (diff < best_diff) {
+                                best_diff = diff;
+                                best_action = &action;
+                            }
+                        }
+                        std::ostringstream detail;
+                        detail << "round=" << game.round_index
+                               << " frame=" << turn.frame
+                               << " player=" << player
+                               << " current=" << piece_name(active_state.current)
+                               << " final=" << piece_name(turn.exact_final_piece)
+                               << " hold=" << (turn.exact_used_hold ? 1 : 0)
+                               << " x=" << turn.exact_final_x
+                               << " y=" << turn.exact_final_y
+                               << " r=" << static_cast<int>(turn.exact_final_rotation)
+                               << " actions=" << actions.size()
+                               << " target_present=" << (replay_origin_present ? 1 : 0)
+                               << " target_diff=" << replay_origin_diff
+                               << " best_diff=" << best_diff;
+                        if (best_action) {
+                            detail << " best_action=(x=" << best_action->final_x
+                                   << ",y=" << best_action->final_y
+                                   << ",r=" << static_cast<int>(best_action->final_rotation)
+                                   << ",dur=" << best_action->base_duration << ")";
+                        }
+                        stats.unmatched_examples.push_back(detail.str());
+                    }
+                    state[static_cast<std::size_t>(player)] = turn.exact_after;
+                    ++move_number[static_cast<std::size_t>(player)];
+                    continue;
+                }
+
+                const PlacementAction& chosen_action = actions[static_cast<std::size_t>(chosen)];
+                const ActivePiece replay_start = spawn_piece_with_clutch(
+                    active_state.board, chosen_action.final_piece, rules,
+                    active_state.combo >= 0);
+                const ExecutionResult reproduced = execute_inputs(
+                    active_state.board, replay_start,
+                    chosen_action.canonical_input_sequence, rules);
+                if (!reproduced.ok || reproduced.piece.x != chosen_action.final_x ||
+                    reproduced.piece.y != chosen_action.final_y ||
+                    reproduced.piece.rot != chosen_action.final_rotation) {
+                    ++stats.skipped_execution;
+                    if (stats.unmatched_examples.size() < 16) {
+                        std::ostringstream detail;
+                        detail << "sequence mismatch round=" << game.round_index
+                               << " frame=" << turn.frame << " player=" << player
+                               << " target=(" << chosen_action.final_x << ','
+                               << chosen_action.final_y << ','
+                               << static_cast<int>(chosen_action.final_rotation) << ")"
+                               << " replayed=(" << reproduced.piece.x << ','
+                               << reproduced.piece.y << ','
+                               << static_cast<int>(reproduced.piece.rot) << ") seq=";
+                        for (const Input input : chosen_action.canonical_input_sequence)
+                            detail << input_name(input) << ',';
+                        stats.unmatched_examples.push_back(detail.str());
+                    }
+                    state[static_cast<std::size_t>(player)] = turn.exact_after;
+                    ++move_number[static_cast<std::size_t>(player)];
+                    continue;
+                }
+
+                TrainingSample sample;
+                sample.tokens = tokenizer.encode(obs, rules).tokens;
+                sample.action_embeddings.reserve(actions.size());
+                for (const PlacementAction& action : actions)
+                    sample.action_embeddings.push_back(embed_action(action, obs.board, rules));
+                sample.search_policy.assign(actions.size(), 0.0f);
+                sample.search_policy[static_cast<std::size_t>(chosen)] = 1.0f;
+                sample.outcome = std::clamp(game.outcome[static_cast<std::size_t>(player)], -1.0f, 1.0f);
+                sample.n_step_return = sample.outcome;
+                sample.search_value = 0.0f;
+                sample.aux_target_schema_version = schema::AUX_TARGET_SCHEMA_VERSION;
+                sample.aux_targets.fill(0.0f);
+                sample.aux_valid.fill(0);
+                sample.termination_reason = TerminationReason::Terminated;
+                sample.player_index = player;
+                sample.value_perspective = 1;
+                sample.timestamp = turn.frame;
+                sample.trajectory_index = move_number[static_cast<std::size_t>(player)];
+                sample.ruleset_hash = rules.hash();
+                sample.game_seed = source_hash;
+                sample.model_version = model_version;
+                sample.move_number = move_number[static_cast<std::size_t>(player)];
+                sample.chosen_action = chosen;
+                samples.push_back(std::move(sample));
+                ++stats.imported;
+
+                state[static_cast<std::size_t>(player)] = turn.exact_after;
+                ++move_number[static_cast<std::size_t>(player)];
+                continue;
+            }
+
             HumanReplayState& active_state = state[static_cast<std::size_t>(player)];
             if (!active_state.valid || active_state.current == Piece::None) {
                 ++stats.skipped_invalid_state;
@@ -470,7 +725,7 @@ inline HumanReplayImportStats build_human_replay_samples(
                                               : active_state.queue.front();
             const std::vector<PlacementAction> actions = movegen.generate(
                 active_state.board, active_state.current, active_state.hold,
-                next_after_hold, rules);
+                next_after_hold, rules, active_state.combo >= 0);
             int chosen = -1;
             Tick best_duration = TICK_NEVER;
             for (std::size_t i = 0; i < actions.size(); ++i) {

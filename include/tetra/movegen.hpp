@@ -31,18 +31,22 @@ public:
 
     std::vector<PlacementAction> generate_for_piece(const Board& board, Piece piece,
                                                     const RulesetConfig& cfg,
-                                                    bool use_hold) const;
+                                                    bool use_hold,
+                                                    bool allow_clutch = false) const;
 
     std::vector<PlacementAction> generate(const Board& board, Piece current, Piece hold_piece,
                                           Piece next_after_hold,
-                                          const RulesetConfig& cfg) const {
-        std::vector<PlacementAction> out = generate_for_piece(board, current, cfg, false);
+                                          const RulesetConfig& cfg,
+                                          bool allow_clutch = false) const {
+        std::vector<PlacementAction> out =
+            generate_for_piece(board, current, cfg, false, allow_clutch);
         if (!options_.include_hold || !cfg.randomizer.hold_enabled) return out;
 
         const Piece swapped = (hold_piece != Piece::None) ? hold_piece : next_after_hold;
         if (swapped == Piece::None || swapped == current) return out;
 
-        std::vector<PlacementAction> held = generate_for_piece(board, swapped, cfg, true);
+        std::vector<PlacementAction> held =
+            generate_for_piece(board, swapped, cfg, true, allow_clutch);
         out.insert(out.end(), held.begin(), held.end());
         return out;
     }

@@ -9,6 +9,7 @@ auxiliary heads remain the job of self-play/Reanalyze after bootstrap.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,37 @@ def run(command: list[str], root: Path, dry_run: bool) -> None:
     print("+", " ".join(command), flush=True)
     if not dry_run:
         subprocess.run(command, cwd=str(root), check=True)
+
+
+def manifest_shards(output_dir: Path) -> list[Path]:
+    """Return exactly the shards selected by the latest import manifest.
+
+    Old shard files are intentionally not deleted: a changed sharding target can
+    leave earlier generated files in the directory, and globbing all of them
+    would duplicate examples.  Manifest paths may have been written by WSL or
+    Windows, so only the filename is carried across the runtime boundary.
+    """
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return sorted(output_dir.glob("*.tetradat")) if output_dir.exists() else []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    items = manifest.get("shards", []) if isinstance(manifest, dict) else []
+    if not isinstance(items, list):
+        raise SystemExit(f"invalid shard list in {manifest_path}")
+    shards: list[Path] = []
+    seen: set[Path] = set()
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            continue
+        name = Path(item["path"].replace("\\", "/")).name
+        candidate = output_dir / name
+        if candidate not in seen:
+            shards.append(candidate)
+            seen.add(candidate)
+    missing = [path for path in shards if not path.exists()]
+    if missing:
+        raise SystemExit(f"manifest references missing human replay shard: {missing[0]}")
+    return shards
 
 
 def main() -> int:
@@ -32,6 +64,12 @@ def main() -> int:
     ap.add_argument("--model-version", type=int, default=0)
     ap.add_argument("--force-import", action="store_true")
     ap.add_argument("--strict-source", action="store_true")
+    ap.add_argument(
+        "--min-import-fraction",
+        type=float,
+        default=0.0,
+        help="refuse training when validated samples / normalized hard-drop turns falls below this fraction",
+    )
     ap.add_argument("--skip-import", action="store_true", help="train from existing shards only")
 
     ap.add_argument("--save", default="models/human_pretrain.pt")
@@ -39,7 +77,12 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--model", choices=("dev", "s"), default="dev")
+    ap.add_argument(
+        "--model",
+        choices=("dev", "xs", "s"),
+        default="xs",
+        help="model preset; xs is the named 64x2 lightweight transformer used by the size-ablation baseline",
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--require-gpu", action="store_true")
@@ -53,6 +96,8 @@ def main() -> int:
 
     if args.steps < 0 or args.batch <= 0 or args.samples_per_shard <= 0:
         raise SystemExit("steps must be non-negative; batch and samples-per-shard must be positive")
+    if not 0.0 <= args.min_import_fraction <= 1.0:
+        raise SystemExit("--min-import-fraction must be in [0, 1]")
 
     root = Path(__file__).resolve().parents[1]
     py = sys.executable
@@ -81,7 +126,21 @@ def main() -> int:
             import_cmd.append("--strict-source")
         run(import_cmd, root, args.dry_run)
 
-    shards = sorted(output_dir.glob("*.tetradat")) if output_dir.exists() else []
+    if not args.dry_run and args.min_import_fraction > 0.0:
+        manifest_path = output_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise SystemExit(f"missing human replay manifest for quality gate: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        totals = manifest.get("totals", {}) if isinstance(manifest, dict) else {}
+        fraction = float(totals.get("import_fraction", 0.0))
+        if fraction < args.min_import_fraction:
+            raise SystemExit(
+                f"human replay quality gate failed: import_fraction={fraction:.3f} "
+                f"< required {args.min_import_fraction:.3f}; inspect reconstruction before training"
+            )
+        print(f"human replay quality gate: import_fraction={fraction:.1%}", flush=True)
+
+    shards = manifest_shards(output_dir)
     if args.dry_run and not shards:
         shards = [output_dir / "human_*.tetradat"]
     if not shards:

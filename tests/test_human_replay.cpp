@@ -85,6 +85,50 @@ TEST(human_replay_hold_is_matched_against_hold_action) {
     CHECK_EQ(actions[static_cast<std::size_t>(sample.chosen_action)].final_piece, Piece::I);
 }
 
+TEST(exact_same_piece_hold_canonicalizes_to_no_hold_action) {
+    const RulesetConfig rules = RulesetConfig::tetra_league();
+    HumanReplayGame game = one_turn_game(rules, {});
+    game.turns.clear();
+    game.initial[0] = empty_state(
+        rules, Piece::T, Piece::T,
+        {Piece::O, Piece::S, Piece::Z, Piece::J, Piece::L});
+
+    MoveGenerator movegen;
+    const HumanReplayState& before = game.initial[0];
+    const auto actions = movegen.generate(
+        before.board, before.current, before.hold, before.queue.front(), rules);
+    CHECK(!actions.empty());
+    CHECK(std::none_of(actions.begin(), actions.end(),
+                       [](const PlacementAction& action) { return action.use_hold; }));
+
+    const PlacementAction& target = actions.front();
+    const PlacementOutcome target_outcome =
+        evaluate_placement(before.board, target.piece_state(), rules);
+
+    HumanReplayTurn turn;
+    turn.frame = 12;
+    turn.player = 0;
+    turn.exact = true;
+    turn.exact_before = before;
+    turn.exact_after = before;
+    turn.exact_placement_board = target_outcome.board;
+    turn.exact_used_hold = true;
+    turn.exact_final_piece = Piece::T;
+    turn.exact_final_x = target.final_x + 1;
+    turn.exact_final_y = target.final_y + 1;
+    turn.exact_final_rotation = target.final_rotation;
+    game.turns.push_back(std::move(turn));
+
+    std::vector<TrainingSample> samples;
+    const HumanReplayImportStats stats =
+        build_human_replay_samples({game}, rules, 0, samples);
+    CHECK_EQ(stats.imported, static_cast<std::size_t>(1));
+    CHECK_EQ(stats.skipped_no_legal_match, static_cast<std::size_t>(0));
+    CHECK_EQ(samples.size(), static_cast<std::size_t>(1));
+    CHECK(samples.front().chosen_action >= 0);
+    CHECK(!actions[static_cast<std::size_t>(samples.front().chosen_action)].use_hold);
+}
+
 TEST(human_replay_missing_hard_drop_is_rejected_not_fabricated) {
     const RulesetConfig rules = RulesetConfig::tetra_league();
     std::vector<TrainingSample> samples;

@@ -457,7 +457,7 @@ private:
             auto actions = gen.generate(
                 active.board(), active.active().type, active.hold(),
                 active.visible_next().empty() ? Piece::None : active.visible_next()[0],
-                rules);
+                rules, active.attack_state().combo >= 0);
             const Tick next_activation = active.garbage().next_activation(active.now());
             if (sc.enable_timing_actions && next_activation != TICK_NEVER &&
                 !actions.empty()) {

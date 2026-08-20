@@ -19,12 +19,14 @@
 
 namespace tetra {
 
-template <Cobra::Policy::KickRule Kick, bool Enable180, bool TrackTSpin>
+template <Cobra::Policy::KickRule Kick, bool Enable180, bool TrackTSpin, int SpawnY = 21>
 struct CobraRules : Cobra::RulesetBase {
     static constexpr Cobra::Policy::KickRule KICKS = Kick;
     static constexpr Cobra::Policy::SpinRule SPINS =
         TrackTSpin ? Cobra::Policy::SpinRule::TSPIN : Cobra::Policy::SpinRule::NONE;
-    static constexpr int SPAWN_Y = 20;
+    // TETR.IO v19 spawn centre maps to ~21.04 in the bottom-up board used by
+    // this adapter. Cobra uses an integer distinguished-cell coordinate.
+    static constexpr int SPAWN_Y = SpawnY;
     static constexpr bool ENABLE_180 = Enable180;
 };
 
@@ -75,13 +77,15 @@ inline bool map_cobra_input(Cobra::PathFinder::Input in, Input& out) {
 
 inline bool gravity_reachable(const Board& board, Piece piece, const std::vector<Input>& sequence,
                               const RulesetConfig& cfg,
-                              const MoveGenerator::Options& options) {
+                              const MoveGenerator::Options& options,
+                              int spawn_y) {
     const HandlingModel h = HandlingModel::from(cfg);
     if (!options.enforce_gravity || h.gravity_num <= 0 ||
         h.ticks_per_cell() > options.gravity_check_threshold)
         return true;
 
-    const ActivePiece start = spawn_piece(piece, cfg);
+    ActivePiece start = spawn_piece(piece, cfg);
+    start.y += spawn_y - 21;
     std::vector<Input> prefix;
     prefix.reserve(sequence.size());
     for (const Input in : sequence) {
@@ -165,7 +169,7 @@ inline bool map_cobra_path(const Cobra::PathFinder::Inputs& path, bool use_hold,
     return true;
 }
 
-template <typename MoveRules, typename PathRules, Cobra::Piece CP>
+template <typename MoveRules, typename PathRules, Cobra::Piece CP, int SpawnY>
 void collect_piece(const BoardView& view, const Board& source, Piece tetra_piece,
                    bool use_hold, const RulesetConfig& cfg,
                    const MoveGenerator::Options& options, std::vector<PlacementAction>& out,
@@ -185,12 +189,13 @@ void collect_piece(const BoardView& view, const Board& source, Piece tetra_piece
                               map_cobra_path(tap_it->second, use_hold, tap_sequence);
         const bool have_finesse = finesse_it != finesse_paths.end() &&
                                   map_cobra_path(finesse_it->second, use_hold, finesse_sequence);
+        ActivePiece start = spawn_piece(tetra_piece, cfg);
+        start.y += SpawnY - 21;
         ExecutionResult tap_result, finesse_result;
         if (have_tap)
-            tap_result = execute_inputs(source, spawn_piece(tetra_piece, cfg), tap_sequence, cfg);
+            tap_result = execute_inputs(source, start, tap_sequence, cfg);
         if (have_finesse)
-            finesse_result =
-                execute_inputs(source, spawn_piece(tetra_piece, cfg), finesse_sequence, cfg);
+            finesse_result = execute_inputs(source, start, finesse_sequence, cfg);
         if (!tap_result.ok && !finesse_result.ok) return;
         if (!tap_result.ok ||
             (finesse_result.ok &&
@@ -201,10 +206,9 @@ void collect_piece(const BoardView& view, const Board& source, Piece tetra_piece
         } else {
             sequence = std::move(tap_sequence);
         }
-        if (!gravity_reachable(source, tetra_piece, sequence, cfg, options)) return;
+        if (!gravity_reachable(source, tetra_piece, sequence, cfg, options, SpawnY)) return;
 
-        const ExecutionResult full =
-            execute_inputs(source, spawn_piece(tetra_piece, cfg), sequence, cfg);
+        const ExecutionResult full = execute_inputs(source, start, sequence, cfg);
         if (!full.ok) return;
 
         ActivePiece landed = full.piece;
@@ -229,7 +233,7 @@ void collect_piece(const BoardView& view, const Board& source, Piece tetra_piece
     });
 }
 
-template <typename MoveRules, typename PathRules>
+template <typename MoveRules, typename PathRules, int SpawnY>
 void collect_piece(const BoardView& view, const Board& source, Piece piece, bool use_hold,
                    const RulesetConfig& cfg, const MoveGenerator::Options& options,
                    std::vector<PlacementAction>& out,
@@ -237,43 +241,43 @@ void collect_piece(const BoardView& view, const Board& source, Piece piece, bool
                    const bool spin_only) {
     switch (piece) {
         case Piece::I:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::I>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::I, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::J:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::J>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::J, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::L:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::L>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::L, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::O:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::O>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::O, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::S:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::S>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::S, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::T:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::T>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::T, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::Z:
-            collect_piece<MoveRules, PathRules, Cobra::Piece::Z>(
+            collect_piece<MoveRules, PathRules, Cobra::Piece::Z, SpawnY>(
                 view, source, piece, use_hold, cfg, options, out, by_outcome, spin_only);
             break;
         case Piece::None: break;
     }
 }
 
-template <Cobra::Policy::KickRule Kick, bool Enable180>
+template <Cobra::Policy::KickRule Kick, bool Enable180, int SpawnY>
 void collect_with_kick(const BoardView& view, const Board& source, Piece piece, bool use_hold,
                        const RulesetConfig& cfg, const MoveGenerator::Options& options,
                        std::vector<PlacementAction>& out,
                        std::unordered_map<std::uint64_t, size_t>& by_outcome) {
-    using PathRules = CobraRules<Kick, Enable180, true>;
+    using PathRules = CobraRules<Kick, Enable180, true, SpawnY>;
     if (piece == Piece::T && cfg.clear_rules.spin_detection != SpinDetection::None) {
         // The non-spin MoveList is the complete reachable-placement set.  The
         // spin-aware list is an additional Cobra pass for alternate paths that
@@ -281,14 +285,14 @@ void collect_with_kick(const BoardView& view, const Board& source, Piece piece, 
         // important: Cobra's spin reachability bitmap is provenance-aware and
         // must not suppress a plain landing which is mirror-equivalent to a
         // spin landing on another board.
-        collect_piece<CobraRules<Kick, Enable180, false>,
-                      PathRules>(
+        collect_piece<CobraRules<Kick, Enable180, false, SpawnY>,
+                      PathRules, SpawnY>(
             view, source, piece, use_hold, cfg, options, out, by_outcome, false);
-        collect_piece<CobraRules<Kick, Enable180, true>, PathRules>(
+        collect_piece<CobraRules<Kick, Enable180, true, SpawnY>, PathRules, SpawnY>(
             view, source, piece, use_hold, cfg, options, out, by_outcome, true);
     } else {
-        collect_piece<CobraRules<Kick, Enable180, false>,
-                      CobraRules<Kick, Enable180, false>>(
+        collect_piece<CobraRules<Kick, Enable180, false, SpawnY>,
+                      CobraRules<Kick, Enable180, false, SpawnY>, SpawnY>(
             view, source, piece, use_hold, cfg, options, out, by_outcome, false);
     }
 }
@@ -297,30 +301,47 @@ void collect_with_kick(const BoardView& view, const Board& source, Piece piece, 
 
 std::vector<PlacementAction> MoveGenerator::generate_for_piece(const Board& board, Piece piece,
                                                                 const RulesetConfig& cfg,
-                                                                bool use_hold) const {
+                                                                bool use_hold,
+                                                                bool allow_clutch) const {
     std::vector<PlacementAction> out;
     if (!cobra_geometry(board, cfg) || piece == Piece::None) return out;
+
+    const ActivePiece start = spawn_piece_with_clutch(board, piece, cfg, allow_clutch);
+    if (collides(board, start)) return out;
+    // Tetra stores the bottom of the SRS bounding box, while Cobra stores the
+    // distinguished occupied cell. Convert the normal-or-clutched Tetra origin
+    // back to Cobra's coordinate before choosing the compile-time ruleset.
+    const int spawn_y = start.y + shape_of(piece, Rot::N).min_dy;
+    // Current Cobra adaptation has explicit v19 instantiations for the normal
+    // spawn and the observed one-row clutch spawn. Higher clutch starts remain
+    // fail-closed until a corpus demonstrates that they are required.
+    if (spawn_y != 21 && spawn_y != 22) return out;
 
     const BoardView view = to_cobra_board(board);
     std::unordered_map<std::uint64_t, size_t> by_outcome;
 
+    const auto collect_srs = [&]<Cobra::Policy::KickRule Kick, bool Enable180>() {
+        if (spawn_y == 22)
+            collect_with_kick<Kick, Enable180, 22>(
+                view, board, piece, use_hold, cfg, options_, out, by_outcome);
+        else
+            collect_with_kick<Kick, Enable180, 21>(
+                view, board, piece, use_hold, cfg, options_, out, by_outcome);
+    };
+
     switch (cfg.movement.kick_table) {
         case KickTableId::SRS:
             if (options_.allow_180 && cfg.movement.allow_180)
-                collect_with_kick<Cobra::Policy::KickRule::SRS, true>(
-                    view, board, piece, use_hold, cfg, options_, out, by_outcome);
+                collect_srs.template operator()<Cobra::Policy::KickRule::SRS, true>();
             else
-                collect_with_kick<Cobra::Policy::KickRule::SRS, false>(
-                    view, board, piece, use_hold, cfg, options_, out, by_outcome);
+                collect_srs.template operator()<Cobra::Policy::KickRule::SRS, false>();
             break;
         case KickTableId::SRS_PLUS:
         case KickTableId::SRS_X:
             if (options_.allow_180 && cfg.movement.allow_180)
-                collect_with_kick<Cobra::Policy::KickRule::SRS_PLUS, true>(
-                    view, board, piece, use_hold, cfg, options_, out, by_outcome);
+                collect_srs.template operator()<Cobra::Policy::KickRule::SRS_PLUS, true>();
             else
-                collect_with_kick<Cobra::Policy::KickRule::SRS_PLUS, false>(
-                    view, board, piece, use_hold, cfg, options_, out, by_outcome);
+                collect_srs.template operator()<Cobra::Policy::KickRule::SRS_PLUS, false>();
             break;
         case KickTableId::None:
             break;

@@ -102,7 +102,7 @@ public:
             auto actions =
                 movegen_.generate(p_active.board(), p_active.active().type, p_active.hold(),
                                   p_active.visible_next().empty() ? Piece::None : p_active.visible_next()[0],
-                                  rules);
+                                  rules, p_active.attack_state().combo >= 0);
             const Tick next_activation = p_active.garbage().next_activation(p_active.now());
             if (sc.enable_timing_actions && next_activation != TICK_NEVER &&
                 !actions.empty()) {

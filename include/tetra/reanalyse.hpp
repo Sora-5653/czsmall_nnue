@@ -95,7 +95,8 @@ inline ReconstructionReport reconstruct_historical_roots(
 
         std::vector<PlacementAction> actions = movegen.generate(
             active.board(), active.active().type, active.hold(),
-            active.visible_next().empty() ? Piece::None : active.visible_next()[0], rules);
+            active.visible_next().empty() ? Piece::None : active.visible_next()[0], rules,
+            active.attack_state().combo >= 0);
         if (enable_timing_actions) {
             const Tick activation = active.garbage().next_activation(active.now());
             if (activation != TICK_NEVER && !actions.empty()) {

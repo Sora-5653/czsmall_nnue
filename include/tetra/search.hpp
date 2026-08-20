@@ -639,7 +639,7 @@ private:
         n.actions = movegen_.generate(state.board(), state.active().type, state.hold(),
                                       state.visible_next().empty() ? Piece::None
                                                                    : state.visible_next()[0],
-                                      cfg);
+                                      cfg, state.attack_state().combo >= 0);
         const Tick next_activation = state.garbage().next_activation(state.now());
         if (cfg_.enable_timing_actions && next_activation != TICK_NEVER &&
             !n.actions.empty()) {

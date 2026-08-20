@@ -129,6 +129,7 @@ RulesetConfig RulesetConfig::guideline() {
     c.version = 1;
     c.movement.kick_table = KickTableId::SRS;
     c.movement.allow_180 = false;
+    c.movement.spawn_above_stack = false;
     c.clear_rules.spin_detection = SpinDetection::TSpin;
     c.attack.b2b_mode = B2BMode::Chaining;
     c.attack.single = 0;
