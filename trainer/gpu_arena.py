@@ -10,11 +10,14 @@ resident on the selected GPU and serves the requests over one binary pipe.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+import json
 import math
 import os
 import queue
 import struct
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 
@@ -26,6 +29,7 @@ from gpu_match import (
     AsyncStreamingInferenceDispatcher,
     ChildFailed,
     ChildFinished,
+    ChildStderrDrainer,
     GpuRequest,
     StreamingInferenceQueue,
     answer_request,
@@ -41,6 +45,50 @@ ARENA_FORMAT = "<4I29fI"
 PAIR_SEED_STRIDE = 0x9E3779B97F4A7C15
 UINT64_MASK = (1 << 64) - 1
 PROMOTION_THRESHOLD = 0.55
+
+
+@dataclass(frozen=True)
+class ArenaProtocolConfig:
+    """Arguments shared by serial and parallel Arena protocol children."""
+
+    sims: int
+    pieces: int
+    batch_size: int
+    determinizations: int
+    use_gumbel: bool
+    candidate_sims: int = -1
+    champion_sims: int = -1
+    candidate_gumbel: int = -1
+    champion_gumbel: int = -1
+    gumbel_c_scale: float = 0.01
+    gumbel_noise_scale: float = 0.05
+    candidate_timing_actions: int = -1
+    champion_timing_actions: int = -1
+    candidate_gumbel_noise_scale: float = -1.0
+    champion_gumbel_noise_scale: float = -1.0
+
+    def command(self, engine: str, pairs: int, seed: int) -> list[str]:
+        return [
+            engine,
+            "gpu-arena-protocol",
+            str(max(1, pairs)),
+            str(max(1, self.sims)),
+            str(max(1, self.pieces)),
+            str(max(1, self.batch_size)),
+            str(max(1, self.determinizations)),
+            "1" if self.use_gumbel else "0",
+            str(max(0, seed) & UINT64_MASK),
+            str(self.candidate_sims),
+            str(self.champion_sims),
+            str(self.candidate_gumbel),
+            str(self.champion_gumbel),
+            f"{self.gumbel_c_scale:.9g}",
+            f"{self.gumbel_noise_scale:.9g}",
+            str(self.candidate_timing_actions),
+            str(self.champion_timing_actions),
+            f"{self.candidate_gumbel_noise_scale:.9g}",
+            f"{self.champion_gumbel_noise_scale:.9g}",
+        ]
 
 
 def _arena_result_from_values(values) -> dict[str, int | float]:
@@ -88,29 +136,6 @@ def _read_arena_result(proc: subprocess.Popen) -> dict[str, int | float]:
         ARENA_FORMAT, read_exact(proc.stdout, struct.calcsize(ARENA_FORMAT))
     )
     return _arena_result_from_values(values)
-
-
-def _start_stderr_drain(proc: subprocess.Popen) -> tuple[list[bytes], threading.Thread]:
-    """Drain child diagnostics while stdout/protocol processing is active.
-
-    The C++ child emits a per-decision diagnostics JSON line after the binary
-    result frame.  Waiting for the child before reading stderr can deadlock
-    once that pipe reaches its OS buffer limit.
-    """
-    assert proc.stderr is not None
-    chunks: list[bytes] = []
-
-    def drain() -> None:
-        assert proc.stderr is not None
-        while True:
-            chunk = proc.stderr.read(64 * 1024)
-            if not chunk:
-                return
-            chunks.append(chunk)
-
-    thread = threading.Thread(target=drain, name="gpu-arena-stderr-drain", daemon=True)
-    thread.start()
-    return chunks, thread
 
 
 def _wilson_ci(p: float, n: int) -> tuple[float, float]:
@@ -213,38 +238,12 @@ def _aggregate_arena_results(results: list[dict[str, int | float]]) -> dict[str,
     }
 
 
-def _evaluate_serial(candidate: torch.nn.Module, champion: torch.nn.Module, device: torch.device,
-             engine: str, pairs: int, sims: int, pieces: int, batch_size: int,
-             determinizations: int, use_gumbel: bool, precision: str, seed: int,
-             candidate_sims: int = -1, champion_sims: int = -1,
-             candidate_gumbel: int = -1, champion_gumbel: int = -1,
-             gumbel_c_scale: float = 0.01, gumbel_noise_scale: float = 0.05,
-             candidate_timing_actions: int = -1, champion_timing_actions: int = -1,
-             candidate_gumbel_noise_scale: float = -1.0,
-             champion_gumbel_noise_scale: float = -1.0
-             ) -> tuple[dict[str, int | float], float]:
+def _evaluate_serial(candidate: torch.nn.Module, champion: torch.nn.Module,
+                     device: torch.device, engine: str, pairs: int,
+                     protocol: ArenaProtocolConfig, precision: str,
+                     seed: int) -> tuple[dict[str, int | float], float]:
     proc = subprocess.Popen(
-        [
-            engine,
-            "gpu-arena-protocol",
-            str(max(1, pairs)),
-            str(max(1, sims)),
-            str(max(1, pieces)),
-            str(max(1, batch_size)),
-            str(max(1, determinizations)),
-            "1" if use_gumbel else "0",
-            str(max(0, seed)),
-            str(candidate_sims),
-            str(champion_sims),
-            str(candidate_gumbel),
-            str(champion_gumbel),
-            f"{gumbel_c_scale:.9g}",
-            f"{gumbel_noise_scale:.9g}",
-            str(candidate_timing_actions),
-            str(champion_timing_actions),
-            f"{candidate_gumbel_noise_scale:.9g}",
-            f"{champion_gumbel_noise_scale:.9g}",
-        ],
+        protocol.command(engine, pairs, seed),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -253,7 +252,7 @@ def _evaluate_serial(candidate: torch.nn.Module, champion: torch.nn.Module, devi
     assert proc.stdin is not None
     assert proc.stdout is not None
     assert proc.stderr is not None
-    stderr_chunks, stderr_thread = _start_stderr_drain(proc)
+    stderr = ChildStderrDrainer(proc, "gpu-arena-stderr-drain")
 
     models = {0: candidate, 1: champion}
     inference_seconds = 0.0
@@ -267,35 +266,26 @@ def _evaluate_serial(candidate: torch.nn.Module, champion: torch.nn.Module, devi
                 result = _read_arena_result(proc)
                 break
             raise RuntimeError(f"unexpected GPU Arena protocol frame: {magic!r}")
-    except Exception:
+    except BaseException:
         proc.kill()
         proc.wait()
-        stderr_thread.join(timeout=2.0)
+        stderr.finish()
         raise
 
     proc.stdin.close()
     return_code = proc.wait()
-    stderr_thread.join(timeout=2.0)
-    error = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+    error = stderr.finish()
     if return_code != 0:
         raise RuntimeError(f"tetra_cli GPU Arena child failed with {return_code}: {error}")
     return result, inference_seconds
 
 
 def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
-                       device: torch.device, engine: str, pairs: int, sims: int,
-                       pieces: int, batch_size: int, determinizations: int,
-                       use_gumbel: bool, precision: str, seed: int, workers: int,
+                       device: torch.device, engine: str, pairs: int,
+                       protocol: ArenaProtocolConfig, precision: str,
+                       seed: int, workers: int,
                        batch_window_ms: float, target_positions: int = 512,
-                       inflight_batches: int = 2, gpu_workers: int = 2,
-                       candidate_sims: int = -1,
-                       champion_sims: int = -1, candidate_gumbel: int = -1,
-                       champion_gumbel: int = -1, gumbel_c_scale: float = 0.01,
-                       gumbel_noise_scale: float = 0.05,
-                       candidate_timing_actions: int = -1,
-                       champion_timing_actions: int = -1,
-                       candidate_gumbel_noise_scale: float = -1.0,
-                       champion_gumbel_noise_scale: float = -1.0
+                       inflight_batches: int = 2, gpu_workers: int = 2
                        ) -> tuple[dict[str, int | float], float]:
     """Run independent factorial Arena pairs concurrently through one GPU queue."""
     total_pairs = max(1, pairs)
@@ -305,7 +295,9 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
     models = {0: candidate, 1: champion}
     batcher = StreamingInferenceQueue(
         models, device, precision,
-        target_positions=max(1, min(batch_size * max_workers, target_positions)),
+        target_positions=max(
+            1, min(protocol.batch_size * max_workers, target_positions)
+        ),
         window_ms=max(0.0, batch_window_ms),
     )
     dispatcher = AsyncStreamingInferenceDispatcher(
@@ -322,34 +314,16 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
     def launch(pair_index: int) -> None:
         pair_seed = (int(seed) + pair_index * PAIR_SEED_STRIDE) & UINT64_MASK
         proc = subprocess.Popen(
-            [
-                engine,
-                "gpu-arena-protocol",
-                "1",
-                str(max(1, sims)),
-                str(max(1, pieces)),
-                str(max(1, batch_size)),
-                str(max(1, determinizations)),
-                "1" if use_gumbel else "0",
-                str(pair_seed),
-                str(candidate_sims),
-                str(champion_sims),
-                str(candidate_gumbel),
-                str(champion_gumbel),
-                f"{gumbel_c_scale:.9g}",
-                f"{gumbel_noise_scale:.9g}",
-                str(candidate_timing_actions),
-                str(champion_timing_actions),
-                f"{candidate_gumbel_noise_scale:.9g}",
-                f"{champion_gumbel_noise_scale:.9g}",
-            ],
+            protocol.command(engine, 1, pair_seed),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
         )
         processes[pair_index] = proc
-        stderr_chunks, stderr_thread = _start_stderr_drain(proc)
+        stderr = ChildStderrDrainer(
+            proc, f"gpu-arena-stderr-drain-{pair_index}"
+        )
 
         def reader() -> None:
             try:
@@ -361,9 +335,10 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
                         continue
                     if magic == ARENA_MAGIC:
                         result = _read_arena_result(proc)
+                        assert proc.stdin is not None
+                        proc.stdin.close()
                         return_code = proc.wait()
-                        stderr_thread.join(timeout=2.0)
-                        error = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+                        error = stderr.finish()
                         if return_code != 0:
                             raise RuntimeError(
                                 f"tetra_cli GPU Arena pair {pair_index} failed with "
@@ -383,10 +358,6 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
         thread.start()
         threads.append(thread)
 
-    while next_pair < max_workers:
-        launch(next_pair)
-        next_pair += 1
-
     def handle_control(item) -> None:
         nonlocal finished, next_pair
         if isinstance(item, ChildFailed):
@@ -399,7 +370,12 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
             launch(next_pair)
             next_pair += 1
 
+    failed = False
     try:
+        while next_pair < max_workers:
+            launch(next_pair)
+            next_pair += 1
+
         while finished < total_pairs:
             first = events.get()
             if not isinstance(first, GpuRequest):
@@ -408,15 +384,15 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
             pending = batcher.collect(first, events, handle_control)
             dispatcher.submit(pending)
     except BaseException:
+        failed = True
         for proc in processes.values():
             if proc.poll() is None:
                 proc.kill()
         for proc in processes.values():
-            if proc.poll() is None:
-                proc.wait()
+            proc.wait()
         raise
     finally:
-        dispatcher.close()
+        dispatcher.close(raise_worker_error=not failed)
         for thread in threads:
             thread.join(timeout=1.0)
         for proc in processes.values():
@@ -455,23 +431,32 @@ def evaluate(candidate: torch.nn.Module, champion: torch.nn.Module, device: torc
              target_positions: int = 192, inflight_batches: int = 2,
              gpu_workers: int = 2
              ) -> tuple[dict[str, int | float], float]:
+    protocol = ArenaProtocolConfig(
+        sims=sims,
+        pieces=pieces,
+        batch_size=batch_size,
+        determinizations=determinizations,
+        use_gumbel=use_gumbel,
+        candidate_sims=candidate_sims,
+        champion_sims=champion_sims,
+        candidate_gumbel=candidate_gumbel,
+        champion_gumbel=champion_gumbel,
+        gumbel_c_scale=gumbel_c_scale,
+        gumbel_noise_scale=gumbel_noise_scale,
+        candidate_timing_actions=candidate_timing_actions,
+        champion_timing_actions=champion_timing_actions,
+        candidate_gumbel_noise_scale=candidate_gumbel_noise_scale,
+        champion_gumbel_noise_scale=champion_gumbel_noise_scale,
+    )
     worker_count = max(1, min(max(1, pairs), workers))
     if worker_count <= 1 or pairs <= 1:
         return _evaluate_serial(
-            candidate, champion, device, engine, pairs, sims, pieces, batch_size,
-            determinizations, use_gumbel, precision, seed, candidate_sims,
-            champion_sims, candidate_gumbel, champion_gumbel, gumbel_c_scale,
-            gumbel_noise_scale, candidate_timing_actions, champion_timing_actions,
-            candidate_gumbel_noise_scale, champion_gumbel_noise_scale,
+            candidate, champion, device, engine, pairs, protocol, precision, seed
         )
     return _evaluate_parallel(
-        candidate, champion, device, engine, pairs, sims, pieces, batch_size,
-        determinizations, use_gumbel, precision, seed, worker_count,
+        candidate, champion, device, engine, pairs, protocol, precision,
+        seed, worker_count,
         batch_window_ms, target_positions, inflight_batches, gpu_workers,
-        candidate_sims, champion_sims, candidate_gumbel,
-        champion_gumbel, gumbel_c_scale, gumbel_noise_scale,
-        candidate_timing_actions, champion_timing_actions,
-        candidate_gumbel_noise_scale, champion_gumbel_noise_scale,
     )
 
 
@@ -568,6 +553,32 @@ def report(result: dict[str, int | float], candidate: str, champion: str,
     print(f"  GPU infer      : {inference_seconds:.2f}s")
 
 
+def _write_result_json(path: Path, payload: dict[str, object]) -> None:
+    """Atomically publish a machine-readable Arena result."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(
+                payload,
+                stream,
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("candidate")
@@ -638,6 +649,11 @@ def main() -> int:
     ap.add_argument("--champion-policy-temperature", type=float, default=1.0,
                     help="champion policy-logit temperature; below 1 sharpens the search prior")
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp16")
+    ap.add_argument(
+        "--result-json",
+        default="",
+        help="optional path for an atomic machine-readable Arena result",
+    )
     args = ap.parse_args()
 
     if args.gumbel_c_scale < 0.0:
@@ -727,6 +743,68 @@ def main() -> int:
             f"requests={int(result.get('gpu_queue_requests', 0))} "
             f"forwards={int(result.get('gpu_server_batches', 0))} "
             f"fill={float(result.get('gpu_queue_fill_ratio', 0.0)):.3f}"
+        )
+    if args.result_json:
+        _write_result_json(
+            Path(args.result_json),
+            {
+                "schema_version": 1,
+                "candidate": str(Path(args.candidate).resolve()),
+                "champion": str(Path(args.champion).resolve()),
+                "engine": str(Path(engine).resolve()),
+                "config": {
+                    "device": str(device),
+                    "pairs": pair_count,
+                    "games_per_pair": 4,
+                    "simulations": max(1, args.sims),
+                    "candidate_simulations": args.candidate_sims,
+                    "champion_simulations": args.champion_sims,
+                    "pieces": max(1, args.pieces),
+                    "batch": max(1, args.batch),
+                    "workers": workers,
+                    "batch_window_ms": max(0.0, args.batch_window_ms),
+                    "target_positions": max(1, args.target_positions),
+                    "inflight_batches": max(1, args.inflight_batches),
+                    "gpu_workers": max(1, args.gpu_workers),
+                    "determinizations": max(1, args.determinizations),
+                    "use_gumbel": args.gumbel,
+                    "candidate_gumbel": (
+                        True if args.candidate_gumbel else None
+                    ),
+                    "champion_gumbel": (
+                        True if args.champion_gumbel else None
+                    ),
+                    "gumbel_c_scale": args.gumbel_c_scale,
+                    "gumbel_noise_scale": args.gumbel_noise_scale,
+                    "candidate_gumbel_noise_scale": (
+                        args.candidate_gumbel_noise_scale
+                    ),
+                    "champion_gumbel_noise_scale": (
+                        args.champion_gumbel_noise_scale
+                    ),
+                    "candidate_timing_actions": args.candidate_timing_actions,
+                    "champion_timing_actions": args.champion_timing_actions,
+                    "candidate_policy_temperature": (
+                        args.candidate_policy_temperature
+                    ),
+                    "champion_policy_temperature": (
+                        args.champion_policy_temperature
+                    ),
+                    "candidate_tactical_value_weight": (
+                        args.candidate_tactical_value_weight
+                    ),
+                    "champion_tactical_value_weight": (
+                        args.champion_tactical_value_weight
+                    ),
+                    "precision": args.precision,
+                    "seed": max(0, args.seed),
+                    "pair_seed_stride": f"0x{PAIR_SEED_STRIDE:016X}",
+                },
+                "promotion_threshold": PROMOTION_THRESHOLD,
+                "promotion_ci_lower_exclusive": 0.5,
+                "inference_seconds": inference_seconds,
+                "result": result,
+            },
         )
     report(
         result, args.candidate, args.champion, inference_seconds, pair_count,

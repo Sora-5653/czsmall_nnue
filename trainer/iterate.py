@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -66,6 +68,68 @@ def parse_arena(output: str) -> dict[str, float | int | bool]:
         "ci_upper": number(r"95% CI:\s+[0-9.]+%\s+-\s+([0-9.]+)%") / 100.0,
         "promoted": promoted,
     }
+
+
+def load_gpu_arena_result(path: Path) -> dict[str, float | int | bool]:
+    """Load the versioned machine-readable result emitted by gpu_arena.py."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read GPU Arena result: {path}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"GPU Arena result root is not an object: {path}")
+    if payload.get("schema_version") != 1:
+        raise RuntimeError(f"unsupported GPU Arena result schema: {path}")
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError(f"GPU Arena result is missing its result object: {path}")
+    required = {
+        "games_played",
+        "candidate_wins",
+        "champion_wins",
+        "draws",
+        "win_rate",
+        "ci_lower",
+        "ci_upper",
+        "promoted",
+    }
+    missing = sorted(required.difference(result))
+    if missing:
+        raise RuntimeError(
+            f"GPU Arena result is missing required fields {missing}: {path}"
+        )
+    if not isinstance(result["promoted"], bool):
+        raise RuntimeError(f"GPU Arena promoted field is not boolean: {path}")
+
+    count_keys = ("games_played", "candidate_wins", "champion_wins", "draws")
+    for key in count_keys:
+        value = result[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError(
+                f"GPU Arena {key} must be a non-negative integer: {path}"
+            )
+    games = result["games_played"]
+    if games <= 0:
+        raise RuntimeError(f"GPU Arena games_played must be positive: {path}")
+    counted_games = (
+        result["candidate_wins"] + result["champion_wins"] + result["draws"]
+    )
+    if counted_games != games:
+        raise RuntimeError(f"GPU Arena game counts do not sum to total: {path}")
+
+    rates: dict[str, float] = {}
+    for key in ("win_rate", "ci_lower", "ci_upper"):
+        value = result[key]
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(float(value))):
+            raise RuntimeError(f"GPU Arena {key} must be finite: {path}")
+        rates[key] = float(value)
+    if not (
+        0.0 <= rates["ci_lower"] <= rates["win_rate"] <=
+        rates["ci_upper"] <= 1.0
+    ):
+        raise RuntimeError(f"GPU Arena confidence interval is invalid: {path}")
+    return result
 
 
 def checkpoint_aux_targets(path: Path) -> int:
@@ -437,6 +501,8 @@ def main() -> int:
     run_checked(export_cmd, root)
 
     arena_backend = "gpu"
+    temporary_arena_result: Path | None = None
+    arena_result_path = models_dir / f"{tag}.arena.json"
     if args.cpu_arena:
         arena_backend = "cpu"
         champion_weights = champion.with_suffix(".tetrawts")
@@ -448,6 +514,11 @@ def main() -> int:
             str(max(1, args.arena_pieces)),
         ]
     else:
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{tag}.arena.", suffix=".json", dir=models_dir
+        )
+        os.close(handle)
+        temporary_arena_result = Path(temporary_name)
         arena_cmd = [
             py, str(root / "trainer/gpu_arena.py"), str(arena_candidate), str(champion),
             "--device", args.device, "--engine", engine,
@@ -463,12 +534,22 @@ def main() -> int:
             "--determinizations", str(max(1, arena_determinizations)),
             "--seed", str(max(0, args.arena_seed)),
             "--precision", args.precision,
+            "--result-json", str(temporary_arena_result),
         ]
         if arena_use_gumbel:
             arena_cmd.append("--gumbel")
-    arena_output = run_checked(arena_cmd, root, capture=True)
-    print(arena_output, end="", flush=True)
-    arena = parse_arena(arena_output)
+    try:
+        arena_output = run_checked(arena_cmd, root, capture=True)
+        print(arena_output, end="", flush=True)
+        if temporary_arena_result is None:
+            arena = parse_arena(arena_output)
+        else:
+            arena = load_gpu_arena_result(temporary_arena_result)
+            os.replace(temporary_arena_result, arena_result_path)
+            temporary_arena_result = None
+    finally:
+        if temporary_arena_result is not None and temporary_arena_result.exists():
+            temporary_arena_result.unlink()
 
     promoted = bool(arena["promoted"] and args.champion_output)
     promoted_to = ""
@@ -486,6 +567,12 @@ def main() -> int:
     else:
         print("promotion     retained current champion", flush=True)
 
+    candidate_step_value = checkpoint_step(candidate)
+    arena_candidate_step_value = (
+        candidate_step_value
+        if candidate.resolve() == arena_candidate.resolve()
+        else checkpoint_step(arena_candidate)
+    )
     summary = {
         "generation": args.generation,
         "champion": str(champion),
@@ -542,6 +629,7 @@ def main() -> int:
             "topout_aux_weight": args.topout_aux_weight,
         },
         "arena_backend": arena_backend,
+        "arena_result": str(arena_result_path) if arena_backend == "gpu" else "",
         "arena_runtime": {
             "workers": (min(max(1, args.arena_pairs), 32)
                         if args.arena_workers <= 0
@@ -551,8 +639,8 @@ def main() -> int:
             "inflight_batches": max(1, args.arena_inflight_batches),
             "gpu_workers": max(1, args.arena_gpu_workers),
         },
-        "candidate_step": checkpoint_step(candidate),
-        "arena_candidate_step": checkpoint_step(arena_candidate),
+        "candidate_step": candidate_step_value,
+        "arena_candidate_step": arena_candidate_step_value,
         "arena": arena,
         "promoted_to": promoted_to,
         "elapsed_seconds": time.time() - started,

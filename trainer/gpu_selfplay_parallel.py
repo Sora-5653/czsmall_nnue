@@ -27,6 +27,7 @@ from gpu_match import (
     RESULT_MAGIC,
     AsyncStreamingInferenceDispatcher,
     ChildFailed,
+    ChildStderrDrainer,
     GpuRequest,
     StreamingInferenceQueue,
     StreamingInferenceTelemetry,
@@ -129,33 +130,48 @@ def generate_parallel(
         Path(shard).parent.mkdir(parents=True, exist_ok=True)
         shard_seed = seed + offset
         offset += shard_games
-        proc = subprocess.Popen(
-            [
-                engine,
-                "gpu-export-protocol",
-                shard,
-                str(shard_games),
-                str(pieces),
-                str(sims),
-                str(batch_size),
-                str(shard_seed),
-                str(model_version),
-                str(max(1, determinizations)),
-                "1" if use_gumbel else "0",
-                f"{root_noise_fraction:.9g}",
-                "1" if enable_timing_actions else "0",
-                "1" if no_attack_delivery else "0",
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-        )
+        try:
+            proc = subprocess.Popen(
+                [
+                    engine,
+                    "gpu-export-protocol",
+                    shard,
+                    str(shard_games),
+                    str(pieces),
+                    str(sims),
+                    str(batch_size),
+                    str(shard_seed),
+                    str(model_version),
+                    str(max(1, determinizations)),
+                    "1" if use_gumbel else "0",
+                    f"{root_noise_fraction:.9g}",
+                    "1" if enable_timing_actions else "0",
+                    "1" if no_attack_delivery else "0",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except BaseException:
+            for running_proc in processes.values():
+                if running_proc.poll() is None:
+                    running_proc.kill()
+            for running_proc in processes.values():
+                running_proc.wait()
+            dispatcher.close(raise_worker_error=False)
+            for thread in threads:
+                thread.join(timeout=1.0)
+            raise
         processes[index] = proc
+        stderr = ChildStderrDrainer(
+            proc, f"gpu-selfplay-stderr-drain-{index}"
+        )
 
         def reader(idx: int = index, p: subprocess.Popen = proc,
                    pth: str = shard, expected_games: int = shard_games,
-                   first_seed: int = shard_seed) -> None:
+                   first_seed: int = shard_seed,
+                   diagnostics: ChildStderrDrainer = stderr) -> None:
             results: list[dict[str, int | float]] = []
             try:
                 assert p.stdout is not None
@@ -184,7 +200,7 @@ def generate_parallel(
                         }
                         p.stdin.close()
                         return_code = p.wait()
-                        error = p.stderr.read().decode("utf-8", errors="replace").strip()
+                        error = diagnostics.finish()
                         if return_code != 0:
                             raise RuntimeError(
                                 f"tetra_cli GPU self-play shard {idx} failed with "
@@ -218,6 +234,7 @@ def generate_parallel(
         all_results.extend(item.results)
         finished += 1
 
+    failed = False
     try:
         while finished < worker_count:
             first = events.get()
@@ -228,12 +245,15 @@ def generate_parallel(
             pending = batcher.collect(first, events, handle_control)
             dispatcher.submit(pending)
     except BaseException:
+        failed = True
         for proc in processes.values():
             if proc.poll() is None:
                 proc.kill()
+        for proc in processes.values():
+            proc.wait()
         raise
     finally:
-        dispatcher.close()
+        dispatcher.close(raise_worker_error=not failed)
         for thread in threads:
             thread.join(timeout=1.0)
 

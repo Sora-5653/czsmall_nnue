@@ -62,6 +62,40 @@ class ChildFailed:
     error: BaseException
 
 
+class ChildStderrDrainer:
+    """Continuously drain a child process stderr pipe.
+
+    Protocol children can emit enough diagnostics to fill the operating-system
+    pipe before they exit.  Reading only after ``wait()`` can therefore
+    deadlock an otherwise completed Arena, self-play, or Reanalyse job.
+    """
+
+    def __init__(self, proc: subprocess.Popen, thread_name: str):
+        if proc.stderr is None:
+            raise ValueError("child process stderr must be piped")
+        self._proc = proc
+        self._chunks: list[bytes] = []
+        self._thread = threading.Thread(
+            target=self._drain,
+            name=thread_name,
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _drain(self) -> None:
+        assert self._proc.stderr is not None
+        while True:
+            chunk = self._proc.stderr.read(64 * 1024)
+            if not chunk:
+                return
+            self._chunks.append(chunk)
+
+    def finish(self, timeout: float = 2.0) -> str:
+        """Wait for EOF and return decoded diagnostics collected so far."""
+        self._thread.join(timeout=timeout)
+        return b"".join(self._chunks).decode("utf-8", errors="replace").strip()
+
+
 @dataclass
 class StreamingInferenceTelemetry:
     """Observability for the LC3-style shared inference queue."""
@@ -131,12 +165,8 @@ class StreamingInferenceQueue:
 
     def serve(self, pending: list[GpuRequest],
               stream: torch.cuda.Stream | None = None) -> list[tuple[list[GpuRequest], float]]:
-        grouped: dict[int, list[GpuRequest]] = {}
-        for request in pending:
-            grouped.setdefault(request.model_id, []).append(request)
-
         served: list[tuple[list[GpuRequest], float]] = []
-        for group in grouped.values():
+        for group in self.compatible_groups(pending):
             positions = sum(request.token_np.shape[0] for request in group)
             elapsed = _serve_request_batch(
                 self.model, self.device, group, self.precision, stream=stream
@@ -150,6 +180,14 @@ class StreamingInferenceQueue:
                 self.telemetry.max_wire_requests = max(self.telemetry.max_wire_requests, len(group))
             served.append((group, elapsed))
         return served
+
+    @staticmethod
+    def compatible_groups(pending: list[GpuRequest]) -> list[list[GpuRequest]]:
+        """Group requests that can share one model forward, preserving order."""
+        grouped: dict[int, list[GpuRequest]] = {}
+        for request in pending:
+            grouped.setdefault(request.model_id, []).append(request)
+        return list(grouped.values())
 
 
 class AsyncStreamingInferenceDispatcher:
@@ -219,7 +257,7 @@ class AsyncStreamingInferenceDispatcher:
             except queue.Full:
                 continue
 
-    def close(self) -> None:
+    def close(self, raise_worker_error: bool = True) -> None:
         if self._failed.is_set():
             # A failed worker may leave prefetched jobs behind.  Drop them so
             # sentinels can reach any sibling dispatcher that is still blocked
@@ -246,7 +284,7 @@ class AsyncStreamingInferenceDispatcher:
 
         for thread in self._threads:
             thread.join()
-        if self._error is not None:
+        if self._error is not None and raise_worker_error:
             raise self._error
 
 
@@ -471,6 +509,67 @@ def _select_model(model: TetraFormer | dict[int, TetraFormer], model_id: int) ->
     return model
 
 
+def _assemble_request_batch(requests: list[GpuRequest]) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[tuple[GpuRequest, int, int]],
+]:
+    """Assemble compatible requests with a zero-copy single-request path."""
+    if not requests:
+        raise ValueError("cannot assemble an empty GPU request batch")
+
+    offsets: list[tuple[GpuRequest, int, int]] = []
+    offset = 0
+    for request in requests:
+        count = request.token_np.shape[0]
+        offsets.append((request, offset, count))
+        offset += count
+
+    if len(requests) == 1:
+        request = requests[0]
+        return (
+            request.token_np,
+            request.token_mask_np,
+            request.action_np,
+            request.action_mask_np,
+            offsets,
+        )
+
+    token_shapes = {request.token_np.shape[1:] for request in requests}
+    token_mask_shapes = {request.token_mask_np.shape[1:] for request in requests}
+    action_shapes = {request.action_np.shape[1:] for request in requests}
+    action_mask_shapes = {request.action_mask_np.shape[1:] for request in requests}
+    if (len(token_shapes) == len(token_mask_shapes) == len(action_shapes) ==
+            len(action_mask_shapes) == 1):
+        return (
+            np.concatenate([request.token_np for request in requests]),
+            np.concatenate([request.token_mask_np for request in requests]),
+            np.concatenate([request.action_np for request in requests]),
+            np.concatenate([request.action_mask_np for request in requests]),
+            offsets,
+        )
+
+    total = offset
+    max_tokens = max(request.token_np.shape[1] for request in requests)
+    max_actions = max(request.action_np.shape[1] for request in requests)
+    token_np = np.zeros((total, max_tokens, TOKEN_FEATURES), dtype=np.float32)
+    token_mask_np = np.zeros((total, max_tokens), dtype=np.float32)
+    action_np = np.zeros((total, max_actions, ACTION_FEATURES), dtype=np.float32)
+    action_mask_np = np.zeros((total, max_actions), dtype=np.float32)
+    for request, start, count in offsets:
+        token_np[start:start + count, :request.token_np.shape[1]] = request.token_np
+        token_mask_np[
+            start:start + count, :request.token_mask_np.shape[1]
+        ] = request.token_mask_np
+        action_np[start:start + count, :request.action_np.shape[1]] = request.action_np
+        action_mask_np[
+            start:start + count, :request.action_mask_np.shape[1]
+        ] = request.action_mask_np
+    return token_np, token_mask_np, action_np, action_mask_np, offsets
+
+
 def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
                          device: torch.device, requests: list[GpuRequest],
                          precision: str,
@@ -482,23 +581,12 @@ def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
         return 0.0
 
     started = time.perf_counter()
-    total = sum(r.token_np.shape[0] for r in requests)
-    max_tokens = max(r.token_np.shape[1] for r in requests)
-    max_actions = max(r.action_np.shape[1] for r in requests)
-    token_np = np.zeros((total, max_tokens, TOKEN_FEATURES), dtype=np.float32)
-    token_mask_np = np.zeros((total, max_tokens), dtype=np.float32)
-    action_np = np.zeros((total, max_actions, ACTION_FEATURES), dtype=np.float32)
-    action_mask_np = np.zeros((total, max_actions), dtype=np.float32)
-    offsets: list[tuple[GpuRequest, int, int]] = []
-    offset = 0
-    for request in requests:
-        count = request.token_np.shape[0]
-        token_np[offset:offset + count, :request.token_np.shape[1]] = request.token_np
-        token_mask_np[offset:offset + count, :request.token_mask_np.shape[1]] = request.token_mask_np
-        action_np[offset:offset + count, :request.action_np.shape[1]] = request.action_np
-        action_mask_np[offset:offset + count, :request.action_mask_np.shape[1]] = request.action_mask_np
-        offsets.append((request, offset, count))
-        offset += count
+    (token_np, token_mask_np, action_np, action_mask_np,
+     offsets) = _assemble_request_batch(requests)
+    total = token_np.shape[0]
+    max_tokens = token_np.shape[1]
+    max_actions = action_np.shape[1]
+    valid_action_counts = np.count_nonzero(action_mask_np >= 0.5, axis=1)
 
     tensor_build_finished = time.perf_counter()
 
@@ -517,8 +605,7 @@ def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
         wdl_np = np.zeros((total, 3), dtype=np.float32)
         aux_np = np.zeros((total, 4), dtype=np.float32)
         for row in range(total):
-            valid = action_mask_np[row] >= 0.5
-            count = int(np.count_nonzero(valid))
+            count = int(valid_action_counts[row])
             if count:
                 policy_np[row, :count] = 1.0 / float(count)
             wdl_np[row, 1] = 1.0
@@ -613,7 +700,7 @@ def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
         assert request.proc.stdin is not None
         payload: list[bytes] = [struct.pack("<4sI", b"TGPR", count)]
         for i in range(start, start + count):
-            actions = int(np.count_nonzero(action_mask_np[i] >= 0.5))
+            actions = int(valid_action_counts[i])
             payload.append(struct.pack("<I", actions))
             payload.append(np.asarray(policy_np[i, :actions], dtype="<f4").tobytes())
             payload.append(np.asarray(wdl_np[i, :3], dtype="<f4").tobytes())
@@ -660,6 +747,7 @@ def serve_game(model: TetraFormer, device: torch.device, engine: str, pieces: in
     assert proc.stdin is not None
     assert proc.stdout is not None
     assert proc.stderr is not None
+    stderr = ChildStderrDrainer(proc, "gpu-game-stderr-drain")
 
     inference_seconds = 0.0
     try:
@@ -686,14 +774,15 @@ def serve_game(model: TetraFormer, device: torch.device, engine: str, pieces: in
             if magic != REQUEST_MAGIC:
                 raise RuntimeError(f"unexpected GPU protocol frame: {magic!r}")
             inference_seconds += answer_request(model, device, proc, precision)
-    except Exception:
+    except BaseException:
         proc.kill()
         proc.wait()
+        stderr.finish()
         raise
 
     proc.stdin.close()
     return_code = proc.wait()
-    error = proc.stderr.read().decode("utf-8", errors="replace").strip()
+    error = stderr.finish()
     if return_code != 0:
         raise RuntimeError(f"tetra_cli GPU child failed with {return_code}: {error}")
     result["inference_seconds"] = inference_seconds
@@ -757,6 +846,9 @@ def serve_games_parallel(model: TetraFormer, device: torch.device, engine: str,
         )
         processes[index] = proc
         running += 1
+        stderr = ChildStderrDrainer(
+            proc, f"gpu-game-stderr-drain-{index}"
+        )
 
         def reader() -> None:
             try:
@@ -768,8 +860,10 @@ def serve_games_parallel(model: TetraFormer, device: torch.device, engine: str,
                         continue
                     if magic == RESULT_MAGIC:
                         result = _read_game_result(proc)
+                        assert proc.stdin is not None
+                        proc.stdin.close()
                         return_code = proc.wait()
-                        error = proc.stderr.read().decode("utf-8", errors="replace").strip()
+                        error = stderr.finish()
                         if return_code != 0:
                             raise RuntimeError(
                                 f"tetra_cli GPU child failed with {return_code}: {error}"
@@ -783,10 +877,6 @@ def serve_games_parallel(model: TetraFormer, device: torch.device, engine: str,
         thread = threading.Thread(target=reader, name=f"gpu-game-reader-{index}", daemon=True)
         thread.start()
         threads.append(thread)
-
-    while next_index < max_workers:
-        launch(next_index)
-        next_index += 1
 
     def handle_control(item) -> None:
         nonlocal finished, running, next_index
@@ -802,6 +892,10 @@ def serve_games_parallel(model: TetraFormer, device: torch.device, engine: str,
             next_index += 1
 
     try:
+        while next_index < max_workers:
+            launch(next_index)
+            next_index += 1
+
         while finished < total_games:
             first = requests.get()
             if not isinstance(first, GpuRequest):
@@ -819,6 +913,8 @@ def serve_games_parallel(model: TetraFormer, device: torch.device, engine: str,
         for proc in processes.values():
             if proc.poll() is None:
                 proc.kill()
+        for proc in processes.values():
+            proc.wait()
         raise
     finally:
         for thread in threads:

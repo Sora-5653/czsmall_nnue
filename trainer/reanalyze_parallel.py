@@ -28,6 +28,7 @@ from gpu_match import (
     REQUEST_MAGIC,
     AsyncStreamingInferenceDispatcher,
     ChildFailed,
+    ChildStderrDrainer,
     GpuRequest,
     StreamingInferenceQueue,
     StreamingInferenceTelemetry,
@@ -172,6 +173,9 @@ def run_parallel(
             bufsize=0,
         )
         job.proc = proc
+        stderr = ChildStderrDrainer(
+            proc, f"gpu-reanalyse-stderr-drain-{job.index}"
+        )
 
         def reader() -> None:
             try:
@@ -196,9 +200,7 @@ def run_parallel(
                         }
                         proc.stdin.close()
                         return_code = proc.wait()
-                        diagnostics = proc.stderr.read().decode(
-                            "utf-8", errors="replace"
-                        ).strip()
+                        diagnostics = stderr.finish()
                         if return_code != 0:
                             raise RuntimeError(
                                 f"reanalyse shard {job.index} failed with {return_code}: {diagnostics}"
@@ -219,9 +221,6 @@ def run_parallel(
         thread.start()
         threads.append(thread)
 
-    for job in jobs:
-        launch(job)
-
     completed = 0
 
     def handle_control(item) -> None:
@@ -235,7 +234,11 @@ def run_parallel(
         finished[item.index] = item
         completed += 1
 
+    failed = False
     try:
+        for job in jobs:
+            launch(job)
+
         while completed < len(jobs):
             first = events.get()
             if not isinstance(first, GpuRequest):
@@ -316,12 +319,16 @@ def run_parallel(
                 encoding="utf-8",
             )
     except BaseException:
+        failed = True
         for job in jobs:
             if job.proc is not None and job.proc.poll() is None:
                 job.proc.kill()
+        for job in jobs:
+            if job.proc is not None:
+                job.proc.wait()
         raise
     finally:
-        dispatcher.close()
+        dispatcher.close(raise_worker_error=not failed)
         for thread in threads:
             thread.join(timeout=1.0)
         for job in jobs:

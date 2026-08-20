@@ -78,6 +78,7 @@ def generation_artifacts(data_dir: Path, models_dir: Path, generation: int) -> l
         models_dir / f"{tag}.pt",
         models_dir / f"{tag}.best.pt",
         models_dir / f"{tag}.tetrawts",
+        models_dir / f"{tag}.arena.json",
         models_dir / f"{tag}.json",
     ]
 
