@@ -1,30 +1,43 @@
-# ADR 0002: The movegen BFS state includes rotation provenance
+# ADR 0002: 合法手生成ではrotation provenanceを失わない
 
-## Status
-Accepted.
+## 状態
 
-## Context
-The obvious BFS key for legal placement generation is `(x, y, rotation)`. That
-is what the first implementation used.
+採用・実装方式は更新済み。
 
-It is wrong. Spin classification depends on *how* a piece arrived: only a piece
-whose last successful action was a rotation can register a spin, and for the T
-piece the kick index that was used distinguishes a mini from a full spin. Two
-paths that reach the same coordinates are therefore not interchangeable.
+このADRが扱ったproject-side BFS generator自体は、後にpure Cobra movegenへ置換されました。一方で、**同一cellへ到達しても「最後の成功actionがrotationだったか」「どのkick/spin provenanceで到達したか」を失ってはいけない**という不変条件は現在も有効です。現行Cobra adapterはtargetのrotation/spin informationとcanonical pathを保持して同じ意味論を満たします。
 
-Collapsing them made the emitted action set depend on BFS visit order. The
-symptom that exposed this was a property test: left/right mirrored boards
-produced *different numbers of legal placements* (18 of 175 sampled positions
-disagreed), which should be impossible under the mirror-symmetric SRS+ table.
+## 背景
 
-## Decision
-Include `arrived_by_rotation` and the kick index in the packed BFS state, so
-that a rotation-reached state and a slide-reached state at the same coordinates
-are distinct search nodes.
+初期のlegal placement generatorでは、BFS keyとして `(x, y, rotation)` を使うのが自然に見えました。
 
-## Consequences
-- Mirror invariance is now exact: 0 mismatches, verified cell for cell.
-- The state space grows, but the packed key stays at 20 bits, which is what
-  makes the flat generation-stamped visited table (ADR 0003) possible.
-- Spin-bearing placements are never lost to visit-order luck, which matters
-  because those are precisely the high-attack actions the policy must see.
+しかしこれは不十分です。spin classificationは**どのようにその位置へ到達したか**に依存します。
+
+- 最後のsuccessful actionがrotationである場合だけspinになり得る。
+- T pieceでは、使用したkick indexがmini/full判定へ影響する。
+
+したがって同じ `(x, y, rotation)` へ到達した2経路を、必ずしも同一stateとしてmergeできません。
+
+旧実装でmergeしていたとき、emitted action setがBFS visit orderへ依存しました。これを発見したのはproperty testです。mirror-symmetricなSRS+ tableを使っているにもかかわらず、left/right mirrored boardで**legal placement数が一致しない**状態が175 sample中18 positionで起きました。
+
+## 決定
+
+旧BFS実装では、packed stateへ次を含めました。
+
+- `arrived_by_rotation`
+- kick index
+
+これにより、同一座標でもrotationで到達したstateとslideで到達したstateを別nodeとして扱います。
+
+現在は旧BFSを使用していませんが、設計上の決定を次の形で維持します。
+
+> 合法配置をoutcome単位でmergeしても、spin判定に必要なrotation/spin provenanceと、そのplacementを再現するcanonical input sequenceを失ってはならない。
+
+## 帰結
+
+旧generatorでは次の効果がありました。
+
+- mirror invarianceがcell単位で0 mismatchになった。
+- state spaceは増えたが、packed keyは20 bitに収まり、ADR 0003のflat visited tableを可能にした。
+- BFS visit orderの偶然によってspin-bearing placementが消えることを防いだ。
+
+現行Cobra implementationでは、旧20-bit BFS stateそのものは存在しません。そのためこのADRの具体的data structureはhistorical recordであり、現在のcode requirementは**provenance preservation**です。

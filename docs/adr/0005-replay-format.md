@@ -1,54 +1,66 @@
-# ADR 0005: Replay format records inputs, not state
+# ADR 0005: Replayにはderived stateではなくinputを記録する
 
-## Status
-Accepted.
+## 状態
 
-## Context
-Spec §18.1 makes rule consistency the top requirement and §22 lists "replay diff
-testing" as the mitigation for subtle rule drift. Spec §17 asks for Protobuf
-under `/protocol`. Until now a replay existed only as an in-memory vector of
-placements inside one test.
+採用。
 
-## Decision
+## 背景
 
-**Record inputs, never derived state.** A replay stores the seed, the ruleset
-hash, and the sequence of placements. Everything else — boards, attacks, timing
-— is recomputed on playback. Storing derived state would make verification a
-playback of cached results instead of a test of the simulator.
+Spec §18.1はrule consistencyを最重要要件とし、§22は微妙なrule driftへの対策として「replay diff testing」を挙げています。Spec §17は `/protocol` でProtobufを使う案を示していましたが、この時点ではreplayは単一test内のin-memory placement vectorとしてしか存在しませんでした。
 
-**Record spin provenance explicitly.** This is the one thing that cannot be
-recomputed. A piece slid into a notch and a piece rotated into the same notch
-occupy identical cells but score differently, so the final position does not
-determine the spin class. The verifier additionally re-derives the spin and
-compares it to the recorded value, which is what catches a spin-detection
-regression.
+## 決定
 
-**Interleave checkpoints.** Every Nth placement carries a board hash, the
-sent/received line counts and the timestamp, so a divergence is reported at the
-placement where it first appears rather than at the end. The interval is a
-tunable size/locality trade-off.
+### Inputを記録し、derived stateを保存しない
 
-**Custom binary chunk, not Protobuf (yet).** Explicit little-endian, versioned,
-with a trailing FNV-1a checksum. This keeps the project dependency-free, which
-matters more right now than wire compatibility; the field layout mirrors what a
-`.proto` would declare, so migrating later is mechanical.
+Replayは次を保存します。
 
-## Consequences
+- seed
+- ruleset hash
+- placement sequence
 
-- ~19-21 bytes per placement (5.5 KB for a 300-piece game), which is acceptable
-  for the volumes self-play will produce.
-- `verify_replay()` reports `first_divergence`, plus the expected and actual
-  board hashes, so a regression is localised immediately.
-- Four distinct failure modes are detected and distinguished: ruleset hash
-  mismatch, piece-sequence divergence (randomizer change), checkpoint mismatch
-  (rule change), and file corruption (checksum).
-- Writing the format immediately exposed a real bug: the first verifier marked
-  every replayed piece as "rotated", which fabricated spins the original game
-  never scored and diverged at placement 16 of a 53-placement game.
+board、attack、timingなどはplayback時に再計算します。
 
-## Alternatives considered
+もしderived state自体を保存してそれを再生するだけなら、verificationはsimulatorの検証ではなく「cached resultを正しく読めたか」の確認になってしまいます。
 
-- **Store the board after every placement.** Trivially "verifies" and catches
-  nothing; it only proves the file was read correctly.
-- **Protobuf now.** Would pull in a toolchain this sandbox cannot fetch, for a
-  benefit (cross-language wire compat) nothing currently needs.
+### Spin provenanceだけは明示的に記録する
+
+同じnotchへslideで入ったpieceとrotationで入ったpieceは、同じcellを占有してもspin scoreが異なります。final positionだけからspin classを一意に復元できないため、spin provenanceはreplayへ記録します。
+
+verifierはrecorded spinをそのまま信頼するのではなく、可能な範囲でspinを再導出してrecorded valueと比較します。これによりspin-detection regressionを検出できます。
+
+### Checkpointをinterleaveする
+
+N placementsごとに次をcheckpointとして持ちます。
+
+- board hash
+- sent / received line count
+- timestamp
+
+これにより、最終stateだけでなく**最初にdivergeしたplacement**を報告できます。checkpoint intervalはfile sizeとlocalizationのtrade-offです。
+
+### 現段階ではcustom binary chunkを使う
+
+明示little-endian、versioned format、trailing FNV-1a checksumを使います。
+
+この時点ではProtobuf toolchainをsandboxへ取得できず、cross-language wire compatibilityよりdependency-free buildを優先しました。field layoutは将来 `.proto` へ移しやすい形に保ちます。
+
+## 帰結
+
+- 約19–21 bytes / placement。300-piece gameで約5.5 KBだった。
+- `verify_replay()` は `first_divergence` とexpected/actual board hashを報告できる。
+- 次のfailure modeを区別して検出できる。
+  - ruleset hash mismatch
+  - piece-sequence divergence（randomizer change）
+  - checkpoint mismatch（rule change）
+  - checksum mismatch（file corruption）
+- format実装直後、verifierが全replayed pieceを「rotated」と扱い、存在しないspinを生成するbugを発見した。53-placement gameのplacement 16でdivergeしたことで局所化できた。
+
+## 検討した代替案
+
+### 毎placement後のboardを保存する
+
+再生結果を保存値と置き換えるだけになり、rule engineのdriftを検出できません。
+
+### 最初からProtobufを導入する
+
+当時のsandboxではtoolchainを取得できず、現在必要のないcross-language wire compatibilityのためにdependencyを増やすことになるため見送りました。

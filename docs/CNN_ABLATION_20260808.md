@@ -1,119 +1,154 @@
-# CNN architecture ablation — 2026-08-08
+# CNNアーキテクチャ比較実験 — 2026-08-08
 
-## Question
+> この文書は**実験結果の記録**であり、project architecture policyそのものではありません。実験から採用した設計判断は [ADR 0013](adr/0013-architecture-ablation-and-local-geometry.md) を参照してください。
 
-Does an explicit local 2D board inductive bias improve the current TetraFormer policy when the data, split, optimiser, minibatches, number of steps, and seed are held fixed?
+## 問い
 
-The existing Transformer is retained unchanged as the control architecture. The CNN and CNN+Transformer hybrid are additional comparison models; they do not replace the production model or champion.
+同じdata、split、optimizer、minibatch、training steps、seedを固定したとき、**明示的な局所2D board inductive biasは現在のTetraFormer policyを改善するか**を検証しました。
 
-## Fixed dataset
+既存Transformerは変更せずcontrolとして残します。CNNとCNN+Transformer hybridは追加比較modelであり、この実験だけでproduction modelやChampionを置き換えません。
 
-The ablation uses the previously generated 47,693-sample Gen-4 corpus:
+## 固定dataset
+
+既存の47,693-sample Gen-4 corpusを使用しました。
 
 - `data/production/gen4_bootstrap_20260807.part00..07.tetradat`
 - `data/production/gen4_search32_[a-f]_20260807.part00..07.tetradat`
 
-The concatenated rectangular dataset has a maximum of 102 state tokens and 106 legal actions.
+連結したrectangular datasetは最大102 state tokens、106 legal actionsです。
 
-The initial ablation used the existing game-seed split function once and shared it by all architectures:
+### 最初のsplit
+
+初期ablationでは既存のgame-seed split functionを1回適用し、全architectureで共有しました。
 
 - train: 37,966 samples / 512 game seeds
 - held-out: 9,727 samples / 128 game seeds
 
-No position-level random split is used. A later audit found that the production splitter sorts numeric game seeds before the 80/20 cut. Because these generation shards occupy consecutive seed ranges, the initial held-out set consisted entirely of `gen4_search32_e` and `gen4_search32_f`: bootstrap and search32 a-d contributed zero validation samples.
+position単位のrandom splitは使っていません。
 
-A second, still leakage-safe split hashes each game seed before the 80/20 assignment. This distributes validation games across every source:
+しかし後のauditで、production splitterがnumeric game seedをsortしてから80/20 cutしていることが分かりました。generation shardは連続seed rangeを使っていたため、held-out setが完全に `gen4_search32_e` と `gen4_search32_f` だけで構成され、bootstrapとsearch32 a-dからvalidation sampleが1つも入っていませんでした。
+
+### Hashed game split
+
+そこで、game seedをstable hashしてから80/20 assignmentする、leakage-safeなsplitを追加しました。
 
 - hashed train: 37,231 samples / 499 game seeds
 - hashed held-out: 10,462 samples / 141 game seeds
-- hashed validation includes bootstrap (4,383 samples) and every search32 group a-f (694-1,225 samples each)
 
-## Fixed training conditions
+hashed validationには全sourceが入ります。
 
-- optimiser: AdamW
+- bootstrap: 4,383 samples
+- search32 a-f: 各694–1,225 samples
+
+このsplitを、source rangeに依存しにくい代表条件として扱います。
+
+## 固定training条件
+
+- optimizer: AdamW
 - learning rate: `3e-4`
 - weight decay: `1e-4`
 - batch size: 256
 - steps: 400
 - seed: 42
-- exact sampled minibatch schedule: shared across architectures
-- loss weights: policy `1.0`, value `1.0`, aux `0.1`
+- sampled minibatch schedule: architecture間で完全共有
+- loss weight: policy `1.0`, value `1.0`, aux `0.1`
 - gradient clipping: 1.0
-- GPU: RX 9070 XT (`cuda:1` in the Windows ROCm PyTorch environment)
+- GPU: RX 9070 XT（Windows ROCm PyTorch環境では `cuda:1`）
 
-Parameter counts are intentionally close:
+parameter countも意図的に近づけました。
 
 - TetraFormer-S control: 7,175,592
 - CNN baseline: 7,163,880
 - CNN+Transformer hybrid: 7,507,560
 
-## Architecture details
+## Architecture詳細
 
 ### Transformer control
 
-The current 8-layer, width-256 TetraFormer-S is instantiated without modification.
+既存の8-layer、width-256 TetraFormer-Sを変更せず使用します。
 
 ### CNN baseline
 
-The tokenizer already stores the exact 10-wide occupancy bitmap in row-token features 8..17. Under the current two-player token order, the self board is the first 24 row tokens and the opponent board is recovered from the final 36 real tokens (24 rows + 10 columns + board summary + opponent counters).
+tokenizerはrow tokenのfeature 8..17にexact 10-wide occupancy bitmapを保持しています。
 
-The CNN receives five 24x10 planes:
+現行two-player token orderでは:
+
+- self board: 最初の24 row tokens
+- opponent board: 最後の36 real tokens中の先頭24 rows
+  - 24 rows + 10 columns + board summary + opponent counters
+
+から両盤面を復元できます。
+
+CNN inputは5枚の24x10 planeです。
 
 1. self occupancy
 2. opponent occupancy
-3. self minus opponent occupancy
-4. normalised y coordinate
-5. normalised x coordinate
+3. self - opponent occupancy
+4. normalized y coordinate
+5. normalized x coordinate
 
-A residual 3x3 CNN encodes this board tensor. Non-board state is retained through a token-wise MLP plus masked mean pooling. Each legal action is scored conditionally on the fused state vector.
+residual 3x3 CNNでboard tensorをencodeします。non-board stateはtoken-wise MLP + masked mean poolingで保持し、fused state vectorを条件として各legal actionをscoreします。
 
-On this Windows ROCm build, ordinary `Conv2d` backward selected a MIOpen CK kernel that failed on gfx1201 with `invalid device function`. The ablation therefore implements the same spatially shared 3x3 convolution as `unfold + GEMM`, avoiding the failing MIOpen path while preserving the convolution operation.
+#### Windows ROCm上のConv2d workaround
+
+このWindows ROCm buildでは通常の `Conv2d` backwardが、gfx1201で `invalid device function` になるMIOpen CK kernelを選ぶことがありました。
+
+そのため同じspatially shared 3x3 convolutionを `unfold + GEMM` で実装しました。convolution operation自体は維持しつつ、失敗するMIOpen pathだけを避けています。
 
 ### CNN+Transformer hybrid
 
-A smaller board CNN produces one learned board token, which is appended to the normal TetraFormer state sequence before the 8 Transformer blocks. The existing variable-length cross-attention policy head remains intact.
+小型board CNNが1つのlearned board tokenを生成し、通常TetraFormer state sequenceへ追加して8 Transformer blocksへ通します。
 
-## Held-out results
+既存のvariable-length cross-attention policy headはそのまま残します。
 
-Primary metric: held-out policy cross-entropy after exactly 400 steps.
+## 初期held-out結果
 
-| Architecture | Held-out policy loss | Held-out total loss | Notes |
+primary metricは400 steps後のheld-out policy cross-entropyです。
+
+| Architecture | Held-out policy loss | Held-out total loss | 注記 |
 |---|---:|---:|---|
-| Transformer | **3.244058** | 3.941302 | best policy at step 400 |
+| Transformer | **3.244058** | 3.941302 | step 400でbest policy |
 | Hybrid | 3.260342 | 4.204065 | best policy 3.255634 at step 300 |
-| CNN | 3.267351 | **3.896739** | best policy at step 400 |
+| CNN | 3.267351 | **3.896739** | step 400でbest policy |
 
-By policy cross-entropy alone, the original Transformer remains best. The difference is small: CNN is +0.023293 and hybrid is +0.016284 relative to the Transformer.
+policy cross-entropyだけならoriginal Transformerがbestです。
 
-The CNN nevertheless has a lower final total loss than the Transformer, so the board inductive bias is helping some combination of value/auxiliary prediction even though the full policy distribution is fitted slightly less well.
+Transformerとの差:
 
-## Arena
+- CNN: +0.023293
+- Hybrid: +0.016284
 
-All Arena comparisons use the 400-step final checkpoints, identical search budgets, seed 42, fp16 inference, 300-piece cap, and no Gumbel search.
+一方CNNはfinal total lossがTransformerより低く、local board biasがvalue/auxiliary predictionの一部には寄与している可能性がありました。
 
-### Search Arena: 16 simulations each
+## 初期Arena
 
-| Candidate vs Transformer | Record | Win rate | 95% CI |
-|---|---:|---:|---:|
-| CNN | **34-6** | **85.0%** | 70.9%-92.9% |
-| Hybrid | **28-12** | **70.0%** | 54.6%-81.9% |
+400-step final checkpointを使用し、search budget、seed 42、fp16 inference、300-piece capを固定しました。ここではGumbelを使っていません。
 
-The engine reports 40 games for 10 paired Arena units. CNN's interval is entirely above the 55% promotion threshold. Hybrid's point estimate is strong, but its lower confidence bound is just below 55%, so a larger Arena would be needed before treating that margin as robust.
-
-### Policy-only Arena: 0 simulations each
+### Search Arena — 16 simulations each
 
 | Candidate vs Transformer | Record | Win rate | 95% CI |
-|---|---:|---:|---:|
-| CNN | **27-13** | **67.5%** | 52.0%-79.9% |
-| Hybrid | 18-22 | 45.0% | 30.7%-60.2% |
+|---|---:|---:|---|
+| CNN | **34-6** | **85.0%** | 70.9%–92.9% |
+| Hybrid | **28-12** | **70.0%** | 54.6%–81.9% |
 
-This initial policy-only result was subsequently found not to be stable enough to support the claim that the CNN raw policy is intrinsically stronger. Larger and re-split experiments below supersede that interpretation.
+engine report上、10 paired Arena unitsは40 gamesになります。
 
-## Follow-up: ranking diagnostics, split audit, and independent seeds
+CNNのconfidence intervalは55% promotion thresholdを完全に上回りました。Hybridはpoint estimateこそ強いもののlower boundが55%をわずかに下回るため、この時点ではより大きなArenaが必要でした。
 
-### Teacher-ranking diagnostics
+### Policy-only Arena — 0 simulations each
 
-On the original 9,727-position held-out set, the Transformer is also slightly better than the CNN on direct teacher-ranking metrics:
+| Candidate vs Transformer | Record | Win rate | 95% CI |
+|---|---:|---:|---|
+| CNN | **27-13** | **67.5%** | 52.0%–79.9% |
+| Hybrid | 18-22 | 45.0% | 30.7%–60.2% |
+
+このinitial policy-only resultは、後続実験で「CNN raw policyが本質的にstronger」と断定するには不安定だと分かりました。以下のlarger / corrected-split experimentでinterpretationを更新します。
+
+## 追試 — ranking diagnostic、split audit、independent seed
+
+### Teacher-ranking diagnostic
+
+original 9,727-position held-out set上でも、direct teacher-ranking metricではTransformerがCNNよりわずかに良い結果でした。
 
 | Metric | Transformer | CNN | Hybrid |
 |---|---:|---:|---:|
@@ -123,120 +158,144 @@ On the original 9,727-position held-out set, the Transformer is also slightly be
 | teacher mass at model argmax | **0.08910** | 0.08901 | 0.08865 |
 | mean teacher-best rank | **8.49** | 8.58 | 8.52 |
 
-The CNN therefore does not merely sacrifice tail calibration while ranking the teacher's best move better. The earlier policy-only Arena win is not explained by imitation ranking quality.
+つまりCNNは単にtail calibrationを犠牲にしてteacher best moveのrankingを改善していたわけではありません。
+
+初期policy-only Arena winはteacher imitation ranking qualityでは説明できません。
 
 ### Independent training seed
 
-Repeating the ordered-split experiment with training seed 1337 preserves the policy-CE ordering:
+ordered-split experimentをtraining seed 1337で再実行してもpolicy CEの順序は維持されました。
 
 - Transformer: 3.240603
 - CNN: 3.270994
 
-Yet the seed-1337 CNN again beats its paired Transformer in Arena:
+一方、seed-1337 CNNは対応するTransformerにArenaで再び勝ちました。
 
-- policy-only: 52-28 over 80 games (65.0%, 95% CI 54.1%-74.5%)
-- 16 simulations: 32-8 over 40 games (80.0%, 95% CI 65.2%-89.5%)
+- policy-only: 52-28 / 80 games
+  - 65.0%
+  - 95% CI 54.1%–74.5%
+- 16 simulations: 32-8 / 40 games
+  - 80.0%
+  - 95% CI 65.2%–89.5%
 
-Thus the original ordered-split result is not specific to one model-initialisation seed.
+したがってordered-splitの現象は1つのmodel initialization seedだけには依存していません。
 
 ### Hashed game split
 
-With the representative hashed game split and seed 42:
+representative hashed split + seed 42では次の結果でした。
 
 | Architecture | policy loss | value loss | value accuracy | value scalar MSE | total loss |
 |---|---:|---:|---:|---:|---:|
 | Transformer | **3.302256** | 0.693175 | 51.95% | 0.99975 | 3.997783 |
 | CNN | 3.334443 | **0.582125** | **67.25%** | **0.80018** | **3.918749** |
 
-The important structural separation is now clear: the Transformer is the better imitator of the search policy, while the CNN learns the WDL/value target much more successfully.
+ここで重要な構造分離がはっきりしました。
 
-Hashed-split Arena is correspondingly different from the first policy-only result:
+- Transformer: search policyのimitationが良い。
+- CNN: 同じsampleからWDL/valueをかなり良く学ぶ。
 
-- policy-only, seed 777: CNN 37-43 over 80 games (46.3%, 95% CI 35.7%-57.1%)
-- 16 simulations, seed 777: CNN 27-13 over 40 games (67.5%)
-- 16 simulations, seed 5150: CNN 52-28 over 80 games (65.0%)
+hashed-split Arenaでは、initial policy-only resultとは違う姿になりました。
 
-Pooling the two independent 16-simulation hashed-split trials gives 79-41 (65.8%); the Wilson 95% interval is approximately 57.0%-73.7%. The search advantage is considerably more stable than the raw-policy advantage.
+- policy-only, seed 777: CNN 37-43 / 80 games
+  - 46.3%
+  - 95% CI 35.7%–57.1%
+- 16 simulations, seed 777: CNN 27-13 / 40 games
+  - 67.5%
+- 16 simulations, seed 5150: CNN 52-28 / 80 games
+  - 65.0%
 
-### Teacher provenance
+2つのindependent 16-simulation hashed-split trialをpoolすると:
 
-`gen4_search32_[a-f]` was generated by `models/gpu_gen_20260805_gen3.pt` at 32 simulations with no root noise. That checkpoint is itself an 8-layer, width-256 TetraFormer. Held-out policy cross-entropy therefore measures imitation of a Transformer-driven search teacher, not architecture-neutral game strength. This is one reason to give Arena substantially more weight than small CE differences.
+- CNN 79-41 / 120 games
+- 65.8%
+- Wilson 95% CI ≈ 57.0%–73.7%
 
-### Split-head hybrid test
+raw-policy advantageよりsearch advantageのほうがかなり安定しています。
 
-A diagnostic `split_hybrid` keeps the TetraFormer policy path structurally intact while moving value/aux to an independent compact CNN branch. At 100 steps its hashed held-out value metrics improve over the Transformer (value loss 0.6158, accuracy 64.6%, scalar MSE 0.8577), while policy CE is essentially identical (3.356448 vs 3.356361). However, the isolated value branch later overfits badly: by 400 steps value loss reaches 1.3318 despite continuing train-loss improvement. A 100-step 16-simulation Arena also loses 17-23 to the matched 100-step Transformer.
+## Teacher provenance
 
-This indicates that a good static held-out value metric is not sufficient. Search probes counterfactual/off-policy positions, and the CNN baseline's shared policy/value representation appears to regularise the value function in a way the independent branch loses.
+`gen4_search32_[a-f]` は `models/gpu_gen_20260805_gen3.pt` をteacherとして、32 simulations・root noiseなしで生成されました。
 
-### Policy/value factorial diagnostic
+そのcheckpoint自身も8-layer、width-256 TetraFormerです。
 
-Using the hashed seed-42 checkpoints, policy and value outputs were mixed at inference without retraining. On one common 20-game seed block:
+つまりheld-out policy cross-entropyは**architecture-neutral game strength**ではなく、Transformer-driven search teacherをどれだけ模倣できるかを主に測っています。
+
+このため、小さなCE差よりArenaへ大きなweightを置く理由があります。
+
+## Split-head hybrid test
+
+`split_hybrid` diagnosticでは、TetraFormer policy pathを構造的にそのまま残し、value/auxだけをindependent compact CNN branchへ移しました。
+
+100 steps時点ではhashed held-out value metricがTransformerより改善しました。
+
+- value loss: 0.6158
+- accuracy: 64.6%
+- scalar MSE: 0.8577
+- policy CE: 3.356448 vs Transformer 3.356361
+
+しかしisolated value branchはその後strongly overfitしました。
+
+400 stepsでvalue lossは1.3318まで悪化し、train loss自体は改善を続けていました。
+
+さらに100-step 16-simulation Arenaではmatched 100-step Transformerへ17-23で負けました。
+
+この結果から、**static held-out value metricが良いだけでは不十分**と分かります。
+
+searchはcounterfactual / off-policy positionをprobeします。full CNN baselineのshared policy/value representationがvalue functionをregularizeしており、independent branchではその性質を失った可能性があります。
+
+## Policy / value factorial diagnostic
+
+hashed seed-42 checkpointを使い、retrainせずinference時にpolicy/value outputをmixしました。
+
+共通20-game seed blockで:
 
 - Transformer policy + CNN value vs Transformer/Transformer: 10-10
 - CNN policy + Transformer value vs Transformer/Transformer: 11-9
 - CNN policy + CNN value vs Transformer/Transformer: 11-9
 
-Twenty games are too few for strength claims, but neither component swap alone produces an obvious gain. Combined with the larger full-model Arenas, this suggests policy-value compatibility/shared representation may matter, rather than one head being independently responsible.
+20 gamesではstrength claimには不足しますが、どちらか1 component swapだけで明確なgainが出るわけではありませんでした。
 
-## Spatial feature-map hybrid follow-up
+larger full-model Arenaと合わせると、1 headだけでなく**policy-value compatibility / shared representation**が重要である可能性があります。
 
-The next experiment tested the architecture motivated by the CNN/Transformer division of labour directly: let a deep CNN learn exact local board geometry first, then give the Transformer a spatial feature map rather than asking attention to reconstruct cells from row bitmaps.
+## Shared-local-feature hybridの追試
 
-### Architecture
+追加で、local featureを共有するhybridも試しました。
 
-`spatial_hybrid` initially preserved all 24x10 CNN cells as 240 Transformer tokens. It used the same large local encoder as the successful CNN baseline (192 channels, 10 residual blocks), removed raw row/column board tokens from the Transformer sequence, and retained board summaries plus piece/hold/next/garbage/counter/rule/time/event state. This preserved the desired information flow, but the 240-token attention sequence made activation memory unnecessarily large; a batch-256 backward OOMed the 16 GiB RX 9070 XT.
+- `fusion_hybrid`
+  - CNN board tokenをTransformerへappend
+  - 同じboard embeddingをvalue/auxへ直接入力
+- `dual_policy_hybrid`
+  - 上記に加えCNN branchがfinal policy logitsへ50/50で直接寄与
 
-The practical variant, `pooled_spatial_hybrid`, keeps the exact 24x10 board throughout the complete deep CNN and only then applies a 2x2 spatial bottleneck, yielding a 12x5 = 60-token CNN feature map. The Transformer therefore receives learned local-region features plus global game-state tokens. The CNN has already integrated exact cell geometry before pooling, while the Transformer does not spend quadratic attention on every cell.
+しかし両方ともhashed splitでlate value overfitを示しました。
 
-### Microbatch / VRAM trade-off
+400-step total loss:
 
-The effective training batch remains 256 through gradient accumulation. On an 8-step representative benchmark, all microbatch sizes produced numerically identical learning updates; only speed and activation memory changed:
+- `fusion_hybrid`: 4.7677
+- `dual_policy_hybrid`: 4.6082
 
-| microbatch | time / step | peak allocated | peak reserved |
-|---:|---:|---:|---:|
-| 32 | 0.84 s | 2.17 GiB | 2.38 GiB |
-| 64 | 0.76 s | 4.13 GiB | 4.34 GiB |
-| **96** | **0.74 s** | **5.97 GiB** | **6.27 GiB** |
-| 128 | 0.73 s | 7.87 GiB | 8.38 GiB |
+したがって、compact CNN branchへ単純なpolicy regularizationを加えるだけではfull CNNの性質を再現できませんでした。
 
-Microbatch 96 was selected: moving to 128 saved only about 1-2% wall-clock time while consuming roughly 2 GiB more VRAM. In the full 47,693-sample run, peak reserved memory remained 6.60 GiB.
+## 現在のinterpretation
 
-The runner now saves AdamW state and supports exact continuation. The 400-step run was executed as 200 + 200 steps because of the DevSpace per-command timeout; the seed-42 minibatch schedule is regenerated for all 400 steps and the resumed run starts at schedule row 200, so this is the same update sequence as a single uninterrupted 400-step run. A separate 4-step control versus 2+2 resume check produced a maximum absolute parameter difference of exactly 0.0.
+証拠が支持するconclusionを、初期Arenaより狭くします。
 
-### Hashed-split 400-step result
+1. **TransformerはTransformer-generated search policyを一貫して良く再現する。**
+   - 2 training seeds
+   - corrected hashed split
+   でも維持。
 
-| Architecture | policy loss | value loss | value accuracy | value scalar MSE | total loss |
-|---|---:|---:|---:|---:|---:|
-| Transformer | **3.302256** | 0.693175 | 51.95% | 0.99975 | 3.997783 |
-| CNN | 3.334443 | 0.582125 | 67.25% | 0.80018 | 3.918749 |
-| **Pooled spatial hybrid** | 3.310147 | **0.569333** | **68.25%** | **0.77934** | **3.881617** |
+2. **CNNは同じsampleからWDL/valueを大幅に良く学ぶ。**
+   policy CE差よりvalue差のほうが大きい。
 
-This is the first hybrid in the ablation series to preserve the CNN value-learning benefit without materially giving up the Transformer policy fit. Its policy CE is only +0.007891 behind the Transformer while its value metrics slightly exceed the full CNN baseline and its total loss is the best of the three.
+3. **CNNの最も再現性の高いadvantageはsearch下に現れる。**
+   hashed splitの16-simulation Arenaでは120 games pooledで約66%。policy-onlyではparityと矛盾しない。
 
-### Arena
+4. **independent CNN value branchをTransformer policyへ付けるだけではgainを回収できない。**
+   shared CNN representationまたはpolicy-value consistencyが重要な可能性がある。
 
-At 16 simulations per side, 300-piece cap, fp16, and otherwise matched search settings:
-
-- seed 777: pooled spatial hybrid 23-17 Transformer (57.5%)
-- seed 5150: pooled spatial hybrid 21-19 Transformer (52.5%)
-- pooled: 44-36 over 80 games = 55.0%, Wilson 95% CI approximately 44.1%-65.4%
-
-This is statistically compatible with parity. It does not establish a game-strength improvement over the Transformer, but unlike the earlier compact hybrids it also does not show a clear search regression.
-
-### Inference cost
-
-A forward-only fp16 benchmark at Arena batch size 16 and the production maximum tensor shapes gave:
-
-| Architecture | latency / batch | throughput |
-|---|---:|---:|
-| Transformer | 8.271 ms | 1,934.5 positions/s |
-| Pooled spatial hybrid | 13.746 ms | 1,163.9 positions/s |
-
-The deep CNN therefore makes the hybrid about 1.66x slower per inference batch (about 40% lower position throughput) despite keeping Transformer sequence length under control. The remaining engineering question is whether later strength gains justify this extra inference cost, or whether CNN depth/channels can be reduced without losing the value-learning advantage.
-
-## Current interpretation
-
-The evidence now supports a narrower conclusion than the first Arena suggested:
+5. **small shared-local hybridでも解決しなかった。**
+   full CNN baselineの192 channels / 10 residual blocksと、compact hybridの64 channels / 4 blocksではfeature qualityが違う可能性がある。またはpolicy/valueを同じCNN stateから直接生成すること自体が重要かもしれない。
 
 1. **Transformer is consistently better at reproducing the Transformer-generated search policy.** This survives two training seeds and the corrected hashed split.
 2. **CNN is substantially better at WDL/value learning on the same samples.** The difference is much larger than the policy-CE gap.
@@ -358,8 +417,13 @@ The Arena signal nevertheless continued:
 Thus the self-play adaptation effect repeated for a second consecutive generation rather than appearing only at the first distribution shift.
 
 On the same 12-game 32-sim firepower diagnostic used above, Gen-6 produced **65.71 APM / 0.084 APP / 12.99 PPS**. This is lower than Gen-5 seed42 (86.94 / 0.105 / 13.78) but still well above the seed-42 Transformer (38.14 / 0.049 / 12.94), while Gen-6 simultaneously beats Gen-5 in Arena. Raw attack rate is therefore not the sole objective being improved by the closed self-play/search loop.
+したがって次のhybrid experimentでは、「もっとheadを足す」のではなく、次のような明示hypothesisを1つ選びます。
 
-## Added experiment tooling
+- full-capacity local encoderが必要なのか
+- policy/valueがexact same CNN representationを共有する必要があるのか
+- local CNN + global Transformerというrole separationが有効なのか
+
+## 追加した実験tool
 
 - `trainer/ablation_models.py` — CNN baseline, hybrid, checkpoint loader
 - `trainer/run_cnn_ablation.py` — fixed-data paired training ablation
@@ -369,5 +433,20 @@ On the same 12-game 32-sim firepower diagnostic used above, Gen-6 produced **65.
 - `trainer/benchmark_ablation_inference.py` — forward-only latency/throughput comparison for ablation checkpoints
 - `trainer/run_multiseed_ablation_arena.py` — wide-seed Arena aggregation, including policy-only diagnostics
 - `trainer/gpu_match.py` loader — architecture-agnostic experimental checkpoint loading so hybrid checkpoints can drive the existing GPU self-play protocol
+- `trainer/ablation_models.py`
+  - CNN baseline
+  - hybrid variants
+  - checkpoint loader
+- `trainer/run_cnn_ablation.py`
+  - fixed-data paired training ablation
+- `trainer/run_ablation_arena.py`
+  - ablation checkpoint対応Arena runner
+  - policy-only diagnostic override
+- `trainer/analyze_policy_ranking.py`
+  - teacher ranking
+  - top-k
+  - entropy-stratified policy diagnostic
+- `trainer/run_composite_arena.py`
+  - inference-time policy/value factorial mixing
 
-The existing `trainer/tetraformer.py`, production checkpoints, and champion are not replaced by this experiment.
+既存 `trainer/tetraformer.py`、production checkpoint、Championはこの実験によって置換していません。

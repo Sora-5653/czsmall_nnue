@@ -1,36 +1,32 @@
-# ADR 0001: C++17 for the rule core instead of Rust
+# ADR 0001: rule coreはRustではなくC++で実装する
 
-## Status
-Accepted.
+## 状態
 
-## Context
-Spec §17 recommends Rust or C++ for the rule core and search, and Rust was the
-initially preferred option.
+採用。言語選択は現在も有効です。
 
-The development sandbox for this work could not obtain a Rust toolchain:
-`static.rust-lang.org`, `crates.io`, `index.crates.io` and GitHub release
-assets (`release-assets.githubusercontent.com`) are all unreachable from it,
-and no distro package, container registry or mirror was available either. Only
-PyPI, npm and the GitHub API/codeload endpoints respond.
+**追補:** 当時はC++17を採用しましたが、Cobra integration後の現行 `Makefile` はC++23を要求します。したがって「C++を使う」という判断は維持しつつ、現行build standardはC++23です。
 
-Writing Rust anyway would have meant shipping a rule core that had never been
-compiled, let alone tested — directly at odds with the goal of making M0/M1
-*robust*, where spec §18.1 states that rule consistency is the single most
-important requirement.
+## 背景
 
-## Decision
-Implement the rule core in C++17, which spec §17 explicitly permits, using the
-`g++ 12` toolchain available locally. Keep the code dependency-free so it
-builds anywhere with a standard compiler.
+Spec §17はrule coreとsearchの実装言語としてRustまたはC++を推奨しており、当初はRustを第一候補にしていました。
 
-## Consequences
-- The full test suite (117 tests, ~518k assertions) actually runs, under
-  `-Werror`, AddressSanitizer and UBSan. Several real bugs were caught this way
-  that static review would have missed.
-- No `cargo`, so the build is a hand-written `Makefile` with header dependency
-  tracking. Adequate for a header-mostly project.
-- If the project later moves to Rust, the C++ implementation doubles as a
-  reference oracle: the property and determinism tests can be run against both
-  and diffed, which is a stronger position than a direct rewrite.
-- Memory safety is not guaranteed by the language, so sanitizers are part of CI
-  rather than optional.
+しかし初期開発sandboxではRust toolchainを取得できませんでした。`static.rust-lang.org`、`crates.io`、`index.crates.io`、GitHub release assetへ到達できず、利用可能なdistribution package、container registry、mirrorもありませんでした。一方でPyPI、npm、GitHub API/codeload endpointは利用できました。
+
+この状態でRustを選ぶと、**一度もcompileもtestもしていないrule coreを出荷する**ことになります。これはM0/M1をrobustにするという目的、とくにspec §18.1の「rule consistencyを最重要要件とする」という方針に反します。
+
+## 決定
+
+rule coreをC++で実装します。
+
+当初は、spec §17が明示的に許容していたC++17と、sandboxに存在した `g++ 12` を使いました。外部dependencyを持たず、standard compilerだけでbuildできる構造を維持します。
+
+後にvendored Cobra backendがC++23を要求するようになったため、現行compiler modeは `-std=c++23` へ更新されています。これはRust/C++という本ADRの根本判断を変更するものではありません。
+
+## 帰結
+
+- 初期段階から実際にfull test suiteを実行でき、`-Werror`、AddressSanitizer、UBSanで検証できました。
+- 当時の初期suiteは117 tests・約518k assertionsであり、static reviewだけでは見逃した複数の実bugを検出しました。この数値は**当時のhistorical measurement**で、現在のtest countではありません。
+- `cargo` を使わず、header dependency trackingを持つhand-written `Makefile` を採用しました。header-heavy projectとしては十分な構成です。
+- 将来Rustへ移行する場合も、C++ implementationをreference oracleとして残し、property/determinism testを両実装へ流してdiffできます。
+- language-level memory safetyは保証されないため、sanitizerをoptionalではなくCI requirementとして扱います。
+- 現在はCobraの要件に合わせてC++23へ移行しています。現行環境の要件は `README.md` と `docs/SETUP.md` を参照してください。
