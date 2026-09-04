@@ -333,24 +333,32 @@ TEST(expand_delay_bins_produces_distinct_waits) {
 }
 
 TEST(expand_delay_bins_drops_a_pointless_wait) {
-    // With nothing to wait for, WAIT_FOR_EVENT must not duplicate a fixed bin.
+    // WAIT_FOR_EVENT is an extra delay that aligns each placement's lock with
+    // the event. Placements whose FASTEST duration already reaches the event
+    // get no WAIT variant; faster placements get exactly the missing ticks.
     const RulesetConfig cfg = league();
     MoveGenerator gen;
     Board b(10, 40);
     const auto base = gen.generate_for_piece(b, Piece::O, cfg, false);
+    constexpr Tick event = 2;
 
-    // A garbage activation exactly 2 ticks away collides with the +2F bin.
     const auto expanded =
-        MoveGenerator::expand_delay_bins(base, cfg, 0, /*next_garbage=*/2, TICK_NEVER,
+        MoveGenerator::expand_delay_bins(base, cfg, 0, event, TICK_NEVER,
                                          {DelayBin::Fastest, DelayBin::Plus2F,
                                           DelayBin::WaitForEvent});
     for (const auto& b0 : base) {
-        int matches = 0;
-        for (const auto& e : expanded)
-            if (e.final_x == b0.final_x && e.final_rotation == b0.final_rotation &&
-                e.final_y == b0.final_y && e.delay_ticks == 2)
-                ++matches;
-        CHECK_MSG(matches == 1, "a wait equal to a fixed bin must be deduplicated");
+        int waits = 0;
+        for (const auto& e : expanded) {
+            if (e.final_x != b0.final_x || e.final_rotation != b0.final_rotation ||
+                e.final_y != b0.final_y || e.final_piece != b0.final_piece ||
+                e.delay_bin != DelayBin::WaitForEvent)
+                continue;
+            ++waits;
+            CHECK_EQ(e.delay_ticks, std::max<Tick>(0, event - b0.base_duration));
+            CHECK_EQ(e.total_duration(), event);
+        }
+        if (b0.base_duration >= event) CHECK_EQ(waits, 0);
+        else CHECK_EQ(waits, 1);
     }
 }
 
@@ -399,8 +407,9 @@ TEST(waiting_lets_garbage_activate_before_the_next_placement) {
 }
 
 TEST(wait_for_event_targets_the_activation_tick) {
-    // End to end: the wait resolved for a real pending-garbage state must be
-    // exactly long enough to reach activation.
+    // The event resolver returns the event horizon, while the action expander
+    // subtracts the placement's unavoidable base execution time so that the
+    // resulting *lock* lands on the event rather than one base-duration late.
     RulesetConfig cfg = league();
     cfg.garbage.travel_time = 10;
     cfg.garbage.activation_delay = 20;
@@ -412,8 +421,22 @@ TEST(wait_for_event_targets_the_activation_tick) {
     CHECK_EQ(activation, 30);
 
     const HandlingModel h = HandlingModel::from(cfg);
-    const Tick wait = resolve_wait_for_event(p.now(), activation, TICK_NEVER, h, /*max=*/60);
-    CHECK_EQ(p.now() + wait, activation);
+    const Tick horizon = resolve_wait_for_event(p.now(), activation, TICK_NEVER, h, /*max=*/60);
+    CHECK_EQ(p.now() + horizon, activation);
+
+    MoveGenerator gen;
+    Board b(10, 40);
+    const auto base = gen.generate_for_piece(b, Piece::O, cfg, false);
+    const auto expanded = MoveGenerator::expand_delay_bins(
+        base, cfg, p.now(), activation, TICK_NEVER,
+        {DelayBin::Fastest, DelayBin::WaitForEvent});
+    int checked = 0;
+    for (const auto& e : expanded) {
+        if (e.delay_bin != DelayBin::WaitForEvent) continue;
+        CHECK_EQ(p.now() + e.total_duration(), activation);
+        ++checked;
+    }
+    CHECK(checked > 0);
 }
 
 TEST(delay_bins_are_visible_to_the_model) {

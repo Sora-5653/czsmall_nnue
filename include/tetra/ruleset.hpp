@@ -81,7 +81,7 @@ struct MovementCfg {
     Tick arr = 0;
     Tick sdf = 0;             // 0 == infinite soft drop factor
     Tick are = 0;             // spawn delay
-    bool spawn_above_stack = false;  // clutch-style spawn push
+    bool spawn_above_stack = true;   // TETR.IO clutch-style spawn push after a clear
 };
 
 struct ClearRulesCfg {

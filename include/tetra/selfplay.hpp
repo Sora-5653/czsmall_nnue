@@ -39,6 +39,7 @@ struct SelfPlayConfig {
 struct SelfPlayStats {
     int pieces = 0;
     int lines_cleared = 0;
+    int garbage_lines_cleared = 0;
     int lines_sent = 0;
     int lines_received = 0;
     bool survived = true;
@@ -46,6 +47,26 @@ struct SelfPlayStats {
     float outcome = 0.0f;
     Tick duration = 0;
     TerminationReason termination_reason = TerminationReason::Unknown;
+
+    // Diagnostic-only counters for the bounded FASTEST/WAIT_FOR_EVENT branch.
+    // These never affect search, rewards, dataset labels, or game transitions.
+    int timing_positions = 0;
+    int timing_pairs = 0;
+    int timing_chosen_fastest = 0;
+    int timing_chosen_wait = 0;
+    int timing_straddle_pairs = 0;
+    int timing_counterfactual_pairs = 0;
+    int timing_effect_pairs = 0;
+    int timing_wait_more_cancel_pairs = 0;
+    int timing_wait_less_cancel_pairs = 0;
+    int timing_wait_saves_topout = 0;
+    int timing_wait_causes_topout = 0;
+    std::int64_t timing_pending_lines_sum = 0;
+    std::int64_t timing_cancel_delta_sum = 0;
+    std::int64_t timing_sent_delta_sum = 0;
+    std::int64_t timing_received_delta_sum = 0;
+    double timing_fast_policy_mass = 0.0;
+    double timing_wait_policy_mass = 0.0;
 };
 
 // Plays one game and returns its samples.
@@ -78,10 +99,20 @@ public:
             Player& p_inactive = p0_turn ? p1 : p0;
             int& active_pieces = p0_turn ? p0_pieces : p1_pieces;
 
-            const auto actions =
+            auto actions =
                 movegen_.generate(p_active.board(), p_active.active().type, p_active.hold(),
                                   p_active.visible_next().empty() ? Piece::None : p_active.visible_next()[0],
-                                  rules);
+                                  rules, p_active.attack_state().combo >= 0);
+            const Tick next_activation = p_active.garbage().next_activation(p_active.now());
+            if (sc.enable_timing_actions && next_activation != TICK_NEVER &&
+                !actions.empty()) {
+                const std::vector<DelayBin> timing_bins{
+                    DelayBin::Fastest, DelayBin::WaitForEvent
+                };
+                actions = MoveGenerator::expand_delay_bins(
+                    actions, rules, p_active.now(), next_activation, TICK_NEVER,
+                    timing_bins);
+            }
             if (actions.empty()) {
                 p_active.die(TopoutReason::BlockOut);
                 recorder.note_topout(p_active.index(), p_active.now(),
@@ -106,6 +137,88 @@ public:
                 break;
             }
 
+            // Counterfactual timing audit. Compare adjacent FASTEST/WAIT variants
+            // of the same placement on copies of the exact root state. This is
+            // intentionally diagnostic-only: no counterfactual state is fed back
+            // into self-play or the training target.
+            if (sc.enable_timing_actions && next_activation != TICK_NEVER) {
+                bool has_timing_pair = false;
+                struct TimingOutcome {
+                    bool valid = false;
+                    int sent = 0;
+                    int cancelled = 0;
+                    int received = 0;
+                    bool topped_out = false;
+                };
+                auto simulate_timing = [&](const PlacementAction& action) {
+                    TimingOutcome out;
+                    Player sim = p_active;
+                    if (action.use_hold && !sim.do_hold()) return out;
+                    sim.set_active(action.piece_state());
+                    int sent = 0;
+                    const LockResult lr = sim.lock_piece(action.total_duration(), &sent);
+                    out.valid = lr.ok || lr.topped_out;
+                    out.sent = sent;
+                    out.cancelled = lr.garbage_cancelled;
+                    out.received = lr.garbage_received;
+                    out.topped_out = lr.topped_out || !sim.alive();
+                    return out;
+                };
+
+                for (size_t i = 0; i + 1 < actions.size(); ++i) {
+                    const PlacementAction& fast = actions[i];
+                    const PlacementAction& wait = actions[i + 1];
+                    if (fast.delay_bin != DelayBin::Fastest ||
+                        wait.delay_bin != DelayBin::WaitForEvent)
+                        continue;
+                    if (fast.final_piece != wait.final_piece || fast.final_x != wait.final_x ||
+                        fast.final_y != wait.final_y ||
+                        fast.final_rotation != wait.final_rotation ||
+                        fast.use_hold != wait.use_hold)
+                        continue;
+
+                    has_timing_pair = true;
+                    ++stats.timing_pairs;
+                    if (i < r.search_policy.size())
+                        stats.timing_fast_policy_mass += r.search_policy[i];
+                    if (i + 1 < r.search_policy.size())
+                        stats.timing_wait_policy_mass += r.search_policy[i + 1];
+                    if (p_active.now() + fast.total_duration() < next_activation &&
+                        p_active.now() + wait.total_duration() >= next_activation)
+                        ++stats.timing_straddle_pairs;
+
+                    const TimingOutcome fast_out = simulate_timing(fast);
+                    const TimingOutcome wait_out = simulate_timing(wait);
+                    if (!fast_out.valid || !wait_out.valid) continue;
+                    ++stats.timing_counterfactual_pairs;
+                    const int cancel_delta = wait_out.cancelled - fast_out.cancelled;
+                    const int sent_delta = wait_out.sent - fast_out.sent;
+                    const int received_delta = wait_out.received - fast_out.received;
+                    stats.timing_cancel_delta_sum += cancel_delta;
+                    stats.timing_sent_delta_sum += sent_delta;
+                    stats.timing_received_delta_sum += received_delta;
+                    if (cancel_delta > 0) ++stats.timing_wait_more_cancel_pairs;
+                    if (cancel_delta < 0) ++stats.timing_wait_less_cancel_pairs;
+                    if (fast_out.topped_out && !wait_out.topped_out)
+                        ++stats.timing_wait_saves_topout;
+                    if (!fast_out.topped_out && wait_out.topped_out)
+                        ++stats.timing_wait_causes_topout;
+                    if (cancel_delta != 0 || sent_delta != 0 || received_delta != 0 ||
+                        fast_out.topped_out != wait_out.topped_out)
+                        ++stats.timing_effect_pairs;
+                }
+                if (has_timing_pair) {
+                    ++stats.timing_positions;
+                    stats.timing_pending_lines_sum += p_active.garbage().total_lines();
+                    const DelayBin chosen_delay =
+                        actions[static_cast<size_t>(r.best_action)].delay_bin;
+                    if (chosen_delay == DelayBin::WaitForEvent)
+                        ++stats.timing_chosen_wait;
+                    else if (chosen_delay == DelayBin::Fastest)
+                        ++stats.timing_chosen_fastest;
+                }
+            }
+
             recorder.add(obs, actions, r, tokenizer, p0_turn ? 1 : -1,
                          p_active.index(), p_active.now());
 
@@ -119,7 +232,8 @@ public:
             int sent = 0;
             const LockResult lr = p_active.lock_piece(chosen.total_duration(), &sent);
             
-            recorder.note_outcome_of_last(sent, lr.garbage_received, p_active.now(),
+            recorder.note_outcome_of_last(sent, lr.garbage_received, lr.garbage_cleared,
+                                          lr.garbage_cancelled, p_active.now(),
                                           lr.topped_out);
 
             if (!lr.ok && !lr.topped_out) {
@@ -138,6 +252,7 @@ public:
 
         stats.pieces = p0_pieces;
         stats.lines_cleared = static_cast<int>(p0.lines_cleared());
+        stats.garbage_lines_cleared = static_cast<int>(p0.garbage_lines_cleared());
         stats.lines_sent = static_cast<int>(p0.lines_sent());
         stats.lines_received = static_cast<int>(p0.lines_received());
         stats.survived = p0.alive();

@@ -1,0 +1,23 @@
+{
+  "fixed_opponent_set": [
+    {
+      "role": "weak_historical",
+      "path": "models/gen12_control_T100_30_20260811.best.pt",
+      "sha256": "2b6717a3a33db439784c74df83afc2bbacf62929c1ad76d07c71aaf86e6b883a",
+      "parameters": 7176624
+    },
+    {
+      "role": "medium_historical",
+      "path": "models/gen13_vsaux_control100_20260814.best.pt",
+      "sha256": "8689e8087d356964d257cd2c63f89c5c8bf1afc3da538c830c04d202a9a55f57",
+      "parameters": 7176624
+    },
+    {
+      "role": "current_champion",
+      "path": "models/gen14_rank100_100_20260814.best.pt",
+      "sha256": "ca6b7037a4497f5cb6ab79d5e7baf6632bd6c982adb7f2c8b004d3795a4cdc86",
+      "parameters": 7176624
+    }
+  ],
+  "executed_in_this_run": ["current_champion"]
+}

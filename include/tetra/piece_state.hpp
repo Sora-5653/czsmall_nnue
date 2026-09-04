@@ -109,13 +109,26 @@ inline ActivePiece spawn_piece(Piece type, const RulesetConfig& cfg) {
     // Guideline: pieces spawn in the two columns left of centre for 3-wide
     // boxes, and columns 3..6 for the I piece on a 10-wide field.
     p.x = (cfg.geometry.width - s.box) / 2;
-    // Bottom of the piece sits on the first row above the visible playfield.
-    p.y = cfg.geometry.visible_height;
+    // TETR.IO v19 spawns at client y=B-2.04.  In our bottom-up integer
+    // placement coordinates this puts the lowest occupied spawn row one row
+    // above the visible-field boundary (row visible_height + 1), not directly
+    // on the boundary.
+    p.y = cfg.geometry.visible_height + 1;
     // Pull the bounding box down so the lowest *filled* row of the piece rests
     // on the spawn row (empty rows in the box must not add height).
     int lowest = s.box;
     for (int i = 0; i < 4; ++i) lowest = std::min(lowest, s.cells[static_cast<size_t>(i)].y);
     p.y -= lowest;
+    return p;
+}
+
+inline ActivePiece spawn_piece_with_clutch(const Board& board, Piece type,
+                                           const RulesetConfig& cfg,
+                                           bool allow_clutch) {
+    ActivePiece p = spawn_piece(type, cfg);
+    if (!collides(board, p)) return p;
+    if (!allow_clutch || !cfg.movement.spawn_above_stack) return p;
+    while (collides(board, p) && p.y < cfg.geometry.internal_height + 4) ++p.y;
     return p;
 }
 

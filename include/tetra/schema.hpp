@@ -17,14 +17,22 @@ inline constexpr std::uint64_t OBSERVATION_SCHEMA_HASH = 0x8c74b1e2d6093a5full;
 inline constexpr std::uint32_t ACTION_SCHEMA_VERSION = 1;
 
 inline constexpr std::uint32_t LEGACY_AUX_TARGET_SCHEMA_VERSION = 1;
-inline constexpr std::uint32_t AUX_TARGET_SCHEMA_VERSION = 2;
+inline constexpr std::uint32_t INTERVAL_AUX_TARGET_SCHEMA_VERSION = 2;
+inline constexpr std::uint32_t GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION = 3;
+inline constexpr std::uint32_t AUX_TARGET_SCHEMA_VERSION = 4;
 inline constexpr int LEGACY_AUX_TARGET_COUNT = 4;
 
 inline constexpr int HORIZON_COUNT = 4;
 inline constexpr int AUX_CHANNEL_COUNT = 4;
 inline constexpr int INTERVAL_AUX_TARGET_COUNT = HORIZON_COUNT * AUX_CHANNEL_COUNT;
-inline constexpr int AUX_TARGET_COUNT =
+inline constexpr int INTERVAL_AUX_TARGET_COUNT_V2 =
     LEGACY_AUX_TARGET_COUNT + 2 * INTERVAL_AUX_TARGET_COUNT;
+inline constexpr int GARBAGE_CLEAR_AUX_TARGET_COUNT = 2 * HORIZON_COUNT;
+inline constexpr int AUX_TARGET_COUNT_V3 =
+    INTERVAL_AUX_TARGET_COUNT_V2 + GARBAGE_CLEAR_AUX_TARGET_COUNT;
+inline constexpr int GARBAGE_CANCEL_AUX_TARGET_COUNT = 2 * HORIZON_COUNT;
+inline constexpr int AUX_TARGET_COUNT =
+    AUX_TARGET_COUNT_V3 + GARBAGE_CANCEL_AUX_TARGET_COUNT;
 
 inline constexpr std::array<std::string_view, 17> TOKEN_KIND_ORDER = {
     "row", "col", "board", "active", "hold", "next", "garbage",
@@ -69,11 +77,33 @@ inline constexpr std::array<std::string_view, AUX_TARGET_COUNT> AUX_TARGET_NAMES
     "placements_4_8_garbage_received",
     "placements_4_8_self_topout",
     "placements_4_8_opponent_topout",
+    "real_0_1s_garbage_cleared",
+    "real_1_2s_garbage_cleared",
+    "real_2_4s_garbage_cleared",
+    "real_4_8s_garbage_cleared",
+    "placements_0_1_garbage_cleared",
+    "placements_1_2_garbage_cleared",
+    "placements_2_4_garbage_cleared",
+    "placements_4_8_garbage_cleared",
+    "real_0_1s_garbage_cancelled",
+    "real_1_2s_garbage_cancelled",
+    "real_2_4s_garbage_cancelled",
+    "real_4_8s_garbage_cancelled",
+    "placements_0_1_garbage_cancelled",
+    "placements_1_2_garbage_cancelled",
+    "placements_2_4_garbage_cancelled",
+    "placements_4_8_garbage_cancelled",
 };
 
 inline constexpr int REAL_AUX_BASE = LEGACY_AUX_TARGET_COUNT;
 inline constexpr int PLACEMENT_AUX_BASE =
     REAL_AUX_BASE + INTERVAL_AUX_TARGET_COUNT;
+inline constexpr int GARBAGE_CLEAR_REAL_AUX_BASE = INTERVAL_AUX_TARGET_COUNT_V2;
+inline constexpr int GARBAGE_CLEAR_PLACEMENT_AUX_BASE =
+    GARBAGE_CLEAR_REAL_AUX_BASE + HORIZON_COUNT;
+inline constexpr int GARBAGE_CANCEL_REAL_AUX_BASE = AUX_TARGET_COUNT_V3;
+inline constexpr int GARBAGE_CANCEL_PLACEMENT_AUX_BASE =
+    GARBAGE_CANCEL_REAL_AUX_BASE + HORIZON_COUNT;
 
 inline constexpr int attack_channel = 0;
 inline constexpr int garbage_channel = 1;
@@ -88,13 +118,29 @@ inline constexpr int placement_aux_index(int horizon, int channel) {
     return PLACEMENT_AUX_BASE + horizon * AUX_CHANNEL_COUNT + channel;
 }
 
+inline constexpr int real_garbage_cleared_aux_index(int horizon) {
+    return GARBAGE_CLEAR_REAL_AUX_BASE + horizon;
+}
+
+inline constexpr int placement_garbage_cleared_aux_index(int horizon) {
+    return GARBAGE_CLEAR_PLACEMENT_AUX_BASE + horizon;
+}
+
+inline constexpr int real_garbage_cancelled_aux_index(int horizon) {
+    return GARBAGE_CANCEL_REAL_AUX_BASE + horizon;
+}
+
+inline constexpr int placement_garbage_cancelled_aux_index(int horizon) {
+    return GARBAGE_CANCEL_PLACEMENT_AUX_BASE + horizon;
+}
+
 inline constexpr bool is_count_target(int index) {
     if (index == 0 || index == 1) return true;
-    if (index >= REAL_AUX_BASE && index < AUX_TARGET_COUNT) {
+    if (index >= REAL_AUX_BASE && index < INTERVAL_AUX_TARGET_COUNT_V2) {
         const int channel = (index - REAL_AUX_BASE) % AUX_CHANNEL_COUNT;
         return channel == attack_channel || channel == garbage_channel;
     }
-    return false;
+    return index >= GARBAGE_CLEAR_REAL_AUX_BASE && index < AUX_TARGET_COUNT;
 }
 
 }  // namespace tetra::schema

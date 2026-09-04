@@ -544,6 +544,28 @@ TEST(spawn_position_is_inside_the_field) {
     }
 }
 
+TEST(tetrio_v19_spawn_uses_hidden_row_21) {
+    const RulesetConfig cfg = league();
+    for (int pi = 0; pi < PIECE_COUNT; ++pi) {
+        const ActivePiece piece = spawn_piece(static_cast<Piece>(pi), cfg);
+        Offset cells[4];
+        piece_cells(piece, cells);
+        int min_y = Board::MAX_HEIGHT;
+        for (const Offset& cell : cells) min_y = std::min(min_y, cell.y);
+        CHECK_EQ(min_y, cfg.geometry.visible_height + 1);
+    }
+}
+
+TEST(tetrio_180_horizontal_kick_direction_matches_v19) {
+    const KickTables& t = kick_tables_for(KickTableId::SRS_PLUS);
+    const KickList& left_to_right = kicks_for(t, Piece::T, Rot::L, Rot::R);
+    const KickList& right_to_left = kicks_for(t, Piece::T, Rot::R, Rot::L);
+    CHECK(left_to_right.size() >= 2);
+    CHECK(right_to_left.size() >= 2);
+    CHECK_EQ(left_to_right[1].x, -1);
+    CHECK_EQ(right_to_left[1].x, +1);
+}
+
 TEST(tetrio_180_kicks_are_not_mirror_symmetric) {
     // IMPORTANT for spec 14 (data augmentation): TETR.IO's 180 kick table is
     // intentionally NOT left/right symmetric -- it contains downward kicks for

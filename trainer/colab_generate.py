@@ -73,12 +73,22 @@ AUX_TARGET_NAMES = [
     "placements_2_4_opponent_topout", "placements_4_8_attack",
     "placements_4_8_garbage_received", "placements_4_8_self_topout",
     "placements_4_8_opponent_topout",
+    "real_0_1s_garbage_cleared", "real_1_2s_garbage_cleared",
+    "real_2_4s_garbage_cleared", "real_4_8s_garbage_cleared",
+    "placements_0_1_garbage_cleared", "placements_1_2_garbage_cleared",
+    "placements_2_4_garbage_cleared", "placements_4_8_garbage_cleared",
+    "real_0_1s_garbage_cancelled", "real_1_2s_garbage_cancelled",
+    "real_2_4s_garbage_cancelled", "real_4_8s_garbage_cancelled",
+    "placements_0_1_garbage_cancelled", "placements_1_2_garbage_cancelled",
+    "placements_2_4_garbage_cancelled", "placements_4_8_garbage_cancelled",
 ]
 TOKENIZER_SCHEMA_VERSION = 2
 TOKENIZER_SCHEMA_HASH = 0x5F1E2C9A7B43D816
 OBSERVATION_SCHEMA_HASH = 0x8C74B1E2D6093A5F
 ACTION_SCHEMA_VERSION = 1
-AUX_TARGET_SCHEMA_VERSION = 2
+INTERVAL_AUX_TARGET_SCHEMA_VERSION = 2
+GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION = 3
+AUX_TARGET_SCHEMA_VERSION = 4
 
 
 class ManifestError(ValueError):
@@ -198,11 +208,19 @@ def read_dataset_header(path: Path) -> DatasetHeader:
                 header.observation_schema_hash != OBSERVATION_SCHEMA_HASH or
                 header.action_schema_version != ACTION_SCHEMA_VERSION):
             raise ManifestError(f"tokenizer/observation/action schema mismatch: {path}")
-        if header.aux_target_schema_version == AUX_TARGET_SCHEMA_VERSION and header.aux_targets != 36:
+        if header.aux_target_schema_version == AUX_TARGET_SCHEMA_VERSION and header.aux_targets != 52:
+            raise ManifestError(f"aux target width does not match schema v4: {path}")
+        if (header.aux_target_schema_version == GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION and
+                header.aux_targets != 44):
+            raise ManifestError(f"aux target width does not match schema v3: {path}")
+        if (header.aux_target_schema_version == INTERVAL_AUX_TARGET_SCHEMA_VERSION and
+                header.aux_targets != 36):
             raise ManifestError(f"aux target width does not match schema v2: {path}")
         if header.aux_target_schema_version == 1 and header.aux_targets != 4:
             raise ManifestError(f"legacy aux target width does not match schema v1: {path}")
-        if header.aux_target_schema_version not in (1, AUX_TARGET_SCHEMA_VERSION):
+        if header.aux_target_schema_version not in (
+                1, INTERVAL_AUX_TARGET_SCHEMA_VERSION,
+                GARBAGE_CLEAR_AUX_TARGET_SCHEMA_VERSION, AUX_TARGET_SCHEMA_VERSION):
             raise ManifestError(f"unknown aux target schema: {path}")
     actual_size = path.stat().st_size
     expected_size = _expected_dataset_size(header)

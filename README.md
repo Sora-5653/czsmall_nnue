@@ -62,6 +62,15 @@ python trainer/gpu_selfplay.py models/gen1.cont.pt data/gen2.tetradat \
 python trainer/iterate.py --champion models/champion.pt \
     --replay data/gen1.tetradat --generation 2 \
     --champion-output models/champion --device cuda
+
+# Bootstrap policy/value from consented TETR.IO human replays.
+python trainer/human_pretrain.py /path/to/consented/replays \
+    --engine build/tetra_cli --device cuda --require-gpu \
+    --save models/human_pretrain.pt
+
+# Keep those human shards as fixed replay while self-play/Reanalyze continues.
+python trainer/auto_improve.py --champion models/human_pretrain.pt \
+    --bootstrap-replay-dir data/human_replay_shards --reanalyze --device cuda
 ```
 
 AMD GPUでの学習は、プロジェクト標準としてROCm 7.2以降を前提にしています。RX 9070 XTは `gfx1201` として扱います。詳細は [`docs/SETUP.md`](docs/SETUP.md) を参照してください。
@@ -113,6 +122,7 @@ AMD GPUでの学習は、プロジェクト標準としてROCm 7.2以降を前�
 - **再開可能checkpoint。** modelだけでなくoptimizerとsampling RNGも保存します。WDL価値headは既定で学習し、accuracyとscalar MSEも記録します。
 - **replay mixとguard付きiteration。** `train.py` は複数generationと `--new-data-repeat` を受け取り、`trainer/iterate.py` がGPU自己対局・学習・Arena・条件付きpromotionを接続します。
 - **sample-efficiency contract。** 現行schema v2の補助目標は36次元で、未知未来をmaskし、方策・価値・補助loss間のshared-trunk gradient norm/cosineも観測できます。
+- **人間リプレイのbootstrap。** `trainer/ttrm_ingest.py` はcanonical形式またはcollector形式の`.ttrm`を正規化し、`tetra_cli import-human-replay` は合法手生成・tokenize・action embeddingをC++側の権威として処理します。`trainer/import_human_replays.py` はcontent-addressed cache、shard、manifestを提供し、`trainer/human_pretrain.py` はtimingや補助目標を推測せず配置・hold方策と結果valueを学習します。`--bootstrap-replay-dir` により人間shardを継続改善時の固定replayとして保持できます。詳細は [`docs/HUMAN_REPLAY_PRETRAINING.md`](docs/HUMAN_REPLAY_PRETRAINING.md) を参照してください。
 
 過去の校正実験では、garbage stream下でGumbel-32が250/250 placementsへ到達し、policy-onlyは平均228.7でした。engine生成データ上では初期のheld-out total lossが4.86 → 2.91へ低下しました。これらは実装・学習経路の成立を示す過去の測定であり、現在のChampion強度そのものを表す数値ではありません。
 
@@ -120,7 +130,7 @@ AMD GPUでの学習は、プロジェクト標準としてROCm 7.2以降を前�
 
 ## 検証
 
-2026-08-10時点の通常 `make test` では **282 tests / 1,045,724 assertions / 0 failed** を確認しています。重要な不変条件は次のとおりです。
+通常の `make test` では **292 tests / 1,055,146 assertions / 0 failed** を確認しています。Reanalyzeのintegration testは3件（17 assertions）です。重要な不変条件は次のとおりです。
 
 - **決定性** — 同一seedのreplayはgarbage込みでbit-identical。RNG状態もsnapshot/restore可能。
 - **鏡映関係** — 回転結果・合法配置集合をrandom board上でcell単位に検査。ただしclassic SRS IおよびTETR.IO 180の既知の非対称性は別途固定。
@@ -208,6 +218,7 @@ trainer/
   train.py           再開可能trainer
   gpu_match.py       GPU match runner
   gpu_selfplay.py    GPU自己対局dataset生成
+  reanalyze.py       exact historical replay + selective GPU target refresh
   colab_generate.py  再現可能Colab shard launcher + validator
   gpu_arena.py       GPU Candidate-vs-Champion Arena
   iterate.py         generation/replay/Arena driver

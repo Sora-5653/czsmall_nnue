@@ -13,6 +13,17 @@ from ablation_models import load_ablation_checkpoint
 from gpu_arena import evaluate, report
 
 
+class ValueTemperatureWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, temperature: float):
+        super().__init__()
+        self.model = model
+        self.temperature = temperature
+
+    def forward(self, tokens, token_mask, actions, action_mask):
+        policy, value, aux = self.model(tokens, token_mask, actions, action_mask)
+        return policy, value / self.temperature, aux
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("candidate")
@@ -31,6 +42,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp16")
     ap.add_argument("--gumbel", action="store_true")
+    ap.add_argument("--candidate-value-temperature", type=float, default=1.0)
+    ap.add_argument("--champion-value-temperature", type=float, default=1.0)
     args = ap.parse_args()
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -38,6 +51,14 @@ def main() -> int:
     device = torch.device(args.device)
     candidate = load_ablation_checkpoint(args.candidate, device)
     champion = load_ablation_checkpoint(args.champion, device)
+    if args.candidate_value_temperature <= 0 or args.champion_value_temperature <= 0:
+        raise SystemExit("value temperature must be > 0")
+    if args.candidate_value_temperature != 1.0:
+        candidate = ValueTemperatureWrapper(candidate, args.candidate_value_temperature).to(device)
+        candidate.eval()
+    if args.champion_value_temperature != 1.0:
+        champion = ValueTemperatureWrapper(champion, args.champion_value_temperature).to(device)
+        champion.eval()
 
     root = Path(__file__).resolve().parents[1]
     engine = args.engine or str(root / ("build/tetra_cli.exe" if os.name == "nt" else "build/tetra_cli"))

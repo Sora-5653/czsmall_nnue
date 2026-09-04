@@ -1,0 +1,27 @@
+{
+  "search_family": "Gumbel sequential halving",
+  "gumbel_c_scale": 0.01,
+  "gumbel_noise_scale": 0.05,
+  "max_depth": 6,
+  "batch_size": 16,
+  "determinizations": 1,
+  "simulations_cap": 100000,
+  "timing_actions": false,
+  "budgets_ms": [5, 10, 20, 40, 80, 160],
+  "primary_budgets_ms": [10, 40, 160],
+  "environments": {
+    "E1": {"garbage_style": 0, "description": "no incoming interaction"},
+    "E2": {"garbage_style": 2, "garbage_period": 8, "garbage_lines": 2, "description": "scripted incoming garbage"},
+    "E3": {"garbage_style": 1, "description": "full versus"}
+  },
+  "game_path_padding": {
+    "fixed_token_count": 0,
+    "fixed_action_count": 0,
+    "reason": "The stable short-path measurements retained the existing variable-shape protocol; fixed-shape padding was separately probed but long-run stability was not established."
+  },
+  "short_path_deviation": {
+    "max_pieces": 5,
+    "extended_diagnostic_max_pieces": 20,
+    "reason": "Longer time-budget protocol runs stalled before returning a result; raw JSON is not treated as gameplay evidence."
+  }
+}

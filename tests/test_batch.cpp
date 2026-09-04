@@ -322,6 +322,7 @@ TEST(dataset_round_trips) {
     CHECK(r.batch.termination_reason == batch.termination_reason);
     CHECK(r.batch.game_seed == batch.game_seed);
     CHECK(r.batch.move_number == batch.move_number);
+    CHECK(r.batch.chosen_action == batch.chosen_action);
 }
 
 TEST(interval_aux_targets_carry_masks_and_termination_reason) {

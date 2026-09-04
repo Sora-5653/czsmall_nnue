@@ -19,6 +19,7 @@
 #include "tetra/ruleset.hpp"
 #include "tetra/search.hpp"
 #include "tetra/selfplay.hpp"
+#include "tetra/stats.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -37,9 +38,25 @@ struct ArenaConfig {
     // measure whether search actually improves a fixed network.
     int candidate_simulations = -1;
     int champion_simulations = -1;
+    // Negative values inherit the shared per-decision wall-clock budget.
+    float candidate_time_budget_ms = -1.0f;
+    float champion_time_budget_ms = -1.0f;
+    // Negative values inherit the shared equal-node diagnostic cap.
+    int candidate_node_budget = -1;
+    int champion_node_budget = -1;
     // -1 inherits search.use_gumbel; 0/1 override per side for diagnostics.
     int candidate_gumbel = -1;
     int champion_gumbel = -1;
+    // Negative values inherit search.gumbel_noise_scale.  Per-side overrides
+    // let Arena calibrate exploration on one fixed checkpoint without changing
+    // any network weights or the opponent's search distribution.
+    float candidate_gumbel_noise_scale = -1.0f;
+    float champion_gumbel_noise_scale = -1.0f;
+    // -1 inherits search.enable_timing_actions; 0/1 override per side. This
+    // permits causal timing experiments without changing the default Arena
+    // action contract used by historical checkpoints.
+    int candidate_timing_actions = -1;
+    int champion_timing_actions = -1;
     GarbageStyle garbage_style = GarbageStyle::Steady;
     int garbage_period = 8;
     int garbage_lines = 2;
@@ -55,13 +72,57 @@ struct ArenaGameResult {
     int champion_pieces = 0;
     std::int64_t candidate_cleared = 0;
     std::int64_t champion_cleared = 0;
+    std::int64_t candidate_garbage_cleared = 0;
+    std::int64_t champion_garbage_cleared = 0;
     std::int64_t candidate_sent = 0;
     std::int64_t champion_sent = 0;
+    std::int64_t candidate_received = 0;
+    std::int64_t champion_received = 0;
     Tick candidate_duration = 0;
     Tick champion_duration = 0;
     bool candidate_survived = false;
     bool champion_survived = false;
+    TopoutReason candidate_topout = TopoutReason::None;
+    TopoutReason champion_topout = TopoutReason::None;
     float candidate_score = 0.0f;       // 1.0 = win, 0.5 = draw, 0.0 = loss
+};
+
+struct SearchSideDiagnostics {
+    std::uint64_t decisions = 0;
+    std::uint64_t simulations = 0;
+    std::uint64_t nodes = 0;
+    std::uint64_t evaluator_calls = 0;
+    std::uint64_t positions_evaluated = 0;
+    std::uint64_t evaluation_flushes = 0;
+    std::uint64_t node_budget_cutoffs = 0;
+    std::uint64_t time_budget_exhaustions = 0;
+    std::uint64_t raw_policy_matches = 0;
+    std::uint64_t searched_action_changes = 0;
+    double elapsed_ms = 0.0;
+    double overshoot_ms = 0.0;
+    double evaluator_elapsed_ms = 0.0;
+    double root_setup_us = 0.0;
+    double gather_us = 0.0;
+    double backup_us = 0.0;
+    double finalize_us = 0.0;
+    double node_allocation_us = 0.0;
+    double legal_action_generation_us = 0.0;
+    double state_transition_us = 0.0;
+    double selection_us = 0.0;
+    double depth_sum = 0.0;
+    std::uint64_t depth_samples = 0;
+    int max_depth = 0;
+    double legal_actions = 0.0;
+    double root_total_visits = 0.0;
+    double root_top1_visit_share = 0.0;
+    double root_top1_q = 0.0;
+    double root_visit_entropy = 0.0;
+    std::vector<double> decision_latencies_ms;
+};
+
+struct ArenaDiagnostics {
+    SearchSideDiagnostics candidate;
+    SearchSideDiagnostics champion;
 };
 
 struct ArenaResult {
@@ -72,8 +133,35 @@ struct ArenaResult {
     float win_rate = 0.0f;              // (candidate_wins + 0.5 * draws) / games_played
     float ci_lower = 0.0f;              // Wilson score 95% CI lower bound
     float ci_upper = 0.0f;              // Wilson score 95% CI upper bound
+    float candidate_vs = 0.0f;          // aggregate TETR.IO VS score
+    float champion_vs = 0.0f;           // aggregate TETR.IO VS score
+    float candidate_apm = 0.0f;
+    float champion_apm = 0.0f;
+    float candidate_app = 0.0f;
+    float champion_app = 0.0f;
+    float candidate_pps = 0.0f;
+    float champion_pps = 0.0f;
+    float candidate_avg_pieces = 0.0f;
+    float champion_avg_pieces = 0.0f;
+    float candidate_avg_seconds = 0.0f;
+    float champion_avg_seconds = 0.0f;
+    float candidate_survival_rate = 0.0f;
+    float champion_survival_rate = 0.0f;
+    float candidate_sent_per_game = 0.0f;
+    float champion_sent_per_game = 0.0f;
+    float candidate_garbage_cleared_per_game = 0.0f;
+    float champion_garbage_cleared_per_game = 0.0f;
+    float candidate_received_per_game = 0.0f;
+    float champion_received_per_game = 0.0f;
+    float candidate_blockout_rate = 0.0f;
+    float champion_blockout_rate = 0.0f;
+    float candidate_lockout_rate = 0.0f;
+    float champion_lockout_rate = 0.0f;
+    float candidate_garbageout_rate = 0.0f;
+    float champion_garbageout_rate = 0.0f;
     bool promoted = false;              // win_rate >= promotion_threshold
     std::vector<ArenaGameResult> games;
+    ArenaDiagnostics diagnostics;
 };
 
 class Arena {
@@ -83,6 +171,7 @@ public:
 
     ArenaResult evaluate(const RulesetConfig& rules, std::uint64_t base_seed = 42) {
         ArenaResult res;
+        diagnostics_ = ArenaDiagnostics{};
         for (int i = 0; i < cfg_.pairs; ++i) {
             const std::uint64_t pair_seed =
                 base_seed + static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull;
@@ -113,6 +202,107 @@ public:
         }
 
         if (res.games_played > 0) {
+            std::int64_t candidate_pressure = 0;
+            std::int64_t champion_pressure = 0;
+            std::int64_t candidate_sent = 0;
+            std::int64_t champion_sent = 0;
+            std::int64_t candidate_garbage_cleared = 0;
+            std::int64_t champion_garbage_cleared = 0;
+            std::int64_t candidate_received = 0;
+            std::int64_t champion_received = 0;
+            std::int64_t candidate_pieces = 0;
+            std::int64_t champion_pieces = 0;
+            int candidate_survived = 0;
+            int champion_survived = 0;
+            int candidate_blockout = 0;
+            int champion_blockout = 0;
+            int candidate_lockout = 0;
+            int champion_lockout = 0;
+            int candidate_garbageout = 0;
+            int champion_garbageout = 0;
+            Tick candidate_duration = 0;
+            Tick champion_duration = 0;
+            for (const auto& g : res.games) {
+                candidate_sent += g.candidate_sent;
+                champion_sent += g.champion_sent;
+                candidate_garbage_cleared += g.candidate_garbage_cleared;
+                champion_garbage_cleared += g.champion_garbage_cleared;
+                candidate_pressure += g.candidate_sent + g.candidate_garbage_cleared;
+                champion_pressure += g.champion_sent + g.champion_garbage_cleared;
+                candidate_received += g.candidate_received;
+                champion_received += g.champion_received;
+                candidate_pieces += g.candidate_pieces;
+                champion_pieces += g.champion_pieces;
+                candidate_survived += g.candidate_survived ? 1 : 0;
+                champion_survived += g.champion_survived ? 1 : 0;
+                candidate_blockout += g.candidate_topout == TopoutReason::BlockOut ? 1 : 0;
+                champion_blockout += g.champion_topout == TopoutReason::BlockOut ? 1 : 0;
+                candidate_lockout += g.candidate_topout == TopoutReason::LockOut ? 1 : 0;
+                champion_lockout += g.champion_topout == TopoutReason::LockOut ? 1 : 0;
+                candidate_garbageout += g.candidate_topout == TopoutReason::GarbageOut ? 1 : 0;
+                champion_garbageout += g.champion_topout == TopoutReason::GarbageOut ? 1 : 0;
+                candidate_duration += g.candidate_duration;
+                champion_duration += g.champion_duration;
+            }
+            const double tick_rate = static_cast<double>(std::max(1, rules.tick_rate));
+            const double candidate_seconds =
+                candidate_duration > 0 ? static_cast<double>(candidate_duration) / tick_rate : 0.0;
+            const double champion_seconds =
+                champion_duration > 0 ? static_cast<double>(champion_duration) / tick_rate : 0.0;
+            res.candidate_vs = candidate_seconds > 0.0
+                ? static_cast<float>(100.0 * static_cast<double>(candidate_pressure) /
+                                     candidate_seconds)
+                : 0.0f;
+            res.champion_vs = champion_seconds > 0.0
+                ? static_cast<float>(100.0 * static_cast<double>(champion_pressure) /
+                                     champion_seconds)
+                : 0.0f;
+            res.candidate_apm = candidate_seconds > 0.0
+                ? static_cast<float>(60.0 * static_cast<double>(candidate_sent) /
+                                     candidate_seconds)
+                : 0.0f;
+            res.champion_apm = champion_seconds > 0.0
+                ? static_cast<float>(60.0 * static_cast<double>(champion_sent) /
+                                     champion_seconds)
+                : 0.0f;
+            res.candidate_app = candidate_pieces > 0
+                ? static_cast<float>(static_cast<double>(candidate_sent) /
+                                     static_cast<double>(candidate_pieces))
+                : 0.0f;
+            res.champion_app = champion_pieces > 0
+                ? static_cast<float>(static_cast<double>(champion_sent) /
+                                     static_cast<double>(champion_pieces))
+                : 0.0f;
+            res.candidate_pps = candidate_seconds > 0.0
+                ? static_cast<float>(static_cast<double>(candidate_pieces) /
+                                     candidate_seconds)
+                : 0.0f;
+            res.champion_pps = champion_seconds > 0.0
+                ? static_cast<float>(static_cast<double>(champion_pieces) /
+                                     champion_seconds)
+                : 0.0f;
+            const float games = static_cast<float>(res.games_played);
+            res.candidate_avg_pieces = static_cast<float>(candidate_pieces) / games;
+            res.champion_avg_pieces = static_cast<float>(champion_pieces) / games;
+            res.candidate_avg_seconds = static_cast<float>(candidate_seconds / games);
+            res.champion_avg_seconds = static_cast<float>(champion_seconds / games);
+            res.candidate_survival_rate = static_cast<float>(candidate_survived) / games;
+            res.champion_survival_rate = static_cast<float>(champion_survived) / games;
+            res.candidate_sent_per_game = static_cast<float>(candidate_sent) / games;
+            res.champion_sent_per_game = static_cast<float>(champion_sent) / games;
+            res.candidate_garbage_cleared_per_game =
+                static_cast<float>(candidate_garbage_cleared) / games;
+            res.champion_garbage_cleared_per_game =
+                static_cast<float>(champion_garbage_cleared) / games;
+            res.candidate_received_per_game = static_cast<float>(candidate_received) / games;
+            res.champion_received_per_game = static_cast<float>(champion_received) / games;
+            res.candidate_blockout_rate = static_cast<float>(candidate_blockout) / games;
+            res.champion_blockout_rate = static_cast<float>(champion_blockout) / games;
+            res.candidate_lockout_rate = static_cast<float>(candidate_lockout) / games;
+            res.champion_lockout_rate = static_cast<float>(champion_lockout) / games;
+            res.candidate_garbageout_rate = static_cast<float>(candidate_garbageout) / games;
+            res.champion_garbageout_rate = static_cast<float>(champion_garbageout) / games;
+
             const float cw = static_cast<float>(res.candidate_wins);
             const float dw = static_cast<float>(res.draws);
             const float gp = static_cast<float>(res.games_played);
@@ -125,12 +315,74 @@ public:
             res.promoted = (res.win_rate >= cfg_.promotion_threshold &&
                             res.ci_lower > 0.5f);
         }
+        res.diagnostics = diagnostics_;
         return res;
     }
 
     const ArenaConfig& config() const { return cfg_; }
 
 private:
+    static void record_search(SearchSideDiagnostics& out, const SearchResult& result,
+                              float time_budget_ms) {
+        ++out.decisions;
+        out.simulations += static_cast<std::uint64_t>(std::max(0, result.simulations_run));
+        out.nodes += static_cast<std::uint64_t>(std::max(0, result.nodes_created));
+        out.evaluator_calls += static_cast<std::uint64_t>(std::max(0, result.evaluator_calls));
+        out.positions_evaluated +=
+            static_cast<std::uint64_t>(std::max(0, result.positions_evaluated));
+        out.evaluation_flushes +=
+            static_cast<std::uint64_t>(std::max(0, result.telemetry.evaluation_flushes));
+        out.node_budget_cutoffs +=
+            static_cast<std::uint64_t>(std::max(0, result.telemetry.node_budget_cutoffs));
+        if (result.time_budget_exhausted) ++out.time_budget_exhaustions;
+        if (result.raw_policy_action >= 0 && result.raw_policy_action == result.best_action)
+            ++out.raw_policy_matches;
+        if (result.raw_policy_action >= 0 && result.best_action >= 0 &&
+            result.raw_policy_action != result.best_action)
+            ++out.searched_action_changes;
+        out.elapsed_ms += result.elapsed_ms;
+        if (time_budget_ms > 0.0f)
+        out.overshoot_ms += std::max(
+                0.0, result.elapsed_ms - static_cast<double>(time_budget_ms));
+        out.evaluator_elapsed_ms += result.evaluator_elapsed_ms;
+        out.root_setup_us += result.telemetry.root_setup_us;
+        out.gather_us += result.telemetry.gather_us;
+        out.backup_us += result.telemetry.backup_us;
+        out.finalize_us += result.telemetry.finalize_us;
+        out.node_allocation_us += result.telemetry.node_allocation_us;
+        out.legal_action_generation_us += result.telemetry.legal_action_generation_us;
+        out.state_transition_us += result.telemetry.state_transition_us;
+        out.selection_us += result.telemetry.selection_us;
+        out.depth_sum += static_cast<double>(result.telemetry.depth_sum);
+        out.depth_samples += static_cast<std::uint64_t>(
+            std::max(0, result.telemetry.depth_samples));
+        out.max_depth = std::max(out.max_depth, result.max_depth);
+        out.legal_actions += static_cast<double>(result.candidates.size());
+        out.decision_latencies_ms.push_back(result.elapsed_ms);
+        int total_visits = 0;
+        int top_visits = 0;
+        float top_q = 0.0f;
+        for (const SearchCandidate& candidate : result.candidates) {
+            total_visits += std::max(0, candidate.visits);
+            if (candidate.visits > top_visits) {
+                top_visits = candidate.visits;
+                top_q = candidate.q_value;
+            }
+        }
+        out.root_total_visits += static_cast<double>(total_visits);
+        if (total_visits > 0) {
+            out.root_top1_visit_share +=
+                static_cast<double>(top_visits) / static_cast<double>(total_visits);
+            for (const SearchCandidate& candidate : result.candidates) {
+                if (candidate.visits <= 0) continue;
+                const double p = static_cast<double>(candidate.visits) /
+                                 static_cast<double>(total_visits);
+                out.root_visit_entropy -= p * std::log(p);
+            }
+        }
+        out.root_top1_q += static_cast<double>(top_q);
+    }
+
     ArenaGameResult play_game(const RulesetConfig& rules, std::uint64_t seed,
                               int pair_idx, bool mirror, bool swap_roles) {
         ArenaGameResult g;
@@ -161,14 +413,34 @@ private:
             candidate_sc.simulations = cfg_.candidate_simulations;
         if (cfg_.champion_simulations >= 0)
             champion_sc.simulations = cfg_.champion_simulations;
+        if (cfg_.candidate_time_budget_ms >= 0.0f)
+            candidate_sc.time_budget_ms = cfg_.candidate_time_budget_ms;
+        if (cfg_.champion_time_budget_ms >= 0.0f)
+            champion_sc.time_budget_ms = cfg_.champion_time_budget_ms;
+        if (cfg_.candidate_node_budget >= 0)
+            candidate_sc.node_budget = cfg_.candidate_node_budget;
+        if (cfg_.champion_node_budget >= 0)
+            champion_sc.node_budget = cfg_.champion_node_budget;
         if (cfg_.candidate_gumbel >= 0)
             candidate_sc.use_gumbel = cfg_.candidate_gumbel != 0;
         if (cfg_.champion_gumbel >= 0)
             champion_sc.use_gumbel = cfg_.champion_gumbel != 0;
+        if (cfg_.candidate_gumbel_noise_scale >= 0.0f)
+            candidate_sc.gumbel_noise_scale = cfg_.candidate_gumbel_noise_scale;
+        if (cfg_.champion_gumbel_noise_scale >= 0.0f)
+            champion_sc.gumbel_noise_scale = cfg_.champion_gumbel_noise_scale;
+        if (cfg_.candidate_timing_actions >= 0)
+            candidate_sc.enable_timing_actions = cfg_.candidate_timing_actions != 0;
+        if (cfg_.champion_timing_actions >= 0)
+            champion_sc.enable_timing_actions = cfg_.champion_timing_actions != 0;
         Searcher candidate_search(candidate_, candidate_sc);
         Searcher champion_search(champion_, champion_sc);
         int candidate_pieces = 0;
         int champion_pieces = 0;
+        int scripted_events = 0;
+        const bool scripted_garbage = cfg_.garbage_style == GarbageStyle::Scripted;
+        const bool full_versus = cfg_.garbage_style != GarbageStyle::None &&
+                                 !scripted_garbage;
 
         while (candidate_player.alive() && champion_player.alive() &&
                candidate_pieces < cfg_.max_pieces && champion_pieces < cfg_.max_pieces) {
@@ -182,10 +454,20 @@ private:
             Searcher& searcher = candidate_turn ? candidate_search : champion_search;
             SearchConfig& sc = candidate_turn ? candidate_sc : champion_sc;
 
-            const auto actions = gen.generate(
+            auto actions = gen.generate(
                 active.board(), active.active().type, active.hold(),
                 active.visible_next().empty() ? Piece::None : active.visible_next()[0],
-                rules);
+                rules, active.attack_state().combo >= 0);
+            const Tick next_activation = active.garbage().next_activation(active.now());
+            if (sc.enable_timing_actions && next_activation != TICK_NEVER &&
+                !actions.empty()) {
+                const std::vector<DelayBin> timing_bins{
+                    DelayBin::Fastest, DelayBin::WaitForEvent
+                };
+                actions = MoveGenerator::expand_delay_bins(
+                    actions, rules, active.now(), next_activation, TICK_NEVER,
+                    timing_bins);
+            }
             if (actions.empty()) {
                 active.die(TopoutReason::BlockOut);
                 break;
@@ -195,9 +477,13 @@ private:
                       static_cast<std::uint64_t>(candidate_pieces + champion_pieces);
             searcher.set_config(sc);
             Evaluator& opponent_evaluator = candidate_turn ? champion_ : candidate_;
-            const SearchResult r = searcher.search(
-                active, &inactive, &opponent_evaluator,
-                /*deliver_attacks=*/cfg_.garbage_style != GarbageStyle::None);
+            const SearchResult r = full_versus
+                ? searcher.search(active, &inactive, &opponent_evaluator,
+                                  /*deliver_attacks=*/true)
+                : searcher.search(active, nullptr, nullptr,
+                                  /*deliver_attacks=*/false);
+            record_search(candidate_turn ? diagnostics_.candidate : diagnostics_.champion,
+                          r, static_cast<float>(sc.time_budget_ms));
             if (r.best_action < 0 || r.best_action >= static_cast<int>(actions.size())) {
                 active.die(TopoutReason::BlockOut);
                 break;
@@ -217,8 +503,17 @@ private:
             }
             if (lr.topped_out) break;
 
-            if (sent > 0 && cfg_.garbage_style != GarbageStyle::None)
+            if (sent > 0 && full_versus)
                 inactive.receive_attack(sent, active.now(), active.index());
+            ++scripted_events;
+            if (scripted_garbage && cfg_.garbage_period > 0 &&
+                scripted_events % cfg_.garbage_period == 0) {
+                const Tick script_tick = std::max(candidate_player.now(), champion_player.now());
+                if (candidate_player.alive())
+                    candidate_player.receive_attack(cfg_.garbage_lines, script_tick, -1);
+                if (champion_player.alive())
+                    champion_player.receive_attack(cfg_.garbage_lines, script_tick, -1);
+            }
             ++active_pieces;
         }
 
@@ -226,12 +521,18 @@ private:
         g.champion_pieces = champion_pieces;
         g.candidate_cleared = candidate_player.lines_cleared();
         g.champion_cleared = champion_player.lines_cleared();
+        g.candidate_garbage_cleared = candidate_player.garbage_lines_cleared();
+        g.champion_garbage_cleared = champion_player.garbage_lines_cleared();
         g.candidate_sent = candidate_player.lines_sent();
         g.champion_sent = champion_player.lines_sent();
+        g.candidate_received = candidate_player.lines_received();
+        g.champion_received = champion_player.lines_received();
         g.candidate_duration = candidate_player.now();
         g.champion_duration = champion_player.now();
         g.candidate_survived = candidate_player.alive();
         g.champion_survived = champion_player.alive();
+        g.candidate_topout = candidate_player.topout_reason();
+        g.champion_topout = champion_player.topout_reason();
 
         float score = 0.5f;
         if (g.candidate_survived && !g.champion_survived) {
@@ -278,6 +579,7 @@ private:
     Evaluator& candidate_;
     Evaluator& champion_;
     ArenaConfig cfg_;
+    ArenaDiagnostics diagnostics_;
 };
 
 }  // namespace tetra

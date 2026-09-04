@@ -63,6 +63,7 @@ struct TensorBatch {
     std::vector<std::int32_t> termination_reason; // [B], TerminationReason
     std::vector<std::uint64_t> game_seed;         // [B]
     std::vector<std::uint32_t> move_number;       // [B]
+    std::vector<std::int32_t> chosen_action;      // [B], -1 when unavailable
 
     size_t token_stride() const { return static_cast<size_t>(max_tokens) * TOKEN_FEATURES; }
     size_t action_stride() const { return static_cast<size_t>(max_actions) * ACTION_FEATURES; }
@@ -92,6 +93,7 @@ struct TensorBatch {
         termination_reason.clear();
         game_seed.clear();
         move_number.clear();
+        chosen_action.clear();
     }
 };
 
@@ -124,6 +126,7 @@ inline void allocate_batch(TensorBatch& out, int b, int t, int a, bool with_targ
                                       static_cast<std::int32_t>(TerminationReason::Unknown));
         out.game_seed.assign(static_cast<size_t>(b), 0);
         out.move_number.assign(static_cast<size_t>(b), 0);
+        out.chosen_action.assign(static_cast<size_t>(b), -1);
     }
 }
 
@@ -257,6 +260,7 @@ inline TensorBatch make_training_batch(const std::vector<const TrainingSample*>&
         out.termination_reason[b] = static_cast<std::int32_t>(s.termination_reason);
         out.game_seed[b] = s.game_seed;
         out.move_number[b] = s.move_number;
+        out.chosen_action[b] = s.chosen_action;
 
         // Auxiliary targets are squashed into roughly [0, 1] before they leave
         // the engine. They are trained with MSE alongside the policy and value
@@ -271,7 +275,7 @@ inline TensorBatch make_training_batch(const std::vector<const TrainingSample*>&
             return v / (v + scale);
         };
         auto raw_target = [&](int index) {
-            if (s.aux_target_schema_version >= schema::AUX_TARGET_SCHEMA_VERSION)
+            if (s.aux_target_schema_version >= schema::INTERVAL_AUX_TARGET_SCHEMA_VERSION)
                 return s.aux_targets[static_cast<size_t>(index)];
             switch (index) {
                 case 0: return s.future_attack_1s;
@@ -282,7 +286,7 @@ inline TensorBatch make_training_batch(const std::vector<const TrainingSample*>&
             }
         };
         auto raw_valid = [&](int index) {
-            if (s.aux_target_schema_version >= schema::AUX_TARGET_SCHEMA_VERSION)
+            if (s.aux_target_schema_version >= schema::INTERVAL_AUX_TARGET_SCHEMA_VERSION)
                 return s.aux_valid[static_cast<size_t>(index)] != 0;
             return index < schema::LEGACY_AUX_TARGET_COUNT;
         };

@@ -12,6 +12,8 @@ TEST(match_stats_use_simulator_time) {
     CHECK_EQ(pieces_per_second(10, duration, rules), 5.0);
     CHECK_EQ(attacks_per_minute(6, duration, rules), 180.0);
     CHECK_EQ(attacks_per_piece(6, 20), 0.3);
+    // ((6 sent + 2 garbage cleared) / 10 pieces) * 5 PPS * 100 = 400.
+    CHECK_EQ(versus_score(6, 2, 10, duration, rules), 400.0);
 }
 
 TEST(match_stats_are_zero_without_time_or_pieces) {
@@ -20,4 +22,6 @@ TEST(match_stats_are_zero_without_time_or_pieces) {
     CHECK_EQ(pieces_per_second(10, 0, rules), 0.0);
     CHECK_EQ(attacks_per_minute(6, 0, rules), 0.0);
     CHECK_EQ(attacks_per_piece(6, 0), 0.0);
+    CHECK_EQ(versus_score(6, 2, 10, 0, rules), 0.0);
+    CHECK_EQ(versus_score(6, 2, 0, rules.tick_rate, rules), 0.0);
 }

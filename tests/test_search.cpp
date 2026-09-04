@@ -125,6 +125,30 @@ public:
     }
 };
 
+class TailPriorEvaluator final : public Evaluator {
+public:
+    void evaluate(const std::vector<EvalRequest>& batch,
+                  std::vector<Evaluation>& out) override {
+        account(batch.size());
+        out.assign(batch.size(), Evaluation{});
+        for (size_t i = 0; i < batch.size(); ++i) {
+            const size_t n = batch[i].actions ? batch[i].actions->size() : 0;
+            out[i].policy.assign(n, 0.0f);
+            if (n == 1) {
+                out[i].policy[0] = 1.0f;
+            } else if (n >= 2) {
+                // Put the unique best prior at the highest action index and the
+                // runner-up at index zero. Sequential halving gives the final
+                // two equal visit counts at common even budgets, so a broken
+                // visit-argmax combiner will incorrectly fall back to index 0.
+                out[i].policy[0] = 0.4f;
+                out[i].policy[n - 1] = 0.6f;
+            }
+            out[i].value.draw = 1.0f;
+        }
+    }
+};
+
 
 }  // namespace
 
@@ -538,6 +562,41 @@ TEST(puct_needs_enough_simulations_to_beat_its_prior) {
                   std::to_string(gum_visited) + " vs " + std::to_string(puct_visited));
 }
 
+TEST(lc3_search_policy_accounts_for_inflight_edge_work) {
+    SearchConfig cfg;
+    cfg.c_puct = 1.5f;
+    cfg.fpu_reduction = 0.0f;
+    SearchPolicy policy(cfg);
+    detail::SearchNode node;
+    node.visits = 1;
+    node.edges.assign(2, detail::SearchEdge{});
+    node.edges[0].prior = 0.5f;
+    node.edges[1].prior = 0.5f;
+    node.edges[0].inflight = 4;
+
+    CHECK_EQ(node.edges[0].effective_visits(), 4);
+    CHECK_EQ(node.edges[1].effective_visits(), 0);
+    CHECK_EQ(policy.select_puct(node, 0), 1);
+}
+
+TEST(lc3_pipeline_telemetry_is_reported_without_changing_the_budget) {
+    UniformEvaluator ev;
+    SearchConfig cfg;
+    cfg.simulations = 64;
+    cfg.max_depth = 3;
+    cfg.use_gumbel = false;
+    cfg.batch_size = 16;
+    Searcher s(ev, cfg);
+    const SearchResult r = s.search(warmed(9));
+
+    CHECK(r.telemetry.gather_attempts > 0);
+    CHECK(r.telemetry.gathered_leaves > 0);
+    CHECK(r.telemetry.selection_steps > 0);
+    CHECK(r.telemetry.evaluation_flushes == r.evaluator_calls);
+    CHECK(r.telemetry.max_edge_inflight > 0);
+    CHECK(r.positions_evaluated >= r.telemetry.gathered_leaves);
+}
+
 TEST(leaves_are_evaluated_in_batches) {
     // Spec 19.4 targets >= 80% batched leaf evaluation. The mean batch size is
     // the measurable proxy: with a batch size of 16 the search must not be
@@ -851,6 +910,31 @@ TEST(candidate_priors_match_the_evaluator) {
 // Chance nodes / determinization (spec 11.3, and the 18.3 leak requirement)
 // ---------------------------------------------------------------------------
 
+TEST(search_timing_actions_branch_on_future_garbage_activation) {
+    RulesetConfig cfg = league();
+    Player p;
+    p.reset(cfg, 4242, 0);
+    // receive_attack schedules arrival/activation in the future under league
+    // rules, so WAIT_FOR_EVENT is a distinct and meaningful choice.
+    p.receive_attack(4, p.now(), 1);
+    const auto base = actions_of(p);
+    CHECK(!base.empty());
+
+    UniformEvaluator ev;
+    SearchConfig off;
+    off.simulations = 0;
+    off.determinize_root = false;
+    Searcher normal(ev, off);
+    const SearchResult normal_result = normal.search(p);
+    CHECK_EQ(normal_result.search_policy.size(), base.size());
+
+    SearchConfig on = off;
+    on.enable_timing_actions = true;
+    Searcher timed(ev, on);
+    const SearchResult timed_result = timed.search(p);
+    CHECK_EQ(timed_result.search_policy.size(), base.size() * 2);
+}
+
 TEST(determinize_preserves_the_visible_preview) {
     // The pieces the player can legitimately see must survive untouched;
     // only the hidden tail may be resampled.
@@ -1000,6 +1084,35 @@ TEST(multiple_determinizations_average_the_policy) {
     CHECK_MSG(std::fabs(sum - 1.0f) < 1e-3f,
               "averaged policy must remain a distribution, got " + std::to_string(sum));
     CHECK(std::isfinite(r.value.scalar()));
+}
+
+TEST(gumbel_multiple_determinizations_preserve_unanimous_survivor) {
+    // With no Gumbel perturbation and no Q correction, every determinization
+    // selects the same root-prior argmax. Combining particle searches must not
+    // replace that unanimous Gumbel survivor with a visit-count tie-break.
+    TailPriorEvaluator ev;
+    const Player p = warmed(30);
+
+    SearchConfig one;
+    one.simulations = 32;
+    one.max_depth = 6;
+    one.seed = 5;
+    one.determinize_root = true;
+    one.determinizations = 1;
+    one.use_gumbel = true;
+    one.gumbel_noise_scale = 0.0f;
+    one.gumbel_c_scale = 0.0f;
+
+    SearchConfig many = one;
+    many.determinizations = 4;
+
+    Searcher single(ev, one), combined(ev, many);
+    const SearchResult a = single.search(p);
+    const SearchResult b = combined.search(p);
+
+    CHECK(a.best_action >= 0);
+    CHECK_EQ(a.best_action, static_cast<int>(actions_of(p).size()) - 1);
+    CHECK_EQ(b.best_action, a.best_action);
 }
 
 TEST(determinization_is_cheap) {

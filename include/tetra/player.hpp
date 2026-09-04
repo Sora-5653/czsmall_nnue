@@ -24,6 +24,7 @@ struct LockResult {
     AttackResult attack{};
     int garbage_cancelled = 0;
     int garbage_received = 0;        // lines that rose into the field
+    int garbage_cleared = 0;         // cleared rows containing received garbage
     bool topped_out = false;
     TopoutReason topout_reason = TopoutReason::None;
     Tick duration = 0;               // ticks consumed by this placement
@@ -54,6 +55,7 @@ public:
         lines_sent_ = 0;
         lines_received_ = 0;
         lines_cleared_ = 0;
+        garbage_lines_cleared_ = 0;
         spawn_next();
     }
 
@@ -79,6 +81,7 @@ public:
     std::int64_t lines_sent() const { return lines_sent_; }
     std::int64_t lines_received() const { return lines_received_; }
     std::int64_t lines_cleared() const { return lines_cleared_; }
+    std::int64_t garbage_lines_cleared() const { return garbage_lines_cleared_; }
     std::array<std::uint64_t, 4> garbage_rng_state() const { return garbage_rng_.state(); }
     std::array<std::uint64_t, 4> attack_rng_state() const { return attack_rng_.state(); }
     bool mirrored() const { return mirror_board_; }
@@ -166,7 +169,9 @@ public:
         clear.cleared_garbage = garbage_rows_cleared > 0;
         clear.all_clear = clear.lines > 0 && board_.empty();
         r.clear = clear;
+        r.garbage_cleared = garbage_rows_cleared;
         lines_cleared_ += clear.lines;
+        garbage_lines_cleared_ += garbage_rows_cleared;
 
         if (clear.lines > 0) {
             now_ += cfg_.clear_rules.line_clear_delay;
@@ -293,17 +298,10 @@ private:
     bool spawn_next() { return spawn_specific(queue_.pop()); }
 
     bool spawn_specific(Piece p) {
-        active_ = spawn_piece(p, cfg_);
+        active_ = spawn_piece_with_clutch(board_, p, cfg_, state_.combo >= 0);
         if (collides(board_, active_)) {
-            // Guideline block-out: try nudging up once (TETR.IO's clutch spawn).
-            ActivePiece up = active_;
-            up.y += 1;
-            if (cfg_.movement.spawn_above_stack && !collides(board_, up)) {
-                active_ = up;
-            } else {
-                die(TopoutReason::BlockOut);
-                return false;
-            }
+            die(TopoutReason::BlockOut);
+            return false;
         }
         log(EventType::PieceSpawn, active_.type, SpinType::None, 0, 0);
         return true;
@@ -339,6 +337,7 @@ private:
     std::int64_t lines_sent_ = 0;
     std::int64_t lines_received_ = 0;
     std::int64_t lines_cleared_ = 0;
+    std::int64_t garbage_lines_cleared_ = 0;
     bool mirror_board_ = false;
 };
 

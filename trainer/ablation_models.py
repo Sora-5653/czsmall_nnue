@@ -51,6 +51,41 @@ class HybridConfig:
 
 
 @dataclass
+class SpatialHybridConfig:
+    token_features: int = 24
+    action_features: int = 24
+    aux_targets: int = 36
+    width: int = 256
+    layers: int = 8
+    heads: int = 8
+    ffn: int = 768
+    board_rows: int = 24
+    board_cols: int = 10
+    cnn_channels: int = 192
+    cnn_blocks: int = 10
+    dropout: float = 0.0
+
+
+@dataclass
+class PooledSpatialHybridConfig:
+    token_features: int = 24
+    action_features: int = 24
+    aux_targets: int = 36
+    width: int = 256
+    layers: int = 8
+    heads: int = 8
+    ffn: int = 768
+    board_rows: int = 24
+    board_cols: int = 10
+    cnn_channels: int = 192
+    cnn_blocks: int = 10
+    spatial_rows: int = 12
+    spatial_cols: int = 5
+    dropout: float = 0.0
+    factor_timing_policy: bool = False
+
+
+@dataclass
 class SplitHybridConfig:
     token_features: int = 24
     action_features: int = 24
@@ -160,6 +195,39 @@ class BoardCNN(nn.Module):
         avg = x.mean(dim=(-2, -1))
         peak = x.amax(dim=(-2, -1))
         return self.out(torch.cat([avg, peak], dim=-1))
+
+
+class BoardSpatialCNN(nn.Module):
+    """Deep residual board CNN that preserves a spatial feature grid."""
+
+    def __init__(self, width: int, channels: int, blocks: int, rows: int, cols: int,
+                 output_rows: int | None = None, output_cols: int | None = None):
+        super().__init__()
+        self.rows = rows
+        self.cols = cols
+        self.output_rows = output_rows if output_rows is not None else rows
+        self.output_cols = output_cols if output_cols is not None else cols
+        self.stem = PatchConv2d(5, channels)
+        self.blocks = nn.ModuleList([ResidualConvBlock(channels) for _ in range(blocks)])
+        self.norm = nn.GroupNorm(1, channels)
+        self.project = nn.Linear(channels, width)
+        self.out_norm = RMSNorm(width)
+
+    def forward(self, tokens: torch.Tensor, token_mask: torch.Tensor) -> torch.Tensor:
+        x = extract_board_planes(tokens, token_mask, self.rows, self.cols)
+        x = self.stem(x)
+        for block in self.blocks:
+            x = block(x)
+        x = F.silu(self.norm(x))
+        if self.output_rows != self.rows or self.output_cols != self.cols:
+            # Pool only after the deep local encoder has processed the exact
+            # 24x10 geometry.  A 12x5 output corresponds to one Transformer
+            # token per 2x2 board region while retaining CNN-computed context.
+            x = F.adaptive_avg_pool2d(x, (self.output_rows, self.output_cols))
+        x = x.permute(0, 2, 3, 1).reshape(
+            x.shape[0], self.output_rows * self.output_cols, -1
+        )
+        return self.out_norm(self.project(x))
 
 
 class CNNPolicyValue(nn.Module):
@@ -276,6 +344,214 @@ class CNNTransformerHybrid(nn.Module):
 
     def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+class SpatialCNNTransformer(nn.Module):
+    """Deep CNN feature map -> spatial tokens -> Transformer policy/value.
+
+    This is deliberately different from the earlier one-board-token hybrid.  The
+    successful full CNN encoder (192 channels, 10 residual blocks) keeps its full
+    24x10 feature map.  Each spatial feature vector is projected to d_model and
+    fed to the Transformer.  Raw row/column board tokens are removed from the
+    Transformer sequence, while board-summary and game-state tokens are retained.
+    The Transformer therefore reasons over CNN-local features plus global state
+    instead of having to rediscover cell geometry from row bitmaps.
+    """
+
+    architecture = "spatial_hybrid"
+
+    def __init__(self, cfg: SpatialHybridConfig):
+        super().__init__()
+        self.cfg = cfg
+        tf_cfg = TetraFormerConfig(
+            token_features=cfg.token_features,
+            action_features=cfg.action_features,
+            width=cfg.width,
+            layers=cfg.layers,
+            heads=cfg.heads,
+            ffn=cfg.ffn,
+            aux_targets=cfg.aux_targets,
+            dropout=cfg.dropout,
+        )
+        self.board = BoardSpatialCNN(
+            cfg.width, cfg.cnn_channels, cfg.cnn_blocks, cfg.board_rows, cfg.board_cols
+        )
+        self.token_in = nn.Linear(cfg.token_features, cfg.width)
+        self.global_type = nn.Parameter(torch.zeros(1, 1, cfg.width))
+        self.spatial_type = nn.Parameter(torch.zeros(1, 1, cfg.width))
+        nn.init.normal_(self.global_type, std=0.02)
+        nn.init.normal_(self.spatial_type, std=0.02)
+        self.blocks = nn.ModuleList([EncoderBlock(tf_cfg) for _ in range(cfg.layers)])
+        self.norm = RMSNorm(cfg.width)
+
+        self.action_in = nn.Linear(cfg.action_features, cfg.width)
+        self.policy_attn = nn.MultiheadAttention(
+            cfg.width, cfg.heads, dropout=cfg.dropout, batch_first=True
+        )
+        self.policy_norm = RMSNorm(cfg.width)
+        self.policy_out = nn.Linear(cfg.width, 1)
+        self.value_head = nn.Sequential(
+            nn.Linear(cfg.width, cfg.width // 2), nn.SiLU(), nn.Linear(cfg.width // 2, 3)
+        )
+        self.aux_head = nn.Sequential(
+            nn.Linear(cfg.width, cfg.width // 2),
+            nn.SiLU(),
+            nn.Linear(cfg.width // 2, cfg.aux_targets),
+        )
+
+    def _compact_global_tokens(self, tokens: torch.Tensor, token_mask: torch.Tensor):
+        """Drop raw board rows/columns, retaining summaries and non-board state."""
+        batch, token_count, features = tokens.shape
+        rows = self.cfg.board_rows
+        cols = self.cfg.board_cols
+        board_prefix = rows + cols
+        board_span = board_prefix + 1
+        positions = torch.arange(token_count, device=tokens.device).view(1, token_count)
+        keep = token_mask >= 0.5
+
+        # Self board is always first: remove rows+columns, retain summary.
+        keep = keep & (positions >= board_prefix)
+
+        # Duel observations end with opponent board + opponent-counters.  Remove
+        # only opponent rows+columns and retain opponent summary/counters.  Solo
+        # observations have a Missing token instead and are left untouched here.
+        real_counts = (token_mask >= 0.5).sum(dim=1)
+        opponent_start = real_counts - (board_span + 1)
+        has_opponent = opponent_start >= board_span
+        opponent_detail = (
+            has_opponent.unsqueeze(1)
+            & (positions >= opponent_start.unsqueeze(1))
+            & (positions < (opponent_start + board_prefix).unsqueeze(1))
+        )
+        keep = keep & ~opponent_detail
+
+        keep_counts = keep.sum(dim=1)
+        max_keep = int(keep_counts.max().item())
+        sortable = torch.where(keep, positions, positions + token_count)
+        gather_index = sortable.sort(dim=1).values[:, :max_keep].clamp(max=token_count - 1)
+        gathered = tokens.gather(
+            1, gather_index.unsqueeze(-1).expand(batch, max_keep, features)
+        )
+        compact_mask = (
+            torch.arange(max_keep, device=tokens.device).view(1, max_keep)
+            < keep_counts.unsqueeze(1)
+        ).to(token_mask.dtype)
+        return gathered, compact_mask
+
+    def forward(self, tokens, token_mask, actions, action_mask):
+        spatial = self.board(tokens, token_mask) + self.spatial_type
+        global_tokens, global_mask = self._compact_global_tokens(tokens, token_mask)
+        global_x = self.token_in(global_tokens) + self.global_type
+
+        x = torch.cat([global_x, spatial], dim=1)
+        spatial_mask = torch.ones(
+            (token_mask.shape[0], spatial.shape[1]),
+            device=token_mask.device,
+            dtype=token_mask.dtype,
+        )
+        extended_mask = torch.cat([global_mask, spatial_mask], dim=1)
+        pad = extended_mask < 0.5
+        for block in self.blocks:
+            x = block(x, pad)
+        x = self.norm(x)
+
+        weight = extended_mask.unsqueeze(-1)
+        pooled = (x * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
+        query = self.action_in(actions)
+        attended, _ = self.policy_attn(query, x, x, key_padding_mask=pad, need_weights=False)
+        logits = self.policy_out(self.policy_norm(query + attended)).squeeze(-1)
+        logits = logits.masked_fill(action_mask < 0.5, float("-inf"))
+        return logits, self.value_head(pooled), self.aux_head(pooled)
+
+    def parameter_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class PooledSpatialCNNTransformer(SpatialCNNTransformer):
+    """Spatial hybrid with a 2x2 post-CNN pooling bottleneck before attention."""
+
+    architecture = "pooled_spatial_hybrid"
+
+    def __init__(self, cfg: PooledSpatialHybridConfig):
+        super().__init__(cfg)
+        self.cfg = cfg
+        self.board = BoardSpatialCNN(
+            cfg.width,
+            cfg.cnn_channels,
+            cfg.cnn_blocks,
+            cfg.board_rows,
+            cfg.board_cols,
+            output_rows=cfg.spatial_rows,
+            output_cols=cfg.spatial_cols,
+        )
+
+
+def factor_timing_policy_logits(logits: torch.Tensor, actions: torch.Tensor,
+                                action_mask: torch.Tensor) -> torch.Tensor:
+    """Factor adjacent FASTEST/WAIT variants into placement mass x timing split.
+
+    If raw logits for a matched pair are b (FASTEST) and w (WAIT), subtracting
+    softplus(w-b) from both preserves their difference while making the pair's
+    log-sum-exp exactly b.  A timing branch can therefore redistribute a base
+    placement's prior mass without duplicating or inflating that placement.
+    """
+    if logits.shape[1] < 2:
+        return logits
+    legal = action_mask > 0.5
+    delay = torch.round(actions[..., 21] * 5.0).long().clamp(0, 5)
+    base_delta = torch.cat(
+        [actions[:, 1:, :21] - actions[:, :-1, :21],
+         actions[:, 1:, 22:] - actions[:, :-1, 22:]], dim=-1
+    )
+    same_base = base_delta.abs().amax(dim=-1) <= 1e-6
+    pair = (
+        legal[:, :-1] & legal[:, 1:]
+        & (delay[:, :-1] == 0) & (delay[:, 1:] == 5)
+        & same_base
+    )
+    safe_logits = logits.masked_fill(~legal, 0.0)
+    delta = safe_logits[:, 1:] - safe_logits[:, :-1]
+    pair_penalty = F.softplus(delta) * pair.to(logits.dtype)
+    penalty = torch.zeros_like(safe_logits)
+    penalty[:, :-1] = penalty[:, :-1] + pair_penalty
+    penalty[:, 1:] = penalty[:, 1:] + pair_penalty
+    return logits - penalty
+
+
+class AugmentedPooledSpatialCNNTransformer(PooledSpatialCNNTransformer):
+    """Keep the complete raw token sequence and append pooled CNN spatial tokens.
+
+    Unlike `pooled_spatial_hybrid`, this model does not replace raw row/column
+    board tokens.  The Transformer can therefore retain the original value-relevant
+    representation while policy attention also sees CNN-local 2D features.
+    """
+
+    architecture = "augmented_pooled_hybrid"
+
+    def forward(self, tokens, token_mask, actions, action_mask):
+        spatial = self.board(tokens, token_mask) + self.spatial_type
+        raw_x = self.token_in(tokens) + self.global_type
+        x = torch.cat([raw_x, spatial], dim=1)
+        spatial_mask = torch.ones(
+            (token_mask.shape[0], spatial.shape[1]),
+            device=token_mask.device,
+            dtype=token_mask.dtype,
+        )
+        extended_mask = torch.cat([token_mask, spatial_mask], dim=1)
+        pad = extended_mask < 0.5
+        for block in self.blocks:
+            x = block(x, pad)
+        x = self.norm(x)
+
+        weight = extended_mask.unsqueeze(-1)
+        pooled = (x * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
+        query = self.action_in(actions)
+        attended, _ = self.policy_attn(query, x, x, key_padding_mask=pad, need_weights=False)
+        logits = self.policy_out(self.policy_norm(query + attended)).squeeze(-1)
+        logits = logits.masked_fill(action_mask < 0.5, float("-inf"))
+        if self.cfg.factor_timing_policy:
+            logits = factor_timing_policy_logits(logits, actions, action_mask)
+        return logits, self.value_head(pooled), self.aux_head(pooled)
 
 
 class FusionCNNTransformer(nn.Module):
@@ -533,7 +809,9 @@ class SplitHeadCNNTransformer(nn.Module):
 
 
 def build_ablation_model(architecture: str, token_features: int, action_features: int,
-                         aux_targets: int) -> nn.Module:
+                         aux_targets: int, *, pooled_cnn_channels: int = 192,
+                         pooled_cnn_blocks: int = 10,
+                         factor_timing_policy: bool = False) -> nn.Module:
     if architecture == "transformer":
         return TetraFormer(TetraFormerConfig(
             token_features=token_features,
@@ -555,6 +833,29 @@ def build_ablation_model(architecture: str, token_features: int, action_features
             token_features=token_features,
             action_features=action_features,
             aux_targets=aux_targets,
+        ))
+    if architecture == "spatial_hybrid":
+        return SpatialCNNTransformer(SpatialHybridConfig(
+            token_features=token_features,
+            action_features=action_features,
+            aux_targets=aux_targets,
+        ))
+    if architecture == "pooled_spatial_hybrid":
+        return PooledSpatialCNNTransformer(PooledSpatialHybridConfig(
+            token_features=token_features,
+            action_features=action_features,
+            aux_targets=aux_targets,
+            cnn_channels=pooled_cnn_channels,
+            cnn_blocks=pooled_cnn_blocks,
+        ))
+    if architecture == "augmented_pooled_hybrid":
+        return AugmentedPooledSpatialCNNTransformer(PooledSpatialHybridConfig(
+            token_features=token_features,
+            action_features=action_features,
+            aux_targets=aux_targets,
+            cnn_channels=pooled_cnn_channels,
+            cnn_blocks=pooled_cnn_blocks,
+            factor_timing_policy=factor_timing_policy,
         ))
     if architecture == "split_hybrid":
         return SplitHeadCNNTransformer(SplitHybridConfig(
@@ -599,6 +900,12 @@ def load_ablation_checkpoint(path: str, device: torch.device | str = "cpu") -> n
             model = CNNPolicyValue(CNNConfig(**config))
         elif architecture == "hybrid":
             model = CNNTransformerHybrid(HybridConfig(**config))
+        elif architecture == "spatial_hybrid":
+            model = SpatialCNNTransformer(SpatialHybridConfig(**config))
+        elif architecture == "pooled_spatial_hybrid":
+            model = PooledSpatialCNNTransformer(PooledSpatialHybridConfig(**config))
+        elif architecture == "augmented_pooled_hybrid":
+            model = AugmentedPooledSpatialCNNTransformer(PooledSpatialHybridConfig(**config))
         elif architecture == "split_hybrid":
             model = SplitHeadCNNTransformer(SplitHybridConfig(**config))
         elif architecture == "fusion_hybrid":

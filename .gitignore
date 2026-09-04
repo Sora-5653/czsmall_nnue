@@ -1,5 +1,6 @@
 # Build output
 build/
+build-*/
 *.o
 *.d
 
@@ -17,6 +18,6 @@ build/
 
 # Python
 .venv/
-.venv-rocm713/
+.venv-rocm*/
 __pycache__/
 trainer/__pycache__/

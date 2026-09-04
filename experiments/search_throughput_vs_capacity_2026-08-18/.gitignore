@@ -1,0 +1,12 @@
+# Large/generated experiment data stays local; manifests and summaries remain tracked.
+results/*.jsonl
+results/*.stdout
+results/*.stderr
+results/**/*.jsonl
+results/**/*.stdout
+results/**/*.stderr
+results/**/*.pt
+results/**/*.tetrawts
+results/**/*.tetradat
+results/**/*.bin
+scripts/__pycache__/

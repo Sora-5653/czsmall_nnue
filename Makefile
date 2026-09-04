@@ -15,8 +15,12 @@ BUILD := build
 SRC   := $(wildcard src/*.cpp)
 OBJ   := $(patsubst src/%.cpp,$(BUILD)/%.o,$(SRC))
 
-TEST_SRC := $(wildcard tests/*.cpp)
+REANALYSE_TEST_SRC := tests/test_reanalyse.cpp
+TEST_SRC := $(filter-out $(REANALYSE_TEST_SRC),$(wildcard tests/*.cpp))
 TEST_BIN := $(BUILD)/tetra_tests
+REANALYSE_TEST_BIN := $(BUILD)/tetra_reanalyse_tests
+TEST_RUN = $(if $(wildcard $(TEST_BIN).exe),$(TEST_BIN).exe,$(TEST_BIN))
+REANALYSE_TEST_RUN = $(if $(wildcard $(REANALYSE_TEST_BIN).exe),$(REANALYSE_TEST_BIN).exe,$(REANALYSE_TEST_BIN))
 
 TOOL_SRC := $(wildcard tools/*.cpp)
 TOOL_BIN := $(patsubst tools/%.cpp,$(BUILD)/%,$(TOOL_SRC))
@@ -40,13 +44,17 @@ $(BUILD)/tests_%.o: tests/%.cpp | $(BUILD)
 $(TEST_BIN): $(TEST_OBJ) $(OBJ) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $(TEST_OBJ) $(OBJ) -o $@ $(LDFLAGS)
 
+$(REANALYSE_TEST_BIN): $(REANALYSE_TEST_SRC) tests/test_main.cpp $(OBJ) | $(BUILD)
+	$(CXX) $(CXXFLAGS) -Itests $(REANALYSE_TEST_SRC) tests/test_main.cpp $(OBJ) -o $@ $(LDFLAGS)
+
 $(BUILD)/%: tools/%.cpp $(OBJ) $(TOOL_HDR) | $(BUILD)
 	$(CXX) $(CXXFLAGS) $< $(OBJ) -o $@ $(LDFLAGS)
 
 tools: $(TOOL_BIN)
 
-test: $(TEST_BIN)
-	@./$(TEST_BIN)
+test: $(TEST_BIN) $(REANALYSE_TEST_BIN)
+	@./$(TEST_RUN)
+	@./$(REANALYSE_TEST_RUN)
 
 # Stricter pass used in CI: sanitizers + debug assertions.
 .PHONY: test-asan

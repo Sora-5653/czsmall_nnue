@@ -34,4 +34,17 @@ inline double attacks_per_piece(std::int64_t lines_sent, int pieces) {
     return pieces > 0 ? static_cast<double>(lines_sent) / static_cast<double>(pieces) : 0.0;
 }
 
+// TETR.IO VS score: ((lines sent + garbage lines cleared) / pieces) * PPS * 100.
+// Algebraically this is 100 * (sent + garbage-cleared) / seconds; keeping the
+// original factors here makes the metric's game meaning explicit.
+inline double versus_score(std::int64_t lines_sent, std::int64_t garbage_lines_cleared,
+                           int pieces, Tick duration, const RulesetConfig& rules) {
+    const double pps = pieces_per_second(pieces, duration, rules);
+    if (pieces <= 0 || pps <= 0.0) return 0.0;
+    const double pressure_per_piece =
+        static_cast<double>(lines_sent + garbage_lines_cleared) /
+        static_cast<double>(pieces);
+    return pressure_per_piece * pps * 100.0;
+}
+
 }  // namespace tetra
