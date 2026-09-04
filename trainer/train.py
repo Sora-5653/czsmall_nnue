@@ -273,7 +273,9 @@ def main() -> int:
     ap.add_argument("--topout-aux-weight", type=float, default=None,
                     help="BCE weight for real-time self/opponent top-out aux channels (default: checkpoint value or 0)")
     ap.add_argument("--new-data-repeat", type=int, default=1,
-                    help="repeat the last dataset this many times when replaying generations")
+                    help="repeat the newest primary dataset source(s) this many times when replaying generations")
+    ap.add_argument("--new-data-source-count", type=int, default=1,
+                    help="number of newest primary dataset inputs treated as one fresh generation for --new-data-repeat")
     ap.add_argument("--secondary-source-count", type=int, default=0,
                     help="treat the final N dataset inputs as a distinct replay source (0 disables)")
     ap.add_argument("--secondary-source-fraction", type=float, default=-1.0,
@@ -330,6 +332,8 @@ def main() -> int:
 
     if args.new_data_repeat < 1:
         raise SystemExit("--new-data-repeat must be at least 1")
+    if args.new_data_source_count < 1:
+        raise SystemExit("--new-data-source-count must be at least 1")
     if args.secondary_source_count < 0:
         raise SystemExit("--secondary-source-count must be non-negative")
     if not math.isfinite(args.secondary_source_fraction):
@@ -644,15 +648,27 @@ def main() -> int:
         train_np, val_np = split_indices_by_game(ds)
     raw_train_samples = len(train_np)
     base_train_np = np.array(train_np, copy=True)
-    if len(loaded_datasets) > 1 and args.new_data_repeat > 1:
-        newest_start = sum(len(item) for item in loaded_datasets[:-1])
-        newest_train = train_np[train_np >= newest_start]
+    if args.new_data_repeat > 1:
+        primary_dataset_count = (
+            len(loaded_datasets) - args.secondary_source_count
+            if source_aware_sampling else len(loaded_datasets)
+        )
+        if args.new_data_source_count > primary_dataset_count:
+            raise SystemExit(
+                "--new-data-source-count exceeds the number of primary dataset inputs"
+            )
+        newest_dataset_index = primary_dataset_count - args.new_data_source_count
+        newest_start = sum(len(item) for item in loaded_datasets[:newest_dataset_index])
+        newest_end = secondary_start if source_aware_sampling else len(ds)
+        newest_train = train_np[(train_np >= newest_start) & (train_np < newest_end)]
         if len(newest_train) > 0:
             train_np = np.concatenate(
                 [train_np] + [newest_train] * (args.new_data_repeat - 1)
             )
-            print(f"replay weight  newest train samples x{args.new_data_repeat} "
-                  f"({len(newest_train)} unique)")
+            print(
+                f"replay weight  newest {args.new_data_source_count} primary source(s) "
+                f"x{args.new_data_repeat} ({len(newest_train)} unique train samples)"
+            )
     if args.elite_app_threshold >= 0.0 and args.elite_app_repeat > 1:
         # The placement-0..1 attack target is the net attack actually sent by
         # this player's immediately following placement. Count targets are

@@ -1,0 +1,58 @@
+{
+  "_id": "human-replay-fixture",
+  "back": "",
+  "data": [
+    {
+      "board": [],
+      "replays": [
+        {
+          "frames": 120,
+          "events": [
+            {
+              "frame": 0,
+              "type": "full",
+              "data": {
+                "game": {
+                  "board": [],
+                  "falling": {"type": "t"},
+                  "hold": {"locked": false, "piece": null},
+                  "bag": ["t", "o", "s", "z", "j", "l", "i"]
+                },
+                "stats": {"combo": -1, "btb": 0}
+              }
+            },
+            {"frame": 8, "type": "keydown", "data": {"key": "moveLeft", "subframe": 0}},
+            {"frame": 9, "type": "keydown", "data": {"key": "hardDrop", "subframe": 0}},
+            {"frame": 100, "type": "end", "data": {"gameoverreason": "winner"}}
+          ]
+        },
+        {
+          "frames": 120,
+          "events": [
+            {
+              "frame": 0,
+              "type": "full",
+              "data": {
+                "game": {
+                  "board": [],
+                  "falling": {"type": "l"},
+                  "hold": {"locked": false, "piece": null},
+                  "bag": ["l", "j", "o", "s", "z", "i", "t"]
+                },
+                "stats": {"combo": -1, "btb": 0}
+              }
+            },
+            {"frame": 11, "type": "keydown", "data": {"key": "hardDrop", "subframe": 0}},
+            {"frame": 101, "type": "end", "data": {"gameoverreason": "topout"}}
+          ]
+        }
+      ]
+    }
+  ],
+  "forcestyle": "",
+  "gametype": "league",
+  "ismulti": true,
+  "shortid": "fixture",
+  "ts": "2026-08-18T00:00:00.000Z",
+  "verified": true
+}

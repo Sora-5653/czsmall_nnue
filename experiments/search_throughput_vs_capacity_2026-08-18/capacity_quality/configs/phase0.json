@@ -1,0 +1,68 @@
+{
+  "phase": "phase0_existing_checkpoint_confound",
+  "primary_seed": 42,
+  "candidate": "models/gen14_rank100_100_20260814.best.pt",
+  "reference": "models/size_search_ablation_20260816/seed42/transformer_s.final.pt",
+  "other_existing_checkpoints": {
+    "m400": "models/size_search_ablation_20260816/seed42/transformer_m.final.pt",
+    "xs400": "models/size_search_ablation_20260816/seed42/transformer_xs.final.pt"
+  },
+  "comparison_orientation": "A is the runner candidate and S400/M400/XS400 is the runner champion; result.wins is A wins and result.losses is the smaller-model wins.",
+  "arena": {
+    "engine": "build/tetra_cli.exe",
+    "ruleset": "RulesetConfig::tetra_league",
+    "environment": "E3",
+    "garbage_style": 1,
+    "garbage_period": 8,
+    "garbage_lines": 2,
+    "pairs": 50,
+    "games_per_pair": 4,
+    "expected_games": 200,
+    "pieces": 300,
+    "sims_argument": 100000,
+    "batch": 16,
+    "determinizations": 1,
+    "gumbel": true,
+    "gumbel_c_scale": 0.01,
+    "gumbel_noise_scale": 0.05,
+    "timing_actions": false,
+    "precision": "fp16",
+    "device": "cuda:1",
+    "fixed_token_count": 0,
+    "fixed_action_count": 0,
+    "stderr_mode": "drain",
+    "prewarm_batches": true,
+    "watchdog_seconds": 300
+  },
+  "conditions": {
+    "no_search_policy": {
+      "condition_id": "phase0-A-vs-S400-no-search-seed42-pairs50",
+      "candidate_sims": 0,
+      "champion_sims": 0,
+      "candidate_node_budget": -1,
+      "champion_node_budget": -1,
+      "interpretation": "Searcher zero-simulation fallback; raw policy is selected. Diagnostics must report simulations=0 and raw_policy_matches=decisions for both sides."
+    },
+    "equal_node_64": {
+      "condition_id": "phase0-A-vs-S400-equal-node64-seed42-pairs50",
+      "candidate_sims": -1,
+      "champion_sims": -1,
+      "candidate_node_budget": 64,
+      "champion_node_budget": 64,
+      "interpretation": "Both sides use the same C++ search algorithm and equal per-decision node budget of 64."
+    }
+  },
+  "scope": {
+    "allowed_write_root": "experiments/search_throughput_vs_capacity_2026-08-18/capacity_quality",
+    "frozen_checkpoints": [
+      "models/gen14_rank100_100_20260814.best.pt",
+      "models/size_search_ablation_20260816/seed42/transformer_s.final.pt",
+      "models/size_search_ablation_20260816/seed42/transformer_m.final.pt",
+      "models/size_search_ablation_20260816/seed42/transformer_xs.final.pt"
+    ],
+    "no_training": true,
+    "no_head_swap": true,
+    "no_wallclock_main": true,
+    "no_promotion": true
+  }
+}

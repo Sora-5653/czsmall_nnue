@@ -1,0 +1,9 @@
+{
+  "git_commit": "04d49ffee95f1c937c07ab60e88a868b6eb61ef6",
+  "python": "3.12.13",
+  "torch": "2.12.0+rocm7.14.0",
+  "engine": "build/tetra_cli.exe",
+  "ruleset": "RulesetConfig::tetra_league",
+  "recorded_at": "2026-08-18",
+  "worktree_note": "The checkout was already dirty; unrelated changes were preserved."
+}

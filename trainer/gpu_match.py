@@ -100,6 +100,7 @@ class StreamingInferenceQueue:
         self.target_positions = max(1, int(target_positions))
         self.window_ms = max(0.0, float(window_ms))
         self.telemetry = StreamingInferenceTelemetry()
+        self._telemetry_lock = threading.Lock()
 
     def collect(self, first: GpuRequest, events: queue.Queue,
                 handle_control) -> list[GpuRequest]:
@@ -128,7 +129,8 @@ class StreamingInferenceQueue:
             self.telemetry.deadline_flushes += 1
         return pending
 
-    def serve(self, pending: list[GpuRequest]) -> list[tuple[list[GpuRequest], float]]:
+    def serve(self, pending: list[GpuRequest],
+              stream: torch.cuda.Stream | None = None) -> list[tuple[list[GpuRequest], float]]:
         grouped: dict[int, list[GpuRequest]] = {}
         for request in pending:
             grouped.setdefault(request.model_id, []).append(request)
@@ -136,15 +138,116 @@ class StreamingInferenceQueue:
         served: list[tuple[list[GpuRequest], float]] = []
         for group in grouped.values():
             positions = sum(request.token_np.shape[0] for request in group)
-            elapsed = _serve_request_batch(self.model, self.device, group, self.precision)
-            self.telemetry.wire_requests += len(group)
-            self.telemetry.positions += positions
-            self.telemetry.batches += 1
-            self.telemetry.inference_seconds += elapsed
-            self.telemetry.max_positions = max(self.telemetry.max_positions, positions)
-            self.telemetry.max_wire_requests = max(self.telemetry.max_wire_requests, len(group))
+            elapsed = _serve_request_batch(
+                self.model, self.device, group, self.precision, stream=stream
+            )
+            with self._telemetry_lock:
+                self.telemetry.wire_requests += len(group)
+                self.telemetry.positions += positions
+                self.telemetry.batches += 1
+                self.telemetry.inference_seconds += elapsed
+                self.telemetry.max_positions = max(self.telemetry.max_positions, positions)
+                self.telemetry.max_wire_requests = max(self.telemetry.max_wire_requests, len(group))
             served.append((group, elapsed))
         return served
+
+
+class AsyncStreamingInferenceDispatcher:
+    """Run GPU batches on a dedicated thread while the caller keeps collecting.
+
+    The protocol reader threads continue to enqueue search requests while the
+    GPU is evaluating the current batch.  Keeping a small bounded queue of
+    prepared request groups removes the synchronous ``collect -> serve`` bubble
+    without allowing unbounded latency or memory growth.  Independent batches
+    may run on multiple accelerator streams; each child still has at most one
+    outstanding request, so its protocol ordering remains deterministic.
+    """
+
+    def __init__(self, batcher: StreamingInferenceQueue, events: queue.Queue,
+                 max_queued_batches: int = 2, gpu_workers: int = 1):
+        self.batcher = batcher
+        self.events = events
+        self.gpu_workers = max(1, int(gpu_workers))
+        self._jobs: queue.Queue[list[GpuRequest] | None] = queue.Queue(
+            maxsize=max(self.gpu_workers, int(max_queued_batches))
+        )
+        self._failed = threading.Event()
+        self._error: BaseException | None = None
+        self._error_lock = threading.Lock()
+        self._threads = [
+            threading.Thread(
+                target=self._run,
+                args=(index,),
+                name=f"gpu-inference-dispatcher-{index}",
+                daemon=True,
+            )
+            for index in range(self.gpu_workers)
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def _run(self, worker_index: int) -> None:
+        stream = None
+        if self.batcher.device.type == "cuda" and self.gpu_workers > 1:
+            stream = torch.cuda.Stream(device=self.batcher.device)
+        try:
+            while True:
+                pending = self._jobs.get()
+                try:
+                    if pending is None:
+                        return
+                    self.batcher.serve(pending, stream=stream)
+                finally:
+                    self._jobs.task_done()
+        except BaseException as exc:
+            with self._error_lock:
+                if self._error is None:
+                    self._error = exc
+            self._failed.set()
+            # Wake a caller blocked on the protocol event queue so the normal
+            # child-failure cleanup path kills all subprocesses promptly.
+            self.events.put(ChildFailed(-1, exc))
+
+    def submit(self, pending: list[GpuRequest]) -> None:
+        while True:
+            if self._failed.is_set():
+                assert self._error is not None
+                raise self._error
+            try:
+                self._jobs.put(pending, timeout=0.01)
+                return
+            except queue.Full:
+                continue
+
+    def close(self) -> None:
+        if self._failed.is_set():
+            # A failed worker may leave prefetched jobs behind.  Drop them so
+            # sentinels can reach any sibling dispatcher that is still blocked
+            # on the queue instead of deadlocking cleanup.
+            while True:
+                try:
+                    self._jobs.get_nowait()
+                    self._jobs.task_done()
+                except queue.Empty:
+                    break
+
+        sentinels = 0
+        while sentinels < self.gpu_workers:
+            try:
+                self._jobs.put(None, timeout=0.01)
+                sentinels += 1
+            except queue.Full:
+                if self._failed.is_set():
+                    try:
+                        self._jobs.get_nowait()
+                        self._jobs.task_done()
+                    except queue.Empty:
+                        pass
+
+        for thread in self._threads:
+            thread.join()
+        if self._error is not None:
+            raise self._error
 
 
 def read_exact(stream, size: int) -> bytes:
@@ -370,11 +473,15 @@ def _select_model(model: TetraFormer | dict[int, TetraFormer], model_id: int) ->
 
 def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
                          device: torch.device, requests: list[GpuRequest],
-                         precision: str) -> float:
+                         precision: str,
+                         stream: torch.cuda.Stream | None = None,
+                         trace: dict[str, object] | None = None,
+                         diagnostic_dummy: bool = False) -> float:
     """Infer several wire requests together, padding only their rectangular edges."""
     if not requests:
         return 0.0
 
+    started = time.perf_counter()
     total = sum(r.token_np.shape[0] for r in requests)
     max_tokens = max(r.token_np.shape[1] for r in requests)
     max_actions = max(r.action_np.shape[1] for r in requests)
@@ -393,34 +500,115 @@ def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
         offsets.append((request, offset, count))
         offset += count
 
-    token = torch.from_numpy(token_np).to(device)
-    token_mask = torch.from_numpy(token_mask_np).to(device)
-    action = torch.from_numpy(action_np).to(device)
-    action_mask = torch.from_numpy(action_mask_np).to(device)
-    autocast_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(precision)
-    autocast_enabled = device.type == "cuda" and autocast_dtype is not None
+    tensor_build_finished = time.perf_counter()
+
     # A mixed request batch is only useful when all requests select the same
     # checkpoint. The caller groups model IDs before reaching this function.
+    autocast_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(precision)
+    autocast_enabled = device.type == "cuda" and autocast_dtype is not None
     active_model = _select_model(models, requests[0].model_id)
-    t0 = time.perf_counter()
-    with torch.inference_mode():
-        if autocast_enabled:
-            with torch.autocast(device_type=device.type, dtype=autocast_dtype):
-                logits, wdl, aux = active_model(token, token_mask, action, action_mask)
+
+    phases: dict[str, float] = {}
+    if diagnostic_dummy:
+        # Keep the wire protocol and action-mask accounting identical to the
+        # normal path while removing model execution.  This is a diagnostic
+        # control only and must never be used for strength evaluation.
+        policy_np = np.zeros((total, max_actions), dtype=np.float32)
+        wdl_np = np.zeros((total, 3), dtype=np.float32)
+        aux_np = np.zeros((total, 4), dtype=np.float32)
+        for row in range(total):
+            valid = action_mask_np[row] >= 0.5
+            count = int(np.count_nonzero(valid))
+            if count:
+                policy_np[row, :count] = 1.0 / float(count)
+            wdl_np[row, 1] = 1.0
+        phases["host_to_device_us"] = 0.0
+        phases["model_forward_us"] = 0.0
+        phases["device_sync_us"] = 0.0
+        phases["postprocess_us"] = 0.0
+    elif trace is None:
+        def run_forward():
+            non_blocking = stream is not None
+            token = torch.from_numpy(token_np).to(device, non_blocking=non_blocking)
+            token_mask = torch.from_numpy(token_mask_np).to(device, non_blocking=non_blocking)
+            action = torch.from_numpy(action_np).to(device, non_blocking=non_blocking)
+            action_mask = torch.from_numpy(action_mask_np).to(device, non_blocking=non_blocking)
+            with torch.inference_mode():
+                if autocast_enabled:
+                    with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                        logits, wdl, aux = active_model(token, token_mask, action, action_mask)
+                else:
+                    logits, wdl, aux = active_model(token, token_mask, action, action_mask)
+                # Keep probability arithmetic and the wire format in fp32 even when
+                # the transformer itself runs under fp16/bf16 autocast.
+                policy = torch.softmax(logits.float(), dim=-1)
+                wdl_prob = torch.softmax(wdl.float(), dim=-1)
+                aux_out = aux.float()
+            return policy, wdl_prob, aux_out
+
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                policy, wdl, aux = run_forward()
+            stream.synchronize()
         else:
-            logits, wdl, aux = active_model(token, token_mask, action, action_mask)
+            policy, wdl, aux = run_forward()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+        policy_np = policy.detach().cpu().numpy()
+        wdl_np = wdl.detach().cpu().numpy()
+        aux_np = aux.detach().cpu().numpy()
+    else:
+        # Diagnostic path: force synchronization around the asynchronous device
+        # work so the forward and synchronization measurements are not falsely
+        # short.  The normal path above deliberately keeps its existing shape.
+        h2d_started = time.perf_counter()
+        non_blocking = stream is not None
+        token = torch.from_numpy(token_np).to(device, non_blocking=non_blocking)
+        token_mask = torch.from_numpy(token_mask_np).to(device, non_blocking=non_blocking)
+        action = torch.from_numpy(action_np).to(device, non_blocking=non_blocking)
+        action_mask = torch.from_numpy(action_mask_np).to(device, non_blocking=non_blocking)
+        phases["host_to_device_us"] = (time.perf_counter() - h2d_started) * 1e6
+
+        forward_started = time.perf_counter()
+        with torch.inference_mode():
+            if autocast_enabled:
+                with torch.autocast(device_type=device.type, dtype=autocast_dtype):
+                    logits, wdl, aux = active_model(token, token_mask, action, action_mask)
+            else:
+                logits, wdl, aux = active_model(token, token_mask, action, action_mask)
+        forward_returned = time.perf_counter()
+        sync_started = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        phases["model_forward_us"] = (forward_returned - forward_started) * 1e6
+        phases["device_sync_us"] = (time.perf_counter() - sync_started) * 1e6
+
+        post_started = time.perf_counter()
         # Keep probability arithmetic and the wire format in fp32 even when
         # the transformer itself runs under fp16/bf16 autocast.
         policy = torch.softmax(logits.float(), dim=-1)
         wdl = torch.softmax(wdl.float(), dim=-1)
         aux = aux.float()
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - t0
-    policy_np = policy.detach().cpu().numpy()
-    wdl_np = wdl.detach().cpu().numpy()
-    aux_np = aux.detach().cpu().numpy()
+        if device.type == "cuda":
+            sync_started = time.perf_counter()
+            torch.cuda.synchronize(device)
+            phases["device_sync_us"] += (time.perf_counter() - sync_started) * 1e6
+        phases["postprocess_us"] = (time.perf_counter() - post_started) * 1e6
+        output_started = time.perf_counter()
+        policy_np = policy.detach().cpu().numpy()
+        wdl_np = wdl.detach().cpu().numpy()
+        aux_np = aux.detach().cpu().numpy()
+        phases["device_to_host_us"] = (time.perf_counter() - output_started) * 1e6
 
+    if "device_to_host_us" not in phases:
+        output_started = time.perf_counter()
+        if diagnostic_dummy:
+            # Already materialized on the host.
+            pass
+        phases["device_to_host_us"] = (time.perf_counter() - output_started) * 1e6
+
+    response_decode_started = time.perf_counter()
+    response_write_us = 0.0
     for request, start, count in offsets:
         assert request.proc.stdin is not None
         payload: list[bytes] = [struct.pack("<4sI", b"TGPR", count)]
@@ -430,8 +618,24 @@ def _serve_request_batch(models: TetraFormer | dict[int, TetraFormer],
             payload.append(np.asarray(policy_np[i, :actions], dtype="<f4").tobytes())
             payload.append(np.asarray(wdl_np[i, :3], dtype="<f4").tobytes())
             payload.append(np.asarray(aux_np[i, :4], dtype="<f4").tobytes())
+        write_started = time.perf_counter()
         request.proc.stdin.write(b"".join(payload))
         request.proc.stdin.flush()
+        response_write_us += (time.perf_counter() - write_started) * 1e6
+    response_decode_us = (time.perf_counter() - response_decode_started) * 1e6
+    elapsed = time.perf_counter() - started
+    if trace is not None:
+        trace.update({
+            "model_id": int(requests[0].model_id),
+            "batch": int(total),
+            "tokens": int(max_tokens),
+            "actions": int(max_actions),
+            "tensor_build_us": (tensor_build_finished - started) * 1e6,
+            "response_decode_us": response_decode_us,
+            "response_write_us": response_write_us,
+            "total_us": elapsed * 1e6,
+            **phases,
+        })
     return elapsed
 
 

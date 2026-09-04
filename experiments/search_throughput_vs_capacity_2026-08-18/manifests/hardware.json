@@ -1,0 +1,8 @@
+{
+  "os": "Windows",
+  "gpu": "AMD Radeon RX 9070 XT",
+  "torch_device": "cuda:1",
+  "rocm_visible_devices": 2,
+  "precision": "fp16",
+  "note": "cuda is the PyTorch ROCm device API name; cuda:0 was integrated graphics and was not used"
+}

@@ -1,0 +1,22 @@
+{
+  "candidate_A": {
+    "path": "models/gen14_rank100_100_20260814.best.pt",
+    "sha256": "ca6b7037a4497f5cb6ab79d5e7baf6632bd6c982adb7f2c8b004d3795a4cdc86",
+    "parameters": 7176624,
+    "step": 3312,
+    "config": {"width": 256, "layers": 8, "heads": 8, "ffn": 768, "aux_targets": 44}
+  },
+  "throughput_B": {
+    "path": "models/size_search_ablation_20260816/seed42/transformer_xs.final.pt",
+    "sha256": "0ee2f041ea9bc3560c9ddc5021161707119f7c226735c9a117861d0334f4d5e2",
+    "parameters": 132744,
+    "step": 400,
+    "config": {"width": 64, "layers": 2, "heads": 4, "ffn": 192, "aux_targets": 36}
+  },
+  "alternate_B_seed1337": {
+    "path": "models/size_search_ablation_20260816/seed1337/transformer_xs.final.pt",
+    "sha256": "4aabaf02e33fadc19b46b4bc9fe62a65d1dafedbaea471632dc2323e07fb69a8",
+    "parameters": 132744,
+    "step": 400
+  }
+}

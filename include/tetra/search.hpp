@@ -20,6 +20,7 @@
 #include "tetra/player.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iterator>
@@ -35,6 +36,14 @@ struct SearchConfig {
     int simulations = 128;
     int max_depth = 8;          // in placements (spec 11.1 suggests 8-20)
     int batch_size = 16;        // leaves collected before an evaluator flush
+    // Disabled by default. When positive, the search stops starting new leaves
+    // after this per-decision wall-clock budget. An already-running evaluator
+    // batch is allowed to finish and its overshoot is reported.
+    double time_budget_ms = 0.0;
+    // Disabled by default. Diagnostic equal-node control; the root itself is
+    // counted, and a path may overshoot only by terminal/transposition work
+    // that was already started before the cap was observed.
+    int node_budget = 0;
 
     // PUCT
     float c_puct = 1.5f;
@@ -117,6 +126,26 @@ struct SearchTelemetry {
     int depth_cutoffs = 0;
     int evaluation_flushes = 0;
     int max_edge_inflight = 0;
+    double elapsed_ms = 0.0;
+    double evaluator_elapsed_ms = 0.0;
+    // Diagnostic wall-clock decomposition.  These fields are observational;
+    // the search decisions must not depend on them.  The fine-grained
+    // selection/state/legal/node fields are inclusive subcomponents of the
+    // broader gather/CPU intervals and therefore are not expected to sum to
+    // elapsed time.
+    double root_setup_us = 0.0;
+    double gather_us = 0.0;
+    double backup_us = 0.0;
+    double finalize_us = 0.0;
+    double node_allocation_us = 0.0;
+    double legal_action_generation_us = 0.0;
+    double state_transition_us = 0.0;
+    double selection_us = 0.0;
+    std::int64_t depth_sum = 0;
+    int depth_samples = 0;
+    int max_depth = 0;
+    int node_budget_cutoffs = 0;
+    bool budget_exhausted = false;
 };
 
 struct SearchResult {
@@ -130,6 +159,12 @@ struct SearchResult {
     int positions_evaluated = 0;
     int transposition_hits = 0;
     double mean_batch_size = 0.0;
+    double elapsed_ms = 0.0;
+    double evaluator_elapsed_ms = 0.0;
+    double mean_depth = 0.0;
+    int max_depth = 0;
+    int raw_policy_action = -1;
+    bool time_budget_exhausted = false;
     SearchTelemetry telemetry;
 };
 
@@ -345,13 +380,28 @@ public:
     SearchResult search(const Player& root_state, const Player* opponent_state = nullptr,
                         Evaluator* opponent_evaluator = nullptr,
                         bool deliver_attacks = true) {
+        const auto started = Clock::now();
+        budget_active_ = cfg_.time_budget_ms > 0.0;
+        deadline_ = budget_active_
+            ? started + std::chrono::duration_cast<Clock::duration>(
+                  std::chrono::duration<double, std::milli>(cfg_.time_budget_ms))
+            : Clock::time_point{};
+        auto finish = [&](SearchResult result) {
+            result.elapsed_ms =
+                std::chrono::duration<double, std::milli>(Clock::now() - started).count();
+            result.telemetry.elapsed_ms = result.elapsed_ms;
+            result.time_budget_exhausted = result.time_budget_exhausted || budget_expired();
+            budget_active_ = false;
+            return result;
+        };
+
         root_player_index_ = root_state.index();
         has_opponent_ = opponent_state != nullptr;
         opponent_eval_ = opponent_evaluator ? opponent_evaluator : &eval_;
         deliver_attacks_ = has_opponent_ && deliver_attacks;
 
         if (!cfg_.determinize_root || cfg_.determinizations <= 1)
-            return search_once(root_state, opponent_state, cfg_.seed);
+            return finish(search_once(root_state, opponent_state, cfg_.seed));
 
         SearchResult combined;
         std::vector<double> policy_sum;
@@ -395,9 +445,25 @@ public:
             telemetry_sum.evaluation_flushes += r.telemetry.evaluation_flushes;
             telemetry_sum.max_edge_inflight =
                 std::max(telemetry_sum.max_edge_inflight, r.telemetry.max_edge_inflight);
+            telemetry_sum.evaluator_elapsed_ms += r.telemetry.evaluator_elapsed_ms;
+            telemetry_sum.root_setup_us += r.telemetry.root_setup_us;
+            telemetry_sum.gather_us += r.telemetry.gather_us;
+            telemetry_sum.backup_us += r.telemetry.backup_us;
+            telemetry_sum.finalize_us += r.telemetry.finalize_us;
+            telemetry_sum.node_allocation_us += r.telemetry.node_allocation_us;
+            telemetry_sum.legal_action_generation_us +=
+                r.telemetry.legal_action_generation_us;
+            telemetry_sum.state_transition_us += r.telemetry.state_transition_us;
+            telemetry_sum.selection_us += r.telemetry.selection_us;
+            telemetry_sum.depth_sum += r.telemetry.depth_sum;
+            telemetry_sum.depth_samples += r.telemetry.depth_samples;
+            telemetry_sum.max_depth = std::max(telemetry_sum.max_depth, r.telemetry.max_depth);
+            telemetry_sum.node_budget_cutoffs += r.telemetry.node_budget_cutoffs;
+            telemetry_sum.budget_exhausted =
+                telemetry_sum.budget_exhausted || r.telemetry.budget_exhausted;
             ++runs;
         }
-        if (runs == 0) return search_once(root_state, opponent_state, cfg_.seed);
+        if (runs == 0) return finish(search_once(root_state, opponent_state, cfg_.seed));
 
         combined.search_policy.assign(policy_sum.size(), 0.0f);
         int best = 0;
@@ -433,11 +499,34 @@ public:
         combined.mean_batch_size = evaluator_calls_sum
                                        ? static_cast<double>(positions_sum) / evaluator_calls_sum
                                        : 0.0;
+        combined.evaluator_elapsed_ms = telemetry_sum.evaluator_elapsed_ms;
+        combined.mean_depth = telemetry_sum.depth_samples
+            ? static_cast<double>(telemetry_sum.depth_sum) / telemetry_sum.depth_samples
+            : 0.0;
+        combined.max_depth = telemetry_sum.max_depth;
+        combined.time_budget_exhausted = telemetry_sum.budget_exhausted;
         combined.telemetry = telemetry_sum;
-        return combined;
+        return finish(combined);
     }
 
 private:
+    using Clock = std::chrono::steady_clock;
+
+    bool budget_expired() const {
+        return budget_active_ && Clock::now() >= deadline_;
+    }
+
+    bool node_budget_reached() const {
+        return cfg_.node_budget > 0 &&
+               static_cast<int>(nodes_.size()) >= cfg_.node_budget;
+    }
+
+    void note_depth(int depth) {
+        telemetry_.depth_sum += depth;
+        ++telemetry_.depth_samples;
+        telemetry_.max_depth = std::max(telemetry_.max_depth, depth);
+    }
+
     SearchResult search_once(const Player& root_state, const Player* opponent_state,
                              std::uint64_t seed) {
         nodes_.clear();
@@ -447,6 +536,7 @@ private:
         SearchResult result;
 
         // Determinize: never let the tree read pieces the player cannot see.
+        const auto root_setup_started = Clock::now();
         Player rooted = root_state;
         Player rooted_opponent;
         const Player* opponent = nullptr;
@@ -460,8 +550,11 @@ private:
         }
 
         const std::int32_t root = create_node(rooted, opponent);
+        telemetry_.root_setup_us +=
+            std::chrono::duration<double, std::micro>(Clock::now() - root_setup_started).count();
         if (nodes_[root].terminal || nodes_[root].actions.empty()) {
             result.value = ValueWDL::from_scalar(nodes_[root].terminal_value);
+            result.telemetry = telemetry_;
             return result;
         }
 
@@ -475,7 +568,10 @@ private:
         else
             run_puct(root, result);
 
+        const auto finalize_started = Clock::now();
         fill_result(root, result);
+        result.telemetry.finalize_us +=
+            std::chrono::duration<double, std::micro>(Clock::now() - finalize_started).count();
         return result;
     }
 
@@ -503,7 +599,10 @@ private:
     std::int32_t make_terminal(const Player& state, const Player* opponent,
                                bool current_player_lost) {
         const std::int32_t idx = static_cast<std::int32_t>(nodes_.size());
+        const auto allocation_started = Clock::now();
         nodes_.emplace_back();
+        telemetry_.node_allocation_us +=
+            std::chrono::duration<double, std::micro>(Clock::now() - allocation_started).count();
         detail::SearchNode& n = nodes_.back();
         n.state = state;
         if (opponent) {
@@ -517,7 +616,10 @@ private:
 
     std::int32_t create_node(const Player& state, const Player* opponent = nullptr) {
         const std::int32_t idx = static_cast<std::int32_t>(nodes_.size());
+        const auto allocation_started = Clock::now();
         nodes_.emplace_back();
+        telemetry_.node_allocation_us +=
+            std::chrono::duration<double, std::micro>(Clock::now() - allocation_started).count();
         detail::SearchNode& n = nodes_.back();
         n.state = state;
         if (opponent) {
@@ -533,6 +635,7 @@ private:
         }
 
         const RulesetConfig& cfg = state.ruleset();
+        const auto legal_started = Clock::now();
         n.actions = movegen_.generate(state.board(), state.active().type, state.hold(),
                                       state.visible_next().empty() ? Piece::None
                                                                    : state.visible_next()[0],
@@ -547,6 +650,8 @@ private:
                 n.actions, cfg, state.now(), next_activation, TICK_NEVER,
                 timing_bins);
         }
+        telemetry_.legal_action_generation_us +=
+            std::chrono::duration<double, std::micro>(Clock::now() - legal_started).count();
         if (n.actions.empty()) {
             n.terminal = true;
             n.terminal_value = terminal_value_for(state, other,
@@ -561,7 +666,10 @@ private:
 
         const Observation obs = n.has_opponent ? observe(n.state, &n.opponent)
                                                 : observe(n.state);
+        const auto eval_started = Clock::now();
         const Evaluation ev = evaluator_for(n)->evaluate_one(obs, n.actions);
+        telemetry_.evaluator_elapsed_ms +=
+            std::chrono::duration<double, std::milli>(Clock::now() - eval_started).count();
         ++eval_calls_;
         ++telemetry_.evaluation_flushes;
         positions_evaluated_ += 1;
@@ -618,11 +726,13 @@ private:
             detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
             if (n.terminal) {
                 ++telemetry_.terminal_backups;
+                note_depth(depth);
                 backup(out.path, n.terminal_value);
                 return false;
             }
             if (!n.expanded) {
                 ++telemetry_.gathered_leaves;
+                note_depth(depth);
                 out.leaf = idx;
                 out.obs = n.has_opponent ? observe(n.state, &n.opponent)
                                          : observe(n.state);
@@ -631,11 +741,15 @@ private:
             }
             if (depth >= cfg_.max_depth) {
                 ++telemetry_.depth_cutoffs;
+                note_depth(depth);
                 backup(out.path, root_perspective_value(n, n.leaf_value));
                 return false;
             }
 
+            const auto selection_started = Clock::now();
             const int a = select_puct(n);
+            telemetry_.selection_us +=
+                std::chrono::duration<double, std::micro>(Clock::now() - selection_started).count();
             ++telemetry_.selection_steps;
             out.path.emplace_back(idx, a);
             detail::SearchEdge& edge = n.edges[static_cast<size_t>(a)];
@@ -644,6 +758,12 @@ private:
 
             std::int32_t child = edge.child;
             if (child < 0) {
+                if (node_budget_reached()) {
+                    ++telemetry_.node_budget_cutoffs;
+                    note_depth(depth);
+                    backup(out.path, root_perspective_value(n, n.leaf_value));
+                    return false;
+                }
                 child = apply_action(idx, a);
                 nodes_[static_cast<size_t>(idx)].edges[static_cast<size_t>(a)].child = child;
             }
@@ -668,6 +788,12 @@ private:
 
     // Apply an action to a copy of the node's state, producing a child node.
     std::int32_t apply_action(std::int32_t parent, int action) {
+        const auto transition_started = Clock::now();
+        auto finish_transition = [&](std::int32_t child) {
+            telemetry_.state_transition_us +=
+                std::chrono::duration<double, std::micro>(Clock::now() - transition_started).count();
+            return child;
+        };
         const detail::SearchNode& parent_node = nodes_[static_cast<size_t>(parent)];
         Player next = parent_node.state;
         Player other;
@@ -679,15 +805,15 @@ private:
         if (a.use_hold && !next.do_hold()) {
             // Hold was refused: treat as a dead end rather than silently
             // playing a different move.
-            return make_terminal(next, has_opponent ? &other : nullptr,
-                                 /*current_player_lost=*/true);
+            return finish_transition(make_terminal(next, has_opponent ? &other : nullptr,
+                                                    /*current_player_lost=*/true));
         }
         next.set_active(a.piece_state());
         int outgoing = 0;
         const LockResult locked = next.lock_piece(a.total_duration(), &outgoing);
         if (!locked.ok && !locked.topped_out)
-            return make_terminal(next, has_opponent ? &other : nullptr,
-                                 /*current_player_lost=*/true);
+            return finish_transition(make_terminal(next, has_opponent ? &other : nullptr,
+                                                    /*current_player_lost=*/true));
 
         // Search must use the same event protocol as Arena/self-play: an
         // attack is delivered to the other board, then the next actor is the
@@ -701,10 +827,10 @@ private:
                 other.now() < next.now() ||
                 (other.now() == next.now() && other.index() < next.index());
             if (other.alive() && next.alive() && other_next)
-                return intern_node(other, &next);
-            return intern_node(next, &other);
+                return finish_transition(intern_node(other, &next));
+            return finish_transition(intern_node(next, &other));
         }
-        return intern_node(next, nullptr);
+        return finish_transition(intern_node(next, nullptr));
     }
 
     void backup(const std::vector<std::pair<std::int32_t, int>>& path, float value) {
@@ -712,6 +838,7 @@ private:
         // view before reaching this function. In a two-board tree this is
         // what makes an opponent leaf a minimizing node without changing the
         // single-board path representation.
+        const auto backup_started = Clock::now();
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             detail::SearchNode& n = nodes_[static_cast<size_t>(it->first)];
             detail::SearchEdge& edge = n.edges[static_cast<size_t>(it->second)];
@@ -721,6 +848,8 @@ private:
             n.visits += 1;
             n.value_sum += value;
         }
+        telemetry_.backup_us +=
+            std::chrono::duration<double, std::micro>(Clock::now() - backup_started).count();
     }
 
     void revert_virtual_loss(const std::vector<std::pair<std::int32_t, int>>& path) {
@@ -737,12 +866,17 @@ private:
         std::vector<Pending> batch;
         batch.reserve(static_cast<size_t>(cfg_.batch_size));
 
-        while (done < cfg_.simulations) {
+        while (done < cfg_.simulations && !budget_expired() && !node_budget_reached()) {
             batch.clear();
             while (static_cast<int>(batch.size()) < cfg_.batch_size &&
-                   done + static_cast<int>(batch.size()) < cfg_.simulations) {
+                   done + static_cast<int>(batch.size()) < cfg_.simulations &&
+                !budget_expired() && !node_budget_reached()) {
                 Pending p;
-                if (descend(root, p)) {
+                const auto gather_started = Clock::now();
+                const bool gathered = descend(root, p);
+                telemetry_.gather_us +=
+                    std::chrono::duration<double, std::micro>(Clock::now() - gather_started).count();
+                if (gathered) {
                     batch.push_back(std::move(p));
                 } else {
                     ++done;
@@ -756,6 +890,7 @@ private:
             flush(batch);
             done += static_cast<int>(batch.size());
         }
+        telemetry_.budget_exhausted = budget_expired();
         result.simulations_run = done;
     }
 
@@ -788,7 +923,10 @@ private:
             }
 
             std::vector<Evaluation> out;
+            const auto eval_started = Clock::now();
             group.evaluator->evaluate(requests, out);
+            telemetry_.evaluator_elapsed_ms +=
+                std::chrono::duration<double, std::milli>(Clock::now() - eval_started).count();
             ++eval_calls_;
             ++telemetry_.evaluation_flushes;
             positions_evaluated_ += static_cast<int>(group.items.size());
@@ -866,14 +1004,19 @@ private:
 
         // Sequential halving: repeatedly give every surviving candidate an
         // equal share of the remaining budget, then keep the best half.
-        while (m > 1 && used < budget) {
+        while (m > 1 && used < budget && !budget_expired() && !node_budget_reached()) {
             const int rounds = std::max(1, (budget - used) / (m * std::max(1, log2_ceil(m))));
-            for (int i = 0; i < rounds && used < budget; ++i) {
+            for (int i = 0; i < rounds && used < budget && !budget_expired() &&
+                 !node_budget_reached(); ++i) {
                 std::vector<Pending> batch;
                 for (int a : candidates) {
-                    if (used >= budget) break;
+                    if (used >= budget || budget_expired() || node_budget_reached()) break;
                     Pending p;
-                    if (visit_root_action(root, a, p)) {
+                    const auto gather_started = Clock::now();
+                    const bool gathered = visit_root_action(root, a, p);
+                    telemetry_.gather_us +=
+                        std::chrono::duration<double, std::micro>(Clock::now() - gather_started).count();
+                    if (gathered) {
                         batch.push_back(std::move(p));
                         if (static_cast<int>(batch.size()) >= cfg_.batch_size) {
                             flush(batch);
@@ -895,12 +1038,17 @@ private:
         }
 
         // Spend anything left on the survivor.
-        while (used < budget && !candidates.empty()) {
+        while (used < budget && !candidates.empty() && !budget_expired() &&
+               !node_budget_reached()) {
             std::vector<Pending> batch;
             const int take = std::min(cfg_.batch_size, budget - used);
             for (int i = 0; i < take; ++i) {
                 Pending p;
-                if (visit_root_action(root, candidates.front(), p)) batch.push_back(std::move(p));
+                const auto gather_started = Clock::now();
+                const bool gathered = visit_root_action(root, candidates.front(), p);
+                telemetry_.gather_us +=
+                    std::chrono::duration<double, std::micro>(Clock::now() - gather_started).count();
+                if (gathered) batch.push_back(std::move(p));
                 ++used;
             }
             if (!batch.empty()) flush(batch);
@@ -908,6 +1056,7 @@ private:
         }
 
         result.simulations_run = used;
+        telemetry_.budget_exhausted = budget_expired();
         gumbel_selected_ = candidates.empty() ? -1 : candidates.front();
     }
 
@@ -935,11 +1084,13 @@ private:
             detail::SearchNode& n = nodes_[static_cast<size_t>(idx)];
             if (n.terminal) {
                 ++telemetry_.terminal_backups;
+                note_depth(depth);
                 backup(out.path, n.terminal_value);
                 return false;
             }
             if (!n.expanded) {
                 ++telemetry_.gathered_leaves;
+                note_depth(depth);
                 out.leaf = idx;
                 out.obs = n.has_opponent ? observe(n.state, &n.opponent)
                                          : observe(n.state);
@@ -948,10 +1099,14 @@ private:
             }
             if (depth >= cfg_.max_depth) {
                 ++telemetry_.depth_cutoffs;
+                note_depth(depth);
                 backup(out.path, root_perspective_value(n, n.leaf_value));
                 return false;
             }
+            const auto selection_started = Clock::now();
             const int a = select_puct(n);
+            telemetry_.selection_us +=
+                std::chrono::duration<double, std::micro>(Clock::now() - selection_started).count();
             ++telemetry_.selection_steps;
             out.path.emplace_back(idx, a);
             detail::SearchEdge& edge = n.edges[static_cast<size_t>(a)];
@@ -959,6 +1114,12 @@ private:
             telemetry_.max_edge_inflight = std::max(telemetry_.max_edge_inflight, edge.inflight);
             std::int32_t next = edge.child;
             if (next < 0) {
+                if (node_budget_reached()) {
+                    ++telemetry_.node_budget_cutoffs;
+                    note_depth(depth);
+                    backup(out.path, root_perspective_value(n, n.leaf_value));
+                    return false;
+                }
                 next = apply_action(idx, a);
                 nodes_[static_cast<size_t>(idx)].edges[static_cast<size_t>(a)].child = next;
             }
@@ -1041,6 +1202,8 @@ private:
         result.search_policy.assign(n.actions.size(), 0.0f);
         int best = -1;
         int best_visits = -1;
+        int raw_policy_action = -1;
+        float raw_policy_prior = -1.0f;
         for (size_t a = 0; a < n.actions.size(); ++a) {
             const detail::SearchEdge& edge = n.edges[a];
             SearchCandidate c;
@@ -1049,6 +1212,10 @@ private:
             c.visits = edge.visits;
             c.q_value = edge.q();
             result.candidates.push_back(c);
+            if (c.prior > raw_policy_prior) {
+                raw_policy_prior = c.prior;
+                raw_policy_action = static_cast<int>(a);
+            }
             if (total_visits > 0)
                 result.search_policy[a] =
                     static_cast<float>(c.visits) / static_cast<float>(total_visits);
@@ -1074,6 +1241,7 @@ private:
         }
 
         result.best_action = best;
+        result.raw_policy_action = raw_policy_action;
         result.value = ValueWDL::from_scalar(
             n.visits > 0 ? n.value_sum / static_cast<float>(n.visits) : n.leaf_value);
         result.nodes_created = static_cast<int>(nodes_.size());
@@ -1082,6 +1250,12 @@ private:
         result.transposition_hits = tt_hits_;
         result.mean_batch_size =
             eval_calls_ ? static_cast<double>(positions_evaluated_) / eval_calls_ : 0.0;
+        result.evaluator_elapsed_ms = telemetry_.evaluator_elapsed_ms;
+        result.mean_depth = telemetry_.depth_samples
+            ? static_cast<double>(telemetry_.depth_sum) / telemetry_.depth_samples
+            : 0.0;
+        result.max_depth = telemetry_.max_depth;
+        result.time_budget_exhausted = budget_expired();
         result.telemetry = telemetry_;
 
         eval_calls_ = 0;
@@ -1104,6 +1278,8 @@ private:
     int positions_evaluated_ = 0;
     int tt_hits_ = 0;
     SearchTelemetry telemetry_;
+    Clock::time_point deadline_{};
+    bool budget_active_ = false;
     int root_player_index_ = 0;
     bool has_opponent_ = false;
     bool deliver_attacks_ = false;

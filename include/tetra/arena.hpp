@@ -38,6 +38,12 @@ struct ArenaConfig {
     // measure whether search actually improves a fixed network.
     int candidate_simulations = -1;
     int champion_simulations = -1;
+    // Negative values inherit the shared per-decision wall-clock budget.
+    float candidate_time_budget_ms = -1.0f;
+    float champion_time_budget_ms = -1.0f;
+    // Negative values inherit the shared equal-node diagnostic cap.
+    int candidate_node_budget = -1;
+    int champion_node_budget = -1;
     // -1 inherits search.use_gumbel; 0/1 override per side for diagnostics.
     int candidate_gumbel = -1;
     int champion_gumbel = -1;
@@ -81,6 +87,44 @@ struct ArenaGameResult {
     float candidate_score = 0.0f;       // 1.0 = win, 0.5 = draw, 0.0 = loss
 };
 
+struct SearchSideDiagnostics {
+    std::uint64_t decisions = 0;
+    std::uint64_t simulations = 0;
+    std::uint64_t nodes = 0;
+    std::uint64_t evaluator_calls = 0;
+    std::uint64_t positions_evaluated = 0;
+    std::uint64_t evaluation_flushes = 0;
+    std::uint64_t node_budget_cutoffs = 0;
+    std::uint64_t time_budget_exhaustions = 0;
+    std::uint64_t raw_policy_matches = 0;
+    std::uint64_t searched_action_changes = 0;
+    double elapsed_ms = 0.0;
+    double overshoot_ms = 0.0;
+    double evaluator_elapsed_ms = 0.0;
+    double root_setup_us = 0.0;
+    double gather_us = 0.0;
+    double backup_us = 0.0;
+    double finalize_us = 0.0;
+    double node_allocation_us = 0.0;
+    double legal_action_generation_us = 0.0;
+    double state_transition_us = 0.0;
+    double selection_us = 0.0;
+    double depth_sum = 0.0;
+    std::uint64_t depth_samples = 0;
+    int max_depth = 0;
+    double legal_actions = 0.0;
+    double root_total_visits = 0.0;
+    double root_top1_visit_share = 0.0;
+    double root_top1_q = 0.0;
+    double root_visit_entropy = 0.0;
+    std::vector<double> decision_latencies_ms;
+};
+
+struct ArenaDiagnostics {
+    SearchSideDiagnostics candidate;
+    SearchSideDiagnostics champion;
+};
+
 struct ArenaResult {
     int games_played = 0;
     int candidate_wins = 0;
@@ -117,6 +161,7 @@ struct ArenaResult {
     float champion_garbageout_rate = 0.0f;
     bool promoted = false;              // win_rate >= promotion_threshold
     std::vector<ArenaGameResult> games;
+    ArenaDiagnostics diagnostics;
 };
 
 class Arena {
@@ -126,6 +171,7 @@ public:
 
     ArenaResult evaluate(const RulesetConfig& rules, std::uint64_t base_seed = 42) {
         ArenaResult res;
+        diagnostics_ = ArenaDiagnostics{};
         for (int i = 0; i < cfg_.pairs; ++i) {
             const std::uint64_t pair_seed =
                 base_seed + static_cast<std::uint64_t>(i) * 0x9E3779B97F4A7C15ull;
@@ -269,12 +315,74 @@ public:
             res.promoted = (res.win_rate >= cfg_.promotion_threshold &&
                             res.ci_lower > 0.5f);
         }
+        res.diagnostics = diagnostics_;
         return res;
     }
 
     const ArenaConfig& config() const { return cfg_; }
 
 private:
+    static void record_search(SearchSideDiagnostics& out, const SearchResult& result,
+                              float time_budget_ms) {
+        ++out.decisions;
+        out.simulations += static_cast<std::uint64_t>(std::max(0, result.simulations_run));
+        out.nodes += static_cast<std::uint64_t>(std::max(0, result.nodes_created));
+        out.evaluator_calls += static_cast<std::uint64_t>(std::max(0, result.evaluator_calls));
+        out.positions_evaluated +=
+            static_cast<std::uint64_t>(std::max(0, result.positions_evaluated));
+        out.evaluation_flushes +=
+            static_cast<std::uint64_t>(std::max(0, result.telemetry.evaluation_flushes));
+        out.node_budget_cutoffs +=
+            static_cast<std::uint64_t>(std::max(0, result.telemetry.node_budget_cutoffs));
+        if (result.time_budget_exhausted) ++out.time_budget_exhaustions;
+        if (result.raw_policy_action >= 0 && result.raw_policy_action == result.best_action)
+            ++out.raw_policy_matches;
+        if (result.raw_policy_action >= 0 && result.best_action >= 0 &&
+            result.raw_policy_action != result.best_action)
+            ++out.searched_action_changes;
+        out.elapsed_ms += result.elapsed_ms;
+        if (time_budget_ms > 0.0f)
+        out.overshoot_ms += std::max(
+                0.0, result.elapsed_ms - static_cast<double>(time_budget_ms));
+        out.evaluator_elapsed_ms += result.evaluator_elapsed_ms;
+        out.root_setup_us += result.telemetry.root_setup_us;
+        out.gather_us += result.telemetry.gather_us;
+        out.backup_us += result.telemetry.backup_us;
+        out.finalize_us += result.telemetry.finalize_us;
+        out.node_allocation_us += result.telemetry.node_allocation_us;
+        out.legal_action_generation_us += result.telemetry.legal_action_generation_us;
+        out.state_transition_us += result.telemetry.state_transition_us;
+        out.selection_us += result.telemetry.selection_us;
+        out.depth_sum += static_cast<double>(result.telemetry.depth_sum);
+        out.depth_samples += static_cast<std::uint64_t>(
+            std::max(0, result.telemetry.depth_samples));
+        out.max_depth = std::max(out.max_depth, result.max_depth);
+        out.legal_actions += static_cast<double>(result.candidates.size());
+        out.decision_latencies_ms.push_back(result.elapsed_ms);
+        int total_visits = 0;
+        int top_visits = 0;
+        float top_q = 0.0f;
+        for (const SearchCandidate& candidate : result.candidates) {
+            total_visits += std::max(0, candidate.visits);
+            if (candidate.visits > top_visits) {
+                top_visits = candidate.visits;
+                top_q = candidate.q_value;
+            }
+        }
+        out.root_total_visits += static_cast<double>(total_visits);
+        if (total_visits > 0) {
+            out.root_top1_visit_share +=
+                static_cast<double>(top_visits) / static_cast<double>(total_visits);
+            for (const SearchCandidate& candidate : result.candidates) {
+                if (candidate.visits <= 0) continue;
+                const double p = static_cast<double>(candidate.visits) /
+                                 static_cast<double>(total_visits);
+                out.root_visit_entropy -= p * std::log(p);
+            }
+        }
+        out.root_top1_q += static_cast<double>(top_q);
+    }
+
     ArenaGameResult play_game(const RulesetConfig& rules, std::uint64_t seed,
                               int pair_idx, bool mirror, bool swap_roles) {
         ArenaGameResult g;
@@ -305,6 +413,14 @@ private:
             candidate_sc.simulations = cfg_.candidate_simulations;
         if (cfg_.champion_simulations >= 0)
             champion_sc.simulations = cfg_.champion_simulations;
+        if (cfg_.candidate_time_budget_ms >= 0.0f)
+            candidate_sc.time_budget_ms = cfg_.candidate_time_budget_ms;
+        if (cfg_.champion_time_budget_ms >= 0.0f)
+            champion_sc.time_budget_ms = cfg_.champion_time_budget_ms;
+        if (cfg_.candidate_node_budget >= 0)
+            candidate_sc.node_budget = cfg_.candidate_node_budget;
+        if (cfg_.champion_node_budget >= 0)
+            champion_sc.node_budget = cfg_.champion_node_budget;
         if (cfg_.candidate_gumbel >= 0)
             candidate_sc.use_gumbel = cfg_.candidate_gumbel != 0;
         if (cfg_.champion_gumbel >= 0)
@@ -321,6 +437,10 @@ private:
         Searcher champion_search(champion_, champion_sc);
         int candidate_pieces = 0;
         int champion_pieces = 0;
+        int scripted_events = 0;
+        const bool scripted_garbage = cfg_.garbage_style == GarbageStyle::Scripted;
+        const bool full_versus = cfg_.garbage_style != GarbageStyle::None &&
+                                 !scripted_garbage;
 
         while (candidate_player.alive() && champion_player.alive() &&
                candidate_pieces < cfg_.max_pieces && champion_pieces < cfg_.max_pieces) {
@@ -357,9 +477,13 @@ private:
                       static_cast<std::uint64_t>(candidate_pieces + champion_pieces);
             searcher.set_config(sc);
             Evaluator& opponent_evaluator = candidate_turn ? champion_ : candidate_;
-            const SearchResult r = searcher.search(
-                active, &inactive, &opponent_evaluator,
-                /*deliver_attacks=*/cfg_.garbage_style != GarbageStyle::None);
+            const SearchResult r = full_versus
+                ? searcher.search(active, &inactive, &opponent_evaluator,
+                                  /*deliver_attacks=*/true)
+                : searcher.search(active, nullptr, nullptr,
+                                  /*deliver_attacks=*/false);
+            record_search(candidate_turn ? diagnostics_.candidate : diagnostics_.champion,
+                          r, static_cast<float>(sc.time_budget_ms));
             if (r.best_action < 0 || r.best_action >= static_cast<int>(actions.size())) {
                 active.die(TopoutReason::BlockOut);
                 break;
@@ -379,8 +503,17 @@ private:
             }
             if (lr.topped_out) break;
 
-            if (sent > 0 && cfg_.garbage_style != GarbageStyle::None)
+            if (sent > 0 && full_versus)
                 inactive.receive_attack(sent, active.now(), active.index());
+            ++scripted_events;
+            if (scripted_garbage && cfg_.garbage_period > 0 &&
+                scripted_events % cfg_.garbage_period == 0) {
+                const Tick script_tick = std::max(candidate_player.now(), champion_player.now());
+                if (candidate_player.alive())
+                    candidate_player.receive_attack(cfg_.garbage_lines, script_tick, -1);
+                if (champion_player.alive())
+                    champion_player.receive_attack(cfg_.garbage_lines, script_tick, -1);
+            }
             ++active_pieces;
         }
 
@@ -446,6 +579,7 @@ private:
     Evaluator& candidate_;
     Evaluator& champion_;
     ArenaConfig cfg_;
+    ArenaDiagnostics diagnostics_;
 };
 
 }  // namespace tetra

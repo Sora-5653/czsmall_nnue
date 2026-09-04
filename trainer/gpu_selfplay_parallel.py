@@ -25,6 +25,7 @@ from gpu_match import (
     EXPORT_MAGIC,
     REQUEST_MAGIC,
     RESULT_MAGIC,
+    AsyncStreamingInferenceDispatcher,
     ChildFailed,
     GpuRequest,
     StreamingInferenceQueue,
@@ -89,6 +90,9 @@ def generate_parallel(
     precision: str,
     workers: int,
     window_ms: float,
+    target_positions: int = 512,
+    inflight_batches: int = 2,
+    gpu_workers: int = 2,
     enable_timing_actions: bool = False,
     no_attack_delivery: bool = False,
 ) -> tuple[
@@ -109,8 +113,14 @@ def generate_parallel(
     all_results: list[dict[str, int | float]] = []
     batcher = StreamingInferenceQueue(
         model, device, precision,
-        target_positions=max(1, batch_size * worker_count),
+        target_positions=max(1, min(batch_size * worker_count, target_positions)),
         window_ms=window_ms,
+    )
+    dispatcher = AsyncStreamingInferenceDispatcher(
+        batcher,
+        events,
+        max_queued_batches=max(1, inflight_batches),
+        gpu_workers=max(1, gpu_workers),
     )
 
     offset = 0
@@ -216,13 +226,14 @@ def generate_parallel(
                 continue
 
             pending = batcher.collect(first, events, handle_control)
-            batcher.serve(pending)
+            dispatcher.submit(pending)
     except BaseException:
         for proc in processes.values():
             if proc.poll() is None:
                 proc.kill()
         raise
     finally:
+        dispatcher.close()
         for thread in threads:
             thread.join(timeout=1.0)
 
@@ -294,10 +305,22 @@ def main() -> int:
                     help="branch FASTEST vs WAIT_FOR_EVENT when pending garbage exists")
     ap.add_argument("--no-attack-delivery", action="store_true",
                     help="compute and record attacks but do not deliver them to the opponent")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=64)
     ap.add_argument(
-        "--batch-window-ms", type=float, default=2.0,
+        "--batch-window-ms", type=float, default=20.0,
         help="micro-batching window across independent C++ exporter children",
+    )
+    ap.add_argument(
+        "--target-positions", type=int, default=256,
+        help="cap the shared GPU batch target so many workers can prepare the next batch asynchronously",
+    )
+    ap.add_argument(
+        "--inflight-batches", type=int, default=2,
+        help="bounded number of GPU batches queued ahead of the active inference batch",
+    )
+    ap.add_argument(
+        "--gpu-workers", type=int, default=2,
+        help="concurrent ROCm/CUDA inference streams serving independent request batches",
     )
     args = ap.parse_args()
 
@@ -332,13 +355,22 @@ def main() -> int:
         args.precision,
         max(1, args.workers),
         max(0.0, args.batch_window_ms),
+        max(1, args.target_positions),
+        max(1, args.inflight_batches),
+        max(1, args.gpu_workers),
         args.timing_actions,
         args.no_attack_delivery,
     )
     print(f"policy_T     {args.policy_temperature:g}")
     report(
         results, shards, telemetry, device, args.checkpoint,
-        target_positions=max(1, args.batch * max(1, min(max(1, args.games), args.workers))),
+        target_positions=max(
+            1,
+            min(
+                args.batch * max(1, min(max(1, args.games), args.workers)),
+                max(1, args.target_positions),
+            ),
+        ),
     )
     return 0
 

@@ -170,6 +170,7 @@ enum class GarbageStyle : std::uint8_t {
     Burst,      // occasional large attacks
     FastSmall,  // frequent single lines
     SlowLarge,  // rare, heavy attacks
+    Scripted,   // fixed incoming schedule for interaction ablation
 };
 
 }  // namespace tetra

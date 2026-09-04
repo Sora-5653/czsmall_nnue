@@ -20,12 +20,16 @@
 #include "tetra/arena.hpp"
 #include "tetra/stats.hpp"
 #include "tetra/gpu_evaluator.hpp"
+#include "tetra/reanalyse.hpp"
+#include "tetra/human_replay.hpp"
 
 #include <chrono>
 #include <cstdio>
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <fstream>
+#include <numeric>
 #include <string>
 
 using namespace tetra;
@@ -809,6 +813,179 @@ int cmd_gpu_export_protocol(int argc, char** argv) {
     return 0;
 }
 
+void write_json_float_array(std::ofstream& out, const float* values, int count) {
+    out << '[';
+    for (int i = 0; i < count; ++i) {
+        if (i) out << ',';
+        out << values[i];
+    }
+    out << ']';
+}
+
+void write_json_float_array(std::ofstream& out, const std::vector<float>& values) {
+    write_json_float_array(out, values.data(), static_cast<int>(values.size()));
+}
+
+// Reconstruct historical roots from v4 provenance, rank them with a cheap
+// current-network pass, and spend full search only on the most stale rows.
+int cmd_gpu_reanalyse_protocol(int argc, char** argv) {
+    if (argc < 6) {
+        std::fprintf(stderr,
+                     "usage: gpu-reanalyse-protocol <input> <output> <audit.jsonl> "
+                     "<select-count> [sims] [batch] [determinizations] [gumbel] "
+                     "[no-attack-delivery] [timing-actions] [teacher-model-version]\n");
+        return 1;
+    }
+    const std::string input = argv[2];
+    const std::string output = argv[3];
+    const std::string audit_path = argv[4];
+    const int requested = std::max(1, std::atoi(argv[5]));
+    const int sims = (argc > 6) ? std::max(1, std::atoi(argv[6])) : 128;
+    const int batch = (argc > 7) ? std::max(1, std::atoi(argv[7])) : 16;
+    const int determinizations = (argc > 8) ? std::max(1, std::atoi(argv[8])) : 2;
+    const bool use_gumbel = (argc > 9) ? std::atoi(argv[9]) != 0 : true;
+    const bool no_attack_delivery = (argc > 10) ? std::atoi(argv[10]) != 0 : false;
+    const bool timing_actions = (argc > 11) ? std::atoi(argv[11]) != 0 : false;
+    const std::uint32_t teacher_model_version =
+        (argc > 12) ? static_cast<std::uint32_t>(std::strtoul(argv[12], nullptr, 10)) : 0;
+    enable_gpu_protocol_stdio();
+
+    const DatasetReadResult source = read_dataset_file(input);
+    if (!source.ok) throw std::runtime_error("cannot read source dataset: " + source.error);
+    if (source.header.version != DatasetHeader::VERSION)
+        throw std::runtime_error("reanalyse requires a rectangular v4 dataset with chosen actions");
+    bool rules_found = false;
+    const RulesetConfig rules = ruleset_from_hash(source.header.ruleset_hash, &rules_found);
+    if (!rules_found)
+        throw std::runtime_error("source ruleset hash is not a known preset");
+
+    const bool deliver_attacks = !no_attack_delivery;
+    ReconstructionReport reconstructed = reconstruct_historical_roots(
+        source.batch, rules, deliver_attacks, timing_actions);
+    if (!reconstructed.ok())
+        throw std::runtime_error("historical-state reconstruction failed: " + reconstructed.error);
+
+    RemoteGpuEvaluator ev(stdin, stdout, batch, 0);
+    struct Candidate {
+        std::size_t root_index = 0;
+        double score = 0.0;
+        Evaluation raw;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(reconstructed.roots.size());
+    for (std::size_t begin = 0; begin < reconstructed.roots.size();
+         begin += static_cast<std::size_t>(batch)) {
+        const std::size_t end = std::min(reconstructed.roots.size(),
+                                         begin + static_cast<std::size_t>(batch));
+        std::vector<EvalRequest> requests;
+        requests.reserve(end - begin);
+        for (std::size_t i = begin; i < end; ++i) {
+            ReanalyseRoot& root = reconstructed.roots[i];
+            requests.push_back(EvalRequest{&root.observation, &root.actions});
+        }
+        std::vector<Evaluation> evaluations;
+        ev.evaluate(requests, evaluations);
+        if (evaluations.size() != requests.size())
+            throw std::runtime_error("teacher returned wrong cheap-screen batch size");
+        for (std::size_t i = begin; i < end; ++i) {
+            const std::size_t local = i - begin;
+            const ReanalyseRoot& root = reconstructed.roots[i];
+            const float* old_policy = source.batch.policy_target.data() +
+                root.source_row * static_cast<std::size_t>(source.batch.max_actions);
+            const double score = policy_kl(old_policy, evaluations[local].policy,
+                                           static_cast<int>(root.actions.size()));
+            candidates.push_back(Candidate{i, score, std::move(evaluations[local])});
+        }
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const Candidate& a, const Candidate& b) {
+                         if (a.score != b.score) return a.score > b.score;
+                         return a.root_index < b.root_index;
+                     });
+    candidates.resize(std::min(candidates.size(), static_cast<std::size_t>(requested)));
+
+    SearchConfig search_cfg;
+    search_cfg.simulations = sims;
+    search_cfg.max_depth = 6;
+    search_cfg.use_gumbel = use_gumbel;
+    search_cfg.batch_size = batch;
+    search_cfg.root_noise_fraction = 0.0f;
+    search_cfg.root_noise_alpha = 0.3f;
+    search_cfg.determinizations = determinizations;
+    search_cfg.enable_timing_actions = timing_actions;
+    Searcher searcher(ev, search_cfg);
+    std::vector<std::size_t> selected_rows;
+    std::vector<std::vector<float>> refreshed_policies;
+    selected_rows.reserve(candidates.size());
+    refreshed_policies.reserve(candidates.size());
+    std::ofstream audit(audit_path, std::ios::binary | std::ios::trunc);
+    if (!audit) throw std::runtime_error("cannot open reanalyse audit output");
+    audit.precision(9);
+    for (const Candidate& candidate : candidates) {
+        const ReanalyseRoot& root = reconstructed.roots[candidate.root_index];
+        search_cfg.seed = source.batch.game_seed[root.source_row] * 0x9E3779B97F4A7C15ull +
+                          source.batch.move_number[root.source_row];
+        searcher.set_config(search_cfg);
+        const SearchResult result = searcher.search(root.active, &root.inactive, &ev,
+                                                    deliver_attacks);
+        if (result.search_policy.size() != root.actions.size())
+            throw std::runtime_error("reanalysis search returned wrong policy width");
+        selected_rows.push_back(root.source_row);
+        refreshed_policies.push_back(result.search_policy);
+
+        const int action_count = static_cast<int>(root.actions.size());
+        const float* old_policy = source.batch.policy_target.data() +
+            root.source_row * static_cast<std::size_t>(source.batch.max_actions);
+        audit << "{\"source_row\":" << root.source_row
+              << ",\"game_seed\":" << source.batch.game_seed[root.source_row]
+              << ",\"move_number\":" << source.batch.move_number[root.source_row]
+              << ",\"player_perspective\":" << source.batch.player_perspective[root.source_row]
+              << ",\"selection_score_policy_kl\":" << candidate.score
+              << ",\"historical_chosen_action\":" << source.batch.chosen_action[root.source_row]
+              << ",\"reanalysis_best_action\":" << result.best_action
+              << ",\"terminal_value_target\":" << source.batch.value_target[root.source_row]
+              << ",\"current_raw_value\":" << candidate.raw.value.scalar()
+              << ",\"reanalysis_search_value\":" << result.value.scalar()
+              << ",\"historical_policy\":";
+        write_json_float_array(audit, old_policy, action_count);
+        audit << ",\"current_raw_policy\":";
+        write_json_float_array(audit, candidate.raw.policy);
+        audit << ",\"reanalysis_policy\":";
+        write_json_float_array(audit, result.search_policy);
+        audit << "}\n";
+    }
+    audit.close();
+
+    TensorBatch refreshed = select_reanalysed_rows(source.batch, selected_rows,
+                                                    refreshed_policies);
+    DatasetContract contract;
+    contract.contract_version = source.header.contract_version;
+    contract.tokenizer_schema_version = source.header.tokenizer_schema_version;
+    contract.tokenizer_schema_hash = source.header.tokenizer_schema_hash;
+    contract.observation_schema_hash = source.header.observation_schema_hash;
+    contract.action_schema_version = source.header.action_schema_version;
+    contract.aux_target_schema_version = source.header.aux_target_schema_version;
+    contract.randomizer_type = source.header.randomizer_type;
+    contract.termination_reason = static_cast<TerminationReason>(source.header.termination_reason);
+    contract.self_play_seed = source.header.self_play_seed;
+    contract.token_kind_order_hash = source.header.token_kind_order_hash;
+    const std::uint32_t output_model_version = teacher_model_version > 0
+        ? teacher_model_version : source.header.model_version;
+    if (!write_dataset_file(output, refreshed, source.header.ruleset_hash,
+                            output_model_version, contract))
+        throw std::runtime_error("cannot write reanalysed dataset");
+
+    gpu_protocol::write_exact(stdout, "RANL", 4);
+    gpu_protocol::write_u32(stdout, static_cast<std::uint32_t>(source.batch.batch));
+    gpu_protocol::write_u32(stdout, static_cast<std::uint32_t>(selected_rows.size()));
+    gpu_protocol::write_u32(stdout, static_cast<std::uint32_t>(reconstructed.token_rows_verified));
+    gpu_protocol::write_u32(stdout, static_cast<std::uint32_t>(reconstructed.action_rows_verified));
+    gpu_protocol::write_u64(stdout, ev.positions_evaluated());
+    gpu_protocol::write_u64(stdout, ev.batches_issued());
+    if (std::fflush(stdout) != 0) throw std::runtime_error("reanalyse protocol flush failed");
+    return 0;
+}
+
 // GPU-backed Arena.  The C++ side still owns the paired-game protocol and
 // simulator; Python only supplies candidate (model 0) and champion (model 1)
 // evaluations through the same GPU bridge.
@@ -833,6 +1010,15 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
         (argc > 17) ? std::strtof(argv[17], nullptr) : -1.0f;
     const float champion_gumbel_noise_scale =
         (argc > 18) ? std::strtof(argv[18], nullptr) : -1.0f;
+    const float candidate_time_budget_ms =
+        (argc > 19) ? std::strtof(argv[19], nullptr) : -1.0f;
+    const float champion_time_budget_ms =
+        (argc > 20) ? std::strtof(argv[20], nullptr) : -1.0f;
+    const int candidate_node_budget = (argc > 21) ? std::atoi(argv[21]) : -1;
+    const int champion_node_budget = (argc > 22) ? std::atoi(argv[22]) : -1;
+    const int garbage_style = (argc > 23) ? std::atoi(argv[23]) : -1;
+    const int garbage_period = (argc > 24) ? std::atoi(argv[24]) : 8;
+    const int garbage_lines = (argc > 25) ? std::atoi(argv[25]) : 2;
     enable_gpu_protocol_stdio();
 
     RemoteGpuEvaluator candidate(stdin, stdout, std::max(1, batch), 0);
@@ -844,6 +1030,10 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
     cfg.search.simulations = std::max(0, sims);
     cfg.candidate_simulations = candidate_sims;
     cfg.champion_simulations = champion_sims;
+    cfg.candidate_time_budget_ms = candidate_time_budget_ms;
+    cfg.champion_time_budget_ms = champion_time_budget_ms;
+    cfg.candidate_node_budget = candidate_node_budget;
+    cfg.champion_node_budget = champion_node_budget;
     cfg.candidate_gumbel = candidate_gumbel;
     cfg.champion_gumbel = champion_gumbel;
     cfg.candidate_gumbel_noise_scale = candidate_gumbel_noise_scale;
@@ -856,6 +1046,10 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
     cfg.search.gumbel_noise_scale = std::max(0.0f, gumbel_noise_scale);
     cfg.search.batch_size = std::max(1, batch);
     cfg.search.determinizations = std::max(1, determinizations);
+    if (garbage_style >= 0 && garbage_style <= static_cast<int>(GarbageStyle::Scripted))
+        cfg.garbage_style = static_cast<GarbageStyle>(garbage_style);
+    cfg.garbage_period = std::max(1, garbage_period);
+    cfg.garbage_lines = std::max(0, garbage_lines);
 
     Arena arena(candidate, champion, cfg);
     const ArenaResult r = arena.evaluate(RulesetConfig::tetra_league(), base_seed);
@@ -875,6 +1069,56 @@ int cmd_gpu_arena_protocol(int argc, char** argv) {
         r.candidate_blockout_rate, r.champion_blockout_rate,
         r.candidate_lockout_rate, r.champion_lockout_rate,
         r.candidate_garbageout_rate, r.champion_garbageout_rate, r.promoted);
+    auto write_diagnostics = [](const char* name, const SearchSideDiagnostics& d,
+                                float budget) {
+        std::fprintf(stderr,
+                     "\"%s\":{\"budget_ms\":%.9g,\"decisions\":%llu,"
+                     "\"simulations\":%llu,\"nodes\":%llu,\"evaluator_calls\":%llu,"
+                     "\"positions_evaluated\":%llu,\"evaluation_flushes\":%llu,"
+                     "\"node_budget_cutoffs\":%llu,\"time_budget_exhaustions\":%llu,"
+                     "\"raw_policy_matches\":%llu,\"searched_action_changes\":%llu,"
+                     "\"elapsed_ms\":%.9g,\"overshoot_ms\":%.9g,"
+                     "\"evaluator_elapsed_ms\":%.9g,\"depth_sum\":%.9g,"
+                     "\"root_setup_us\":%.9g,\"gather_us\":%.9g,"
+                     "\"backup_us\":%.9g,\"finalize_us\":%.9g,"
+                     "\"node_allocation_us\":%.9g,"
+                     "\"legal_action_generation_us\":%.9g,"
+                     "\"state_transition_us\":%.9g,\"selection_us\":%.9g,"
+                     "\"depth_samples\":%llu,\"max_depth\":%d,"
+                     "\"legal_actions\":%.9g,\"root_total_visits\":%.9g,"
+                     "\"root_top1_visit_share\":%.9g,\"root_top1_q\":%.9g,"
+                     "\"root_visit_entropy\":%.9g,\"decision_latencies_ms\":[",
+                     name, budget,
+                     static_cast<unsigned long long>(d.decisions),
+                     static_cast<unsigned long long>(d.simulations),
+                     static_cast<unsigned long long>(d.nodes),
+                     static_cast<unsigned long long>(d.evaluator_calls),
+                     static_cast<unsigned long long>(d.positions_evaluated),
+                     static_cast<unsigned long long>(d.evaluation_flushes),
+                     static_cast<unsigned long long>(d.node_budget_cutoffs),
+                     static_cast<unsigned long long>(d.time_budget_exhaustions),
+                     static_cast<unsigned long long>(d.raw_policy_matches),
+                     static_cast<unsigned long long>(d.searched_action_changes),
+                     d.elapsed_ms, d.overshoot_ms, d.evaluator_elapsed_ms, d.depth_sum,
+                     d.root_setup_us, d.gather_us, d.backup_us, d.finalize_us,
+                     d.node_allocation_us, d.legal_action_generation_us,
+                     d.state_transition_us, d.selection_us,
+                     static_cast<unsigned long long>(d.depth_samples), d.max_depth,
+                     d.legal_actions, d.root_total_visits, d.root_top1_visit_share,
+                     d.root_top1_q, d.root_visit_entropy);
+        for (size_t i = 0; i < d.decision_latencies_ms.size(); ++i) {
+            if (i != 0) std::fputc(',', stderr);
+            std::fprintf(stderr, "%.9g", d.decision_latencies_ms[i]);
+        }
+        std::fputs("]}", stderr);
+    };
+    std::fputs("{\"arena_diagnostics\":{", stderr);
+    write_diagnostics("candidate", r.diagnostics.candidate, candidate_time_budget_ms);
+    std::fputc(',', stderr);
+    write_diagnostics("champion", r.diagnostics.champion, champion_time_budget_ms);
+    std::fprintf(stderr, "},\"garbage_style\":%d,\"garbage_period\":%d,\"garbage_lines\":%d}\n",
+                 garbage_style >= 0 ? garbage_style : static_cast<int>(cfg.garbage_style),
+                 cfg.garbage_period, cfg.garbage_lines);
     return 0;
 }
 
@@ -951,6 +1195,109 @@ int cmd_arena(int argc, char** argv) {
     return 0;
 }
 
+// Diagnostic-only local evaluator control.  This keeps the C++ Arena/search
+// path intact while removing both Python and GPU work.  Its output is not a
+// strength result; it is only a nodes/ms ceiling measurement.
+int cmd_arena_diagnostic(int argc, char** argv) {
+    if (argc < 3) {
+        std::printf(
+            "usage: tetra_cli arena-diagnostic <uniform|heuristic> "
+            "[champion=uniform] [pairs=1] [sims=100000] [pieces=20] "
+            "[budget_ms=40] [garbage_style=1] [seed=42]\n");
+        return 1;
+    }
+    const std::string candidate_name = argv[2];
+    const std::string champion_name = (argc > 3) ? argv[3] : "uniform";
+    const int pairs = (argc > 4) ? std::atoi(argv[4]) : 1;
+    const int sims = (argc > 5) ? std::atoi(argv[5]) : 100000;
+    const int pieces = (argc > 6) ? std::atoi(argv[6]) : 20;
+    const float budget_ms = (argc > 7) ? std::strtof(argv[7], nullptr) : 40.0f;
+    const int garbage_style = (argc > 8) ? std::atoi(argv[8]) : 1;
+    const std::uint64_t seed = (argc > 9) ? std::strtoull(argv[9], nullptr, 10) : 42;
+
+    auto candidate = load_evaluator_from_name(candidate_name);
+    auto champion = load_evaluator_from_name(champion_name);
+    if (!candidate || !champion) return 1;
+
+    ArenaConfig cfg;
+    cfg.pairs = std::max(1, pairs);
+    cfg.max_pieces = std::max(1, pieces);
+    cfg.search.simulations = std::max(0, sims);
+    cfg.search.time_budget_ms = std::max(0.0f, budget_ms);
+    cfg.search.max_depth = 6;
+    cfg.search.batch_size = 16;
+    cfg.search.use_gumbel = true;
+    cfg.search.determinizations = 1;
+    if (garbage_style >= 0 && garbage_style <= static_cast<int>(GarbageStyle::Scripted))
+        cfg.garbage_style = static_cast<GarbageStyle>(garbage_style);
+
+    Arena arena(*candidate, *champion, cfg);
+    const ArenaResult result = arena.evaluate(RulesetConfig::tetra_league(), seed);
+    auto write_side = [](const SearchSideDiagnostics& d) {
+        std::printf(
+            "{\"decisions\":%llu,\"nodes\":%llu,\"positions_evaluated\":%llu,"
+            "\"evaluator_calls\":%llu,\"elapsed_ms\":%.9g,"
+            "\"evaluator_elapsed_ms\":%.9g,\"overshoot_ms\":%.9g,"
+            "\"root_setup_us\":%.9g,\"gather_us\":%.9g,"
+            "\"backup_us\":%.9g,\"finalize_us\":%.9g,"
+            "\"node_allocation_us\":%.9g,\"legal_action_generation_us\":%.9g,"
+            "\"state_transition_us\":%.9g,\"selection_us\":%.9g,"
+            "\"max_depth\":%d}",
+            static_cast<unsigned long long>(d.decisions),
+            static_cast<unsigned long long>(d.nodes),
+            static_cast<unsigned long long>(d.positions_evaluated),
+            static_cast<unsigned long long>(d.evaluator_calls),
+            d.elapsed_ms, d.evaluator_elapsed_ms, d.overshoot_ms,
+            d.root_setup_us, d.gather_us, d.backup_us, d.finalize_us,
+            d.node_allocation_us, d.legal_action_generation_us,
+            d.state_transition_us, d.selection_us, d.max_depth);
+    };
+    std::printf(
+        "{\"local_dummy_diagnostics\":{\"candidate_evaluator\":\"%s\","
+        "\"champion_evaluator\":\"%s\",\"garbage_style\":%d,"
+        "\"budget_ms\":%.9g,\"games\":%d,\"candidate\":",
+        candidate_name.c_str(), champion_name.c_str(), garbage_style, budget_ms,
+        result.games_played);
+    write_side(result.diagnostics.candidate);
+    std::printf(",\"champion\":");
+    write_side(result.diagnostics.champion);
+    std::printf("}}\n");
+    return 0;
+}
+
+int cmd_import_human_replay(int argc, char** argv) {
+    if (argc < 4) {
+        std::fprintf(stderr,
+                     "usage: import-human-replay <normalized.replay> <output.tetradat> "
+                     "[model_version] [league|quickplay|guideline]\n");
+        return 2;
+    }
+    const std::uint32_t model_version = argc > 4
+        ? static_cast<std::uint32_t>(std::strtoul(argv[4], nullptr, 10))
+        : 0u;
+    const RulesetConfig rules = preset(argc > 5 ? argv[5] : "league");
+    HumanReplayImportStats stats;
+    std::string error;
+    if (!import_human_replay_protocol(argv[2], argv[3], rules, model_version,
+                                      &stats, &error)) {
+        std::fprintf(stderr, "human replay import failed: %s\n", error.c_str());
+        std::fprintf(stderr,
+                     "  games=%zu turns=%zu imported=%zu invalid=%zu execution=%zu unmatched=%zu\n",
+                     stats.games, stats.turns, stats.imported,
+                     stats.skipped_invalid_state, stats.skipped_execution,
+                     stats.skipped_no_legal_match);
+        return 1;
+    }
+    std::printf(
+        "human replay import: games=%zu turns=%zu imported=%zu invalid=%zu execution=%zu unmatched=%zu\n",
+        stats.games, stats.turns, stats.imported,
+        stats.skipped_invalid_state, stats.skipped_execution,
+        stats.skipped_no_legal_match);
+    std::printf("wrote %s under ruleset %s (%s), model_version=%u\n",
+                argv[3], rules.id.c_str(), rules.hash_hex().c_str(), model_version);
+    return 0;
+}
+
 int cmd_decode_dataset(int argc, char** argv) {
     if (argc < 3) {
         std::printf(
@@ -1005,11 +1352,19 @@ void usage() {
         "  gpu-play-protocol [pieces] [sims] [batch] [seed] [determinizations] [gumbel]\n"
         "  gpu-export-protocol <file> [games] [pieces] [sims] [batch] [seed] [model_version] "
         "[determinizations] [gumbel]\n"
+        "  gpu-reanalyse-protocol <input> <output> <audit.jsonl> <select-count> "
+        "[sims] [batch] [determinizations] [gumbel] [no-attack] [timing] [model-version]\n"
         "  gpu-arena-protocol [pairs] [sims] [pieces] [batch] [determinizations] [gumbel] [seed] "
         "[candidate_sims] [champion_sims] [candidate_gumbel] [champion_gumbel] "
         "[gumbel_c_scale] [gumbel_noise_scale] [candidate_timing] [champion_timing] "
-        "[candidate_gumbel_noise_scale] [champion_gumbel_noise_scale]\n"
+        "[candidate_gumbel_noise_scale] [champion_gumbel_noise_scale] "
+        "[candidate_time_ms] [champion_time_ms] [candidate_node_budget] "
+        "[champion_node_budget] [garbage_style] [garbage_period] [garbage_lines]\n"
         "  arena <candidate> [champion=heuristic] [pairs] [sims] [pieces]\n"
+        "  arena-diagnostic <uniform|heuristic> [champion=uniform] [pairs] [sims] [pieces] "
+        "[budget_ms] [garbage_style] [seed]\n"
+        "  import-human-replay <normalized.replay> <output.tetradat> [model_version] "
+        "[league|quickplay|guideline]\n"
         "  decode-dataset <input.tetradat> [output.tetradat]\n"
         "  bench [iterations]\n"
         "  determinism [seed]\n");
@@ -1035,8 +1390,11 @@ int main(int argc, char** argv) {
     if (cmd == "play") return cmd_play(argc, argv);
     if (cmd == "gpu-play-protocol") return cmd_gpu_play_protocol(argc, argv);
     if (cmd == "gpu-export-protocol") return cmd_gpu_export_protocol(argc, argv);
+    if (cmd == "gpu-reanalyse-protocol") return cmd_gpu_reanalyse_protocol(argc, argv);
     if (cmd == "gpu-arena-protocol") return cmd_gpu_arena_protocol(argc, argv);
     if (cmd == "arena") return cmd_arena(argc, argv);
+    if (cmd == "arena-diagnostic") return cmd_arena_diagnostic(argc, argv);
+    if (cmd == "import-human-replay") return cmd_import_human_replay(argc, argv);
     if (cmd == "decode-dataset") return cmd_decode_dataset(argc, argv);
     if (cmd == "bench") return cmd_bench(argc, argv);
     if (cmd == "determinism") return cmd_determinism(argc, argv);
