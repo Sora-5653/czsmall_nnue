@@ -3,10 +3,17 @@ from __future__ import annotations
 
 import unittest
 
-from trainer.ttrm_exact_replay import ReplayMachine
+from trainer.ttrm_exact_replay import PieceStream, ReplayMachine
 
 
 class ExactReplayRegressionTest(unittest.TestCase):
+    def test_piece_stream_matches_known_tetrio_seed_vector(self) -> None:
+        stream = PieceStream(794425179)
+        self.assertEqual(
+            [stream.pop() for _ in range(14)],
+            list("TIOZLJSOSJZTLI"),
+        )
+
     def test_v19_gravity_ramp_matches_long_league_snapshot(self) -> None:
         machine = ReplayMachine.__new__(ReplayMachine)
         machine.gravity_base = 0.02

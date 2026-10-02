@@ -175,57 +175,7 @@ def _game_from_full(event: dict[str, Any]) -> dict[str, Any]:
     return _first_mapping(data, ("full", "state", "snapshot"))
 
 
-def _tetrio_7bag_sequence(seed: int, count: int) -> list[str]:
-    """Generate TETR.IO's seeded 7-bag sequence for replay reconstruction.
-
-    TETR.IO replay seeds use MINSTD (16807 mod 2147483647) and Fisher-Yates
-    over the canonical ZLOSIJT input order.  This implementation is local and
-    deliberately tiny; move legality and board mechanics still remain in C++.
-    """
-    if count <= 0:
-        return []
-    modulus = 2147483647
-    state = seed % modulus
-    if state <= 0:
-        state += modulus - 1
-
-    def next_float() -> float:
-        nonlocal state
-        state = (16807 * state) % modulus
-        return (state - 1) / 2147483646
-
-    out: list[str] = []
-    while len(out) < count:
-        bag = list("ZLOSIJT")
-        for index in range(len(bag) - 1, 0, -1):
-            chosen = int(next_float() * (index + 1))
-            bag[index], bag[chosen] = bag[chosen], bag[index]
-        out.extend(bag)
-    return out[:count]
-
-
-def _seed_from_events(events: Sequence[dict[str, Any]]) -> int | None:
-    for event in reversed(events):
-        data = _dict(event.get("data"))
-        candidates = (
-            _dict(data.get("options")).get("seed"),
-            _dict(_dict(data.get("game")).get("options")).get("seed"),
-            data.get("seed"),
-        )
-        for value in candidates:
-            try:
-                if value is not None:
-                    return int(value)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def _extract_state(
-    full_event: dict[str, Any],
-    *,
-    seeded_sequence: Sequence[str] | None = None,
-) -> NormalizedState:
+def _extract_state(full_event: dict[str, Any]) -> NormalizedState:
     game = _game_from_full(full_event)
     if not game:
         raise ValueError("full event has no game snapshot")
@@ -252,24 +202,6 @@ def _extract_state(
         stats = _dict(_dict(full_event.get("data")).get("stats"))
     combo = _int(stats.get("combo", game.get("combo", -1)), -1)
     b2b = _int(stats.get("btb", stats.get("b2b", game.get("b2b", 0))), 0)
-    pieces_placed = _int(stats.get("piecesplaced", stats.get("pieces_placed", 0)), 0)
-
-    # A fresh TETR.IO multiplayer `full` snapshot contains a placeholder
-    # `falling` object, while `bag` is the actual seeded piece stream beginning
-    # with the first playable piece.  For league replays, prefer the verified
-    # seed stream and require its visible prefix to agree with the snapshot.
-    if seeded_sequence is not None and pieces_placed == 0:
-        seeded = [piece for piece in seeded_sequence if piece in PIECES]
-        if not seeded:
-            raise ValueError("seeded replay produced an empty piece sequence")
-        if q and seeded[: len(q)] != q:
-            raise ValueError(
-                "replay seed/bag mismatch: "
-                f"snapshot={''.join(q)} generated={''.join(seeded[:len(q)])}"
-            )
-        current = seeded[0]
-        q = seeded[1:]
-
     if current == "-":
         raise ValueError("full event has no active/current tetromino")
     return NormalizedState(rows, current, hold, "".join(q), combo, b2b)
@@ -400,25 +332,11 @@ def normalize_round(round_data: Any, source_id: str, round_index: int) -> Normal
     streams = [_events(replay) for replay in replays]
     if any(not stream for stream in streams):
         raise ValueError(f"round {round_index}: empty replay stream")
-    player_turns = [list(_turns_for_player(streams[0], 0)), list(_turns_for_player(streams[1], 1))]
-    seeds = [_seed_from_events(stream) for stream in streams]
-    common_seed: int | None = None
-    present_seeds = [seed for seed in seeds if seed is not None]
-    if present_seeds:
-        if len(present_seeds) != 2 or present_seeds[0] != present_seeds[1]:
-            raise ValueError(f"round {round_index}: player replay seeds disagree: {seeds}")
-        common_seed = present_seeds[0]
-
-    # Holds can consume one extra queue item, so reserve a generous tail beyond
-    # the observed hard-drop count.  The generated prefix is cross-checked
-    # against each player's snapshot before it is trusted.
-    sequence_count = max(len(player_turns[0]), len(player_turns[1])) + 32
-    sequence = _tetrio_7bag_sequence(common_seed, sequence_count) if common_seed is not None else None
-    initial = tuple(
-        _extract_state(_first_full(stream), seeded_sequence=sequence)
-        for stream in streams
-    )
-    turns = [*player_turns[0], *player_turns[1]]
+    initial = tuple(_extract_state(_first_full(stream)) for stream in streams)
+    turns = [
+        *list(_turns_for_player(streams[0], 0)),
+        *list(_turns_for_player(streams[1], 1)),
+    ]
     turns.sort(key=lambda turn: (turn.frame, turn.player))
     if not turns:
         raise ValueError(f"round {round_index}: no hard-drop turns")

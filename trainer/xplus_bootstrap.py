@@ -9,24 +9,29 @@ Default pipeline:
     -> frozen-teacher T=3 policy distillation
     -> 0.13M XS local evaluator
 
-The default path deliberately requires a 100% exact import.  A source/round that
+The pipeline deliberately requires a 100% exact import.  A source/round that
 cannot be reconstructed or an exact turn that cannot be represented by the
 production action space stops training instead of silently reducing the corpus.
-`--allow-partial-exact` exists only for explicit diagnostics/ablations.
 
-Human replay WDL is intentionally disabled by default for the local evaluator:
+Human replay WDL is intentionally disabled for the local evaluator:
 in the current exact X+ corpus, local state -> eventual match outcome did not
-produce a useful held-out value signal.  Value distillation remains configurable
-for a future local value target/teacher.
+produce a useful held-out value signal.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+
+MANIFEST_FORMAT = "tetra-human-replay-manifest-v1"
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def run(command: list[str], *, root: Path, dry_run: bool) -> None:
@@ -58,73 +63,150 @@ def load_manifest(output_dir: Path) -> dict:
     return payload
 
 
-def manifest_shards(output_dir: Path, root: Path) -> list[str]:
-    manifest = load_manifest(output_dir)
-    items = manifest.get("shards", [])
-    if not isinstance(items, list):
-        raise SystemExit("invalid shard list in exact replay manifest")
-    shards: list[str] = []
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verified_shards(output_dir: Path, items: object) -> list[Path]:
+    if not isinstance(items, list) or not items:
+        raise SystemExit("exact replay quality gate failed: invalid shard list")
+    shards: list[Path] = []
     seen: set[Path] = set()
     for item in items:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-            continue
+            raise SystemExit("exact replay quality gate failed: invalid shard entry")
+        expected_hash = item.get("dataset_sha256")
+        if not isinstance(expected_hash, str) or not SHA256_RE.fullmatch(expected_hash):
+            raise SystemExit("exact replay quality gate failed: invalid shard sha256")
         # Manifest paths may have been produced by WSL while the learner is a
         # Windows ROCm Python.  The basename plus the selected output dir is the
         # stable cross-runtime identity.
         candidate = output_dir / Path(item["path"].replace("\\", "/")).name
         candidate = candidate.resolve()
         if candidate in seen:
-            continue
+            raise SystemExit("exact replay quality gate failed: duplicate shard path")
         if not candidate.exists():
             raise SystemExit(f"manifest references missing exact shard: {candidate}")
+        if sha256_file(candidate) != expected_hash:
+            raise SystemExit(f"exact replay quality gate failed: shard hash mismatch: {candidate}")
         seen.add(candidate)
-        shards.append(runtime_path(root, candidate))
-    if not shards:
-        raise SystemExit(f"no exact .tetradat shards in {output_dir}")
+        shards.append(candidate)
     return shards
 
 
-def verify_exact_gate(
-    output_dir: Path,
-    *,
-    min_fraction: float,
-    allow_partial: bool,
-) -> None:
-    manifest = load_manifest(output_dir)
-    totals = manifest.get("totals", {}) if isinstance(manifest, dict) else {}
-    fraction = float(totals.get("import_fraction", 0.0)) if isinstance(totals, dict) else 0.0
-    sources = manifest.get("sources", [])
-    source_errors: list[str] = []
-    if isinstance(sources, list):
-        for source in sources:
-            if not isinstance(source, dict):
-                continue
-            errors = source.get("errors", [])
-            if isinstance(errors, list) and errors:
-                source_errors.extend(str(error) for error in errors)
+def nonnegative_int(value: object, label: str) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        result = value
+    elif isinstance(value, str) and value.isdecimal():
+        result = int(value)
+    else:
+        raise SystemExit(f"exact replay quality gate failed: invalid {label}")
+    if result < 0:
+        raise SystemExit(f"exact replay quality gate failed: invalid {label}")
+    return result
 
-    required = min_fraction if allow_partial else 1.0
-    if fraction + 1e-12 < required:
+
+def verify_exact_gate(output_dir: Path) -> list[Path]:
+    manifest = load_manifest(output_dir)
+    if manifest.get("format") != MANIFEST_FORMAT:
+        raise SystemExit("exact replay quality gate failed: invalid manifest format")
+    if manifest.get("normalization_mode") != "exact-v19":
         raise SystemExit(
-            f"exact replay quality gate failed: import_fraction={fraction:.6f} < {required:.6f}"
+            "exact replay quality gate failed: manifest was not produced by "
+            "the exact-v19 normalizer"
         )
-    if source_errors and not allow_partial:
+    totals = manifest.get("totals", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(totals, dict):
+        raise SystemExit("exact replay quality gate failed: invalid totals")
+    normalized = nonnegative_int(totals.get("normalized_turns"), "normalized_turns")
+    normalized_games = nonnegative_int(totals.get("normalized_games"), "normalized_games")
+    imported = nonnegative_int(totals.get("imported_samples"), "imported_samples")
+    skipped = nonnegative_int(
+        totals.get("skipped_during_cpp_validation"),
+        "skipped_during_cpp_validation",
+    )
+    source_files = nonnegative_int(totals.get("source_files"), "source_files")
+    try:
+        fraction = float(totals.get("import_fraction", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("exact replay quality gate failed: invalid totals") from exc
+    if not math.isfinite(fraction):
+        raise SystemExit("exact replay quality gate failed: non-finite import_fraction")
+
+    sources = manifest.get("sources", [])
+    if not isinstance(sources, list) or len(sources) != source_files:
+        raise SystemExit("exact replay quality gate failed: inconsistent source list")
+    source_errors: list[str] = []
+    source_turns = 0
+    source_games = 0
+    for source in sources:
+        if not isinstance(source, dict) or not isinstance(source.get("errors"), list):
+            raise SystemExit("exact replay quality gate failed: invalid source entry")
+        source_turns += nonnegative_int(source.get("turns"), "source turns")
+        source_games += nonnegative_int(source.get("games"), "source games")
+        source_errors.extend(str(error) for error in source["errors"])
+
+    shard_items = manifest.get("shards")
+    shards = verified_shards(output_dir, shard_items)
+    requested_sum = 0
+    games_sum = 0
+    imported_sum = 0
+    skipped_sum = 0
+    assert isinstance(shard_items, list)
+    for shard in shard_items:
+        assert isinstance(shard, dict)
+        requested_sum += nonnegative_int(shard.get("requested_turns"), "shard requested_turns")
+        games_sum += nonnegative_int(shard.get("games"), "shard games")
+        imported_sum += nonnegative_int(shard.get("imported"), "shard imported")
+        skipped_sum += sum(
+            nonnegative_int(shard.get(name), f"shard {name}")
+            for name in ("invalid", "execution", "unmatched")
+        )
+
+    if source_turns != normalized or requested_sum != normalized:
+        raise SystemExit("exact replay quality gate failed: inconsistent normalized turn counts")
+    if source_games != normalized_games or games_sum != normalized_games:
+        raise SystemExit("exact replay quality gate failed: inconsistent normalized game counts")
+    if imported_sum != imported or skipped_sum != skipped:
+        raise SystemExit("exact replay quality gate failed: inconsistent C++ validation counts")
+
+    if normalized <= 0 or imported != normalized or skipped != 0:
         raise SystemExit(
-            "exact replay quality gate failed: at least one source/round was rejected; "
+            "exact replay quality gate failed: expected every normalized turn "
+            f"to import (normalized={normalized}, imported={imported}, skipped={skipped})"
+        )
+    expected_fraction = imported / normalized if normalized else 0.0
+    if abs(fraction - expected_fraction) > 1e-12 or abs(fraction - 1.0) > 1e-12:
+        raise SystemExit(
+            f"exact replay quality gate failed: import_fraction={fraction:.6f}"
+        )
+    if source_errors:
+        raise SystemExit(
+            "exact replay quality gate failed: a source/round was rejected; "
             f"first error: {source_errors[0]}"
         )
     print(
-        f"exact replay gate: import_fraction={fraction:.1%}, source_errors={len(source_errors)}, "
-        f"mode={'partial-opt-in' if allow_partial else 'fail-closed'}",
+        f"exact replay gate: import_fraction={fraction:.1%}, "
+        f"source_errors={len(source_errors)}, "
+        "mode=fail-closed",
         flush=True,
     )
+    return shards
 
 
 def add_common_train_flags(command: list[str], args: argparse.Namespace) -> None:
-    command.extend([
-        "--device", args.device,
-        "--threads", str(max(1, args.threads)),
-    ])
+    command.extend(
+        [
+            "--device",
+            args.device,
+            "--threads",
+            str(max(1, args.threads)),
+        ]
+    )
     if args.require_gpu:
         command.append("--require-gpu")
     if args.checkpoint_every > 0:
@@ -147,7 +229,6 @@ def main() -> int:
     ap.add_argument("--max-record-pages", type=int, default=50)
     ap.add_argument("--max-replays", type=int, default=0)
     ap.add_argument("--replay-url-template", default="")
-    ap.add_argument("--strict-collect", action="store_true")
 
     # Exact import / sharding.
     ap.add_argument("--shard-dir", default="data/xplus_replay_shards")
@@ -155,46 +236,30 @@ def main() -> int:
     ap.add_argument("--engine", default="")
     ap.add_argument("--samples-per-shard", type=int, default=4096)
     ap.add_argument("--workers", type=int, default=16)
-    ap.add_argument("--ruleset", choices=("league",), default="league")
     ap.add_argument("--model-version", type=int, default=0)
     ap.add_argument("--skip-import", action="store_true")
     ap.add_argument("--force-import", action="store_true")
-    ap.add_argument(
-        "--allow-partial-exact",
-        action="store_true",
-        help="diagnostic opt-in: permit rejected rounds/turns instead of the default 100%% exact gate",
-    )
-    ap.add_argument(
-        "--min-import-fraction",
-        type=float,
-        default=1.0,
-        help="minimum fraction only when --allow-partial-exact is set; default exact path requires 1.0",
-    )
 
-    # Training mode. Distillation is the production bootstrap; direct remains a
-    # paired XS baseline.
-    ap.add_argument("--training-mode", choices=("distill", "direct"), default="distill")
-    ap.add_argument("--train-python", default="",
-                    help="learner Python; use .venv-rocm714/Scripts/python.exe on the RX 9070 XT host")
+    ap.add_argument(
+        "--train-python",
+        default="",
+        help=(
+            "learner Python; use .venv-rocm714/Scripts/python.exe on the "
+            "RX 9070 XT host"
+        ),
+    )
     ap.add_argument("--device", default="auto")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--require-gpu", action="store_true")
     ap.add_argument("--checkpoint-every", type=int, default=0)
     ap.add_argument("--eval-every", type=int, default=250)
 
-    # Student / direct baseline options. In distill mode these configure the XS
-    # student and distillation optimizer.
-    ap.add_argument("--model", choices=("xs", "dev", "s"), default="xs")
+    # XS student and distillation optimizer.
     ap.add_argument("--save", default="models/xplus_xs_distilled.pt")
     ap.add_argument("--best-save", default="models/xplus_xs_distilled_best.pt")
-    ap.add_argument("--resume", default="", help="direct-baseline resume checkpoint")
     ap.add_argument("--steps", type=int, default=5000)
     ap.add_argument("--batch", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=5e-4,
-                    help="student/distillation LR; direct mode may prefer 3e-4")
-    ap.add_argument("--policy-weight", type=float, default=1.0)
-    ap.add_argument("--value-weight", type=float, default=0.0,
-                    help="direct baseline WDL weight; local bootstrap default is policy-only")
+    ap.add_argument("--lr", type=float, default=5e-4)
 
     # Teacher.
     ap.add_argument("--teacher-save", default="models/xplus_teacher1m.pt")
@@ -203,16 +268,10 @@ def main() -> int:
     ap.add_argument("--teacher-steps", type=int, default=5000)
     ap.add_argument("--teacher-batch", type=int, default=256)
     ap.add_argument("--teacher-lr", type=float, default=3e-4)
-    ap.add_argument("--teacher-policy-weight", type=float, default=1.0)
-    ap.add_argument("--teacher-value-weight", type=float, default=0.0)
 
-    # MochBot-style frozen-teacher categorical distillation.
+    # Frozen-teacher categorical policy distillation.
     ap.add_argument("--temperature", type=float, default=3.0)
-    ap.add_argument("--distill-policy-weight", type=float, default=1.0)
-    ap.add_argument("--distill-value-kl-weight", type=float, default=0.0)
-    ap.add_argument("--distill-value-mse-weight", type=float, default=0.0)
 
-    ap.add_argument("--collection-only", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -220,10 +279,12 @@ def main() -> int:
         ap.error("training steps must be non-negative")
     if min(args.batch, args.teacher_batch, args.samples_per_shard) <= 0:
         ap.error("batch and samples-per-shard values must be positive")
-    if args.request_interval < 0 or args.max_record_pages <= 0 or args.max_leaderboard_pages <= 0:
+    if (
+        args.request_interval < 0
+        or args.max_record_pages <= 0
+        or args.max_leaderboard_pages <= 0
+    ):
         ap.error("collection interval must be non-negative and page limits must be positive")
-    if not 0.0 <= args.min_import_fraction <= 1.0:
-        ap.error("--min-import-fraction must be in [0, 1]")
     if args.temperature <= 0:
         ap.error("--temperature must be positive")
 
@@ -252,12 +313,8 @@ def main() -> int:
             collect_cmd.append("--refresh-cohort")
         if args.refresh_records:
             collect_cmd.append("--refresh-records")
-        if args.strict_collect:
-            collect_cmd.append("--strict")
+        collect_cmd.append("--strict")
         run(collect_cmd, root=root, dry_run=args.dry_run)
-
-    if args.collection_only:
-        return 0
 
     if not args.skip_import:
         import_cmd = [
@@ -268,49 +325,21 @@ def main() -> int:
             "--cache-dir", str(cache_dir),
             "--samples-per-shard", str(args.samples_per_shard),
             "--workers", str(max(1, args.workers)),
-            "--ruleset", args.ruleset,
+            "--ruleset", "league",
             "--model-version", str(max(0, args.model_version)),
+            "--exact",
+            "--strict-source",
         ]
         if args.engine:
             import_cmd.extend(["--engine", args.engine])
         if args.force_import:
             import_cmd.append("--force")
-        if not args.allow_partial_exact:
-            import_cmd.append("--strict-source")
         run(import_cmd, root=root, dry_run=args.dry_run)
 
     if args.dry_run:
         shards = [runtime_path(root, shard_dir / "human_*.tetradat")]
     else:
-        verify_exact_gate(
-            shard_dir,
-            min_fraction=args.min_import_fraction,
-            allow_partial=args.allow_partial_exact,
-        )
-        shards = manifest_shards(shard_dir, root)
-
-    if args.training_mode == "direct":
-        direct_cmd = [
-            train_py,
-            "trainer/train.py",
-            *shards,
-            "--model", args.model,
-            "--steps", str(args.steps),
-            "--batch", str(args.batch),
-            "--lr", str(args.lr),
-            "--policy-weight", str(args.policy_weight),
-            "--value-weight", str(args.value_weight),
-            "--aux-weight", "0.0",
-            "--save", args.save,
-        ]
-        if args.resume:
-            direct_cmd.extend(["--resume", args.resume])
-        if args.best_save:
-            direct_cmd.extend(["--best-save", args.best_save])
-        add_common_train_flags(direct_cmd, args)
-        run(direct_cmd, root=root, dry_run=args.dry_run)
-        print(f"X+ direct baseline complete: model={args.model} checkpoint={args.save}", flush=True)
-        return 0
+        shards = [runtime_path(root, path) for path in verify_exact_gate(shard_dir)]
 
     teacher_cmd = [
         train_py,
@@ -320,8 +349,8 @@ def main() -> int:
         "--steps", str(args.teacher_steps),
         "--batch", str(args.teacher_batch),
         "--lr", str(args.teacher_lr),
-        "--policy-weight", str(args.teacher_policy_weight),
-        "--value-weight", str(args.teacher_value_weight),
+        "--policy-weight", "1.0",
+        "--value-weight", "0.0",
         "--aux-weight", "0.0",
         "--save", args.teacher_save,
     ]
@@ -343,19 +372,12 @@ def main() -> int:
         "--batch", str(args.batch),
         "--lr", str(args.lr),
         "--temperature", str(args.temperature),
-        "--policy-weight", str(args.distill_policy_weight),
-        "--value-kl-weight", str(args.distill_value_kl_weight),
-        "--value-mse-weight", str(args.distill_value_mse_weight),
-        "--device", args.device,
-        "--threads", str(max(1, args.threads)),
+        "--policy-weight", "1.0",
+        "--value-kl-weight", "0.0",
+        "--value-mse-weight", "0.0",
         "--save", args.save,
     ]
-    if args.require_gpu:
-        distill_cmd.append("--require-gpu")
-    if args.checkpoint_every > 0:
-        distill_cmd.extend(["--checkpoint-every", str(args.checkpoint_every)])
-    if args.eval_every > 0:
-        distill_cmd.extend(["--eval-every", str(args.eval_every)])
+    add_common_train_flags(distill_cmd, args)
     if args.best_save:
         distill_cmd.extend(["--best-save", args.best_save])
     run(distill_cmd, root=root, dry_run=args.dry_run)
