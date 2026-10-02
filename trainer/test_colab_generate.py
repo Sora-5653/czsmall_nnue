@@ -12,22 +12,34 @@ import unittest
 
 try:
     from .colab_generate import (
+        AUX_TARGET_SCHEMA_VERSION,
+        DATASET_CONTRACT,
         DATASET_HEADER,
         DATASET_MAGIC,
+        OBSERVATION_SCHEMA_HASH,
+        TOKENIZER_SCHEMA_HASH,
+        TOKENIZER_SCHEMA_VERSION,
         ManifestError,
         compute_seed_interval,
         create_manifest,
+        read_dataset_header,
         validate_manifests,
         write_manifest,
     )
 except ImportError:  # pragma: no cover - supports direct execution
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from colab_generate import (  # type: ignore
+        AUX_TARGET_SCHEMA_VERSION,
+        DATASET_CONTRACT,
         DATASET_HEADER,
         DATASET_MAGIC,
+        OBSERVATION_SCHEMA_HASH,
+        TOKENIZER_SCHEMA_HASH,
+        TOKENIZER_SCHEMA_VERSION,
         ManifestError,
         compute_seed_interval,
         create_manifest,
+        read_dataset_header,
         validate_manifests,
         write_manifest,
     )
@@ -81,6 +93,71 @@ class ColabShardTests(unittest.TestCase):
         )
         write_manifest(manifest_path, manifest)
         return manifest_path
+
+    def _contract_dataset(self, path: Path, version: int, *, trailing: int = 0) -> None:
+        # One sample with the contract extension and aux schema v4 (52 targets),
+        # laid out exactly as include/tetra/dataset.hpp serialize_dataset writes it.
+        aux = 52
+        header = DATASET_HEADER.pack(DATASET_MAGIC, version, 1, 1, 1, 24, 24, aux, 0x1234, 4)
+        contract = DATASET_CONTRACT.pack(
+            1,
+            TOKENIZER_SCHEMA_VERSION,
+            TOKENIZER_SCHEMA_HASH,
+            OBSERVATION_SCHEMA_HASH,
+            1,
+            AUX_TARGET_SCHEMA_VERSION,
+            0,
+            0,
+            100,
+            TOKENIZER_SCHEMA_HASH,
+        )
+        floats = 24 + 1 + 24 + 1 + 1 + 1 + aux + aux  # ... aux_target, aux_valid_mask
+        payload = b"\0" * (floats * 4)
+        payload += struct.pack("<iiQI", 1, 0, 100, 0)
+        if version >= 4:
+            payload += struct.pack("<i", 7)  # chosen_action
+        path.write_bytes(header + contract + payload + b"\0" * trailing)
+
+    def test_v4_header_with_chosen_action_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "v4.tetradat"
+            self._contract_dataset(dataset, 4)
+            header = read_dataset_header(dataset)
+            self.assertEqual(header.version, 4)
+            self.assertEqual(header.contract_version, 1)
+            self.assertEqual(header.aux_targets, 52)
+            self.assertEqual(header.aux_target_schema_version, AUX_TARGET_SCHEMA_VERSION)
+            self.assertEqual(header.self_play_seed, 100)
+
+    def test_v3_header_remains_readable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "v3.tetradat"
+            self._contract_dataset(dataset, 3)
+            self.assertEqual(read_dataset_header(dataset).version, 3)
+
+    def test_v4_size_must_include_chosen_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # A v4 header over a v3-sized payload lacks the chosen_action block.
+            v3_bytes = root / "v3.tetradat"
+            self._contract_dataset(v3_bytes, 3)
+            truncated = root / "truncated.tetradat"
+            raw = bytearray(v3_bytes.read_bytes())
+            struct.pack_into("<I", raw, 8, 4)
+            truncated.write_bytes(bytes(raw))
+            with self.assertRaises(ManifestError):
+                read_dataset_header(truncated)
+            padded = root / "padded.tetradat"
+            self._contract_dataset(padded, 4, trailing=4)
+            with self.assertRaises(ManifestError):
+                read_dataset_header(padded)
+
+    def test_unknown_dataset_versions_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = Path(directory) / "v5.tetradat"
+            self._contract_dataset(dataset, 5)
+            with self.assertRaises(ManifestError):
+                read_dataset_header(dataset)
 
     def test_seed_interval_is_disjoint_and_bounded(self) -> None:
         self.assertEqual(compute_seed_interval(100, 0, 4, 32), (100, 132))

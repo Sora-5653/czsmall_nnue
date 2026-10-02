@@ -43,7 +43,10 @@ MANIFEST_FORMAT = "czsmall_nnue.colab-shard"
 MANIFEST_VERSION = 2
 DATASET_MAGIC = b"TETRADAT"
 LEGACY_DATASET_VERSION = 1
-DATASET_VERSION = 3
+RECTANGULAR_V3_DATASET_VERSION = 3
+DATASET_VERSION = 4
+# Versions carrying the contract extension (v4 adds per-sample chosen_action).
+CONTRACT_DATASET_VERSIONS = (RECTANGULAR_V3_DATASET_VERSION, DATASET_VERSION)
 UINT64_LIMIT = 1 << 64
 
 # magic, version, samples, max_tokens, max_actions, token_features,
@@ -139,9 +142,12 @@ def _expected_dataset_size(header: DatasetHeader) -> int:
     )
     metadata = 0
     header_bytes = DATASET_HEADER.size
-    if header.version == DATASET_VERSION:
+    if header.version in CONTRACT_DATASET_VERSIONS:
         floats += n * header.aux_targets  # aux_valid_mask
+        # player_perspective, termination_reason, game_seed, move_number
         metadata = n * (4 + 4 + 8 + 4)
+        if header.version == DATASET_VERSION:
+            metadata += n * 4  # chosen_action
         header_bytes += DATASET_CONTRACT.size
     return header_bytes + floats * 4 + metadata
 
@@ -159,12 +165,12 @@ def read_dataset_header(path: Path) -> DatasetHeader:
     if values[0] != DATASET_MAGIC:
         raise ManifestError(f"not a .tetradat file: {path}")
     version = values[1]
-    if version not in (LEGACY_DATASET_VERSION, DATASET_VERSION):
+    if version != LEGACY_DATASET_VERSION and version not in CONTRACT_DATASET_VERSIONS:
         raise ManifestError(
-            f"Colab shards must be rectangular dataset v1 or v3, got v{version}: {path}"
+            f"Colab shards must be rectangular dataset v1, v3 or v4, got v{version}: {path}"
         )
     extra: dict[str, int] = {}
-    if version == DATASET_VERSION:
+    if version in CONTRACT_DATASET_VERSIONS:
         with path.open("rb") as fh:
             fh.seek(DATASET_HEADER.size)
             extension = fh.read(DATASET_CONTRACT.size)
@@ -201,7 +207,7 @@ def read_dataset_header(path: Path) -> DatasetHeader:
         raise ManifestError(f"dataset has no usable samples or dimensions: {path}")
     if header.token_features <= 0 or header.action_features <= 0 or header.aux_targets <= 0:
         raise ManifestError(f"dataset has invalid feature widths: {path}")
-    if header.version == DATASET_VERSION:
+    if header.version in CONTRACT_DATASET_VERSIONS:
         if (header.tokenizer_schema_version != TOKENIZER_SCHEMA_VERSION or
                 header.tokenizer_schema_hash != TOKENIZER_SCHEMA_HASH or
                 header.token_kind_order_hash != TOKENIZER_SCHEMA_HASH or
