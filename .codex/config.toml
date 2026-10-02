@@ -1,19 +1,14 @@
-# Project-local Codex configuration for cz_nnue.
-# Sol acts as the lead/orchestrator; spawned workers default to Luna Max.
-
-model = "gpt-5.6-sol"
+# Project-local lead and worker defaults.
+model = "gpt-6-astra"
 model_reasoning_effort = "high"
 
 developer_instructions = """
-Act as the lead engineer for this repository.
-
-Own architecture, task decomposition, ambiguous design decisions, integration, and final review.
-Delegate bounded implementation, testing, repository exploration, and other clearly specified leaf work to subagents when that saves lead-model work or wall-clock time.
-
-For heterogeneous worker delegation under Multi-Agent V2, use fork_turns = "none" rather than inheriting the full parent history. Put all context the worker needs into the spawn message: exact task, relevant files/interfaces, constraints, acceptance criteria, and tests to run. This is required so the project-level Luna worker defaults can take effect instead of silently inheriting the Sol parent configuration.
-
-Parallelize independent leaf tasks when useful, but avoid multiple workers editing the same files unless coordination is explicit. Do not delegate unresolved architectural choices merely to save tokens. Review returned changes and test results yourself before treating work as integrated or complete.
+Own architecture, integration, and final verification. Delegate independent, bounded work when it saves time or improves quality; handle small coupled changes directly.
+For Luna Max workers, use fork_turns = "none" and provide the task, owned files, relevant context, constraints, acceptance criteria, and checks. Preserve other contributors' changes and avoid overlapping edits. Verify returned changes and evidence before integration.
 """
+
+[features.context_management]
+experimental_mode = true
 
 [agents]
 enabled = true
@@ -22,6 +17,6 @@ default_subagent_model = "gpt-5.6-luna"
 default_subagent_reasoning_effort = "max"
 
 [agents.worker]
-description = "Luna Max implementation worker for bounded coding and testing tasks."
+description = "Luna Max worker for bounded implementation and testing."
 config_file = "./agents/worker.toml"
 nickname_candidates = ["Worker"]

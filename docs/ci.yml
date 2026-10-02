@@ -4,6 +4,13 @@
 # .github/workflows/ へ移すこと。
 name: CI
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: ["**"]
@@ -13,6 +20,7 @@ jobs:
   test:
     name: build & test (${{ matrix.cxx }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +53,7 @@ jobs:
   sanitizers:
     name: address + undefined sanitizers
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Run the suite under ASan/UBSan
@@ -53,6 +62,7 @@ jobs:
   warnings:
     name: warnings are errors
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Build with -Werror
