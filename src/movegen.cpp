@@ -85,7 +85,8 @@ inline bool gravity_reachable(const Board& board, Piece piece, const std::vector
         return true;
 
     ActivePiece start = spawn_piece(piece, cfg);
-    start.y += spawn_y - 21;
+    start.y += spawn_y -
+               (start.y + shape_of(piece, Rot::N).min_dy);
     std::vector<Input> prefix;
     prefix.reserve(sequence.size());
     for (const Input in : sequence) {
@@ -190,7 +191,8 @@ void collect_piece(const BoardView& view, const Board& source, Piece tetra_piece
         const bool have_finesse = finesse_it != finesse_paths.end() &&
                                   map_cobra_path(finesse_it->second, use_hold, finesse_sequence);
         ActivePiece start = spawn_piece(tetra_piece, cfg);
-        start.y += SpawnY - 21;
+        start.y += SpawnY -
+                   (start.y + shape_of(tetra_piece, Rot::N).min_dy);
         ExecutionResult tap_result, finesse_result;
         if (have_tap)
             tap_result = execute_inputs(source, start, tap_sequence, cfg);
@@ -312,10 +314,10 @@ std::vector<PlacementAction> MoveGenerator::generate_for_piece(const Board& boar
     // distinguished occupied cell. Convert the normal-or-clutched Tetra origin
     // back to Cobra's coordinate before choosing the compile-time ruleset.
     const int spawn_y = start.y + shape_of(piece, Rot::N).min_dy;
-    // Current Cobra adaptation has explicit v19 instantiations for the normal
-    // spawn and the observed one-row clutch spawn. Higher clutch starts remain
+    // Current Cobra adaptation has explicit guideline, v19 normal, and the
+    // observed one-row clutch instantiations. Higher clutch starts remain
     // fail-closed until a corpus demonstrates that they are required.
-    if (spawn_y != 21 && spawn_y != 22) return out;
+    if (spawn_y != 20 && spawn_y != 21 && spawn_y != 22) return out;
 
     const BoardView view = to_cobra_board(board);
     std::unordered_map<std::uint64_t, size_t> by_outcome;
@@ -324,8 +326,11 @@ std::vector<PlacementAction> MoveGenerator::generate_for_piece(const Board& boar
         if (spawn_y == 22)
             collect_with_kick<Kick, Enable180, 22>(
                 view, board, piece, use_hold, cfg, options_, out, by_outcome);
-        else
+        else if (spawn_y == 21)
             collect_with_kick<Kick, Enable180, 21>(
+                view, board, piece, use_hold, cfg, options_, out, by_outcome);
+        else
+            collect_with_kick<Kick, Enable180, 20>(
                 view, board, piece, use_hold, cfg, options_, out, by_outcome);
     };
 

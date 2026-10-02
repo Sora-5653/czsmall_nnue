@@ -72,6 +72,9 @@ struct RandomizerCfg {
 struct MovementCfg {
     KickTableId kick_table = KickTableId::SRS_PLUS;
     bool allow_180 = true;
+    // Lowest occupied spawn row relative to the visible-field boundary.
+    // TETR.IO v19 uses +1; guideline-compatible presets use 0.
+    int spawn_row_offset = 1;
     // Gravity in cells per tick, expressed as a rational to stay integer-exact.
     int gravity_num = 1;
     int gravity_den = 60;

@@ -302,6 +302,10 @@ TEST(ruleset_hash_is_stable_and_sensitive) {
     d.garbage.travel_time += 1;
     CHECK(d.hash() != a.hash());
 
+    RulesetConfig e = league();
+    e.movement.spawn_row_offset -= 1;
+    CHECK(e.hash() != a.hash());
+
     // Different presets must hash differently.
     CHECK(RulesetConfig::quick_play().hash() != a.hash());
     CHECK(RulesetConfig::guideline().hash() != a.hash());

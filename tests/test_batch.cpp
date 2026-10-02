@@ -390,6 +390,52 @@ TEST(dataset_file_round_trips) {
     std::remove(path.c_str());
 }
 
+TEST(compact_dataset_reconstructs_a_clutch_spawn) {
+    const RulesetConfig cfg = league();
+    MoveGenerator gen;
+    constexpr std::uint64_t seed = 1;
+    const std::vector<int> choices{
+        14, 34, 76, 47, 21, 19, 45, 34, 20, 23, 14, 4, 0,
+    };
+    Player p;
+    p.reset(cfg, seed, 0);
+    std::vector<TrainingSample> samples;
+    bool saw_clutch = false;
+    for (size_t move = 0; move < choices.size(); ++move) {
+        if (move > 0) p.receive_attack(2, p.now(), 1);
+        const ActivePiece normal = spawn_piece(p.active().type, cfg);
+        saw_clutch = saw_clutch || p.active().y > normal.y;
+        const auto actions = gen.generate(
+            p.board(), p.active().type, p.hold(),
+            p.visible_next().empty() ? Piece::None : p.visible_next()[0], cfg,
+            p.attack_state().combo >= 0);
+        const int chosen = choices[move];
+        CHECK(chosen >= 0 && chosen < static_cast<int>(actions.size()));
+        if (chosen < 0 || chosen >= static_cast<int>(actions.size())) return;
+        TrainingSample sample;
+        sample.ruleset_hash = cfg.hash();
+        sample.game_seed = seed;
+        sample.move_number = static_cast<std::uint32_t>(move);
+        sample.chosen_action = chosen;
+        sample.garbage_style = static_cast<std::uint8_t>(GarbageStyle::Steady);
+        sample.garbage_period = 1;
+        sample.garbage_lines = 2;
+        sample.search_policy.assign(actions.size(), 0.0f);
+        sample.search_policy[static_cast<size_t>(chosen)] = 1.0f;
+        samples.push_back(std::move(sample));
+        const PlacementAction& action = actions[static_cast<size_t>(chosen)];
+        if (action.use_hold) CHECK(p.do_hold());
+        p.set_active(action.piece_state());
+        int outgoing = 0;
+        CHECK(p.lock_piece(action.total_duration(), &outgoing).ok);
+    }
+    CHECK_MSG(saw_clutch, "fixture must reach a clutch spawn");
+    const DatasetReadResult round_trip =
+        deserialize_dataset(serialize_compact_dataset(pointers(samples), 7));
+    CHECK_MSG(round_trip.ok, "compact clutch reconstruction failed: " + round_trip.error);
+    CHECK_EQ(round_trip.header.samples, samples.size());
+}
+
 TEST(missing_dataset_file_is_reported) {
     const auto r = read_dataset_file("build/no_such_dataset.tetradat");
     CHECK(!r.ok);
