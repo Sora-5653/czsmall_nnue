@@ -37,7 +37,8 @@ SEED_MODEL = 0
 SEED_INPUT = 1
 WIDTH, LAYERS, HEADS, FFN = 32, 2, 4, 96
 TOKENS, ACTIONS = 7, 5
-TOKEN_FEATURES, ACTION_FEATURES = 24, 28
+TOKEN_FEATURES = TetraFormerConfig().token_features
+ACTION_FEATURES = TetraFormerConfig().action_features
 
 
 def main() -> int:
