@@ -93,7 +93,7 @@ def generate_parallel(
     window_ms: float,
     target_positions: int = 512,
     inflight_batches: int = 2,
-    gpu_workers: int = 2,
+    gpu_workers: int = 1,
     enable_timing_actions: bool = False,
     no_attack_delivery: bool = False,
 ) -> tuple[
@@ -339,7 +339,7 @@ def main() -> int:
         help="bounded number of GPU batches queued ahead of the active inference batch",
     )
     ap.add_argument(
-        "--gpu-workers", type=int, default=2,
+        "--gpu-workers", type=int, default=1,
         help="concurrent ROCm/CUDA inference streams serving independent request batches",
     )
     args = ap.parse_args()

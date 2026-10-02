@@ -355,7 +355,7 @@ def main() -> int:
     ap.add_argument("--batch-window-ms", type=float, default=20.0)
     ap.add_argument("--target-positions", type=int, default=256)
     ap.add_argument("--inflight-batches", type=int, default=2)
-    ap.add_argument("--gpu-workers", type=int, default=2)
+    ap.add_argument("--gpu-workers", type=int, default=1)
     ap.add_argument("--no-gumbel", action="store_true")
     ap.add_argument("--no-attack-delivery", action="store_true")
     ap.add_argument("--timing-actions", action="store_true")

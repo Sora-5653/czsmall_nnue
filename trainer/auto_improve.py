@@ -127,7 +127,7 @@ def main() -> int:
     ap.add_argument("--selfplay-batch-window-ms", type=float, default=20.0)
     ap.add_argument("--selfplay-target-positions", type=int, default=256)
     ap.add_argument("--selfplay-inflight-batches", type=int, default=2)
-    ap.add_argument("--selfplay-gpu-workers", type=int, default=2)
+    ap.add_argument("--selfplay-gpu-workers", type=int, default=1)
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp16")
     ap.add_argument("--determinizations", type=int, default=2)
     ap.add_argument("--seed", type=int, default=41000000,
@@ -156,7 +156,7 @@ def main() -> int:
     ap.add_argument("--reanalyze-batch-window-ms", type=float, default=20.0)
     ap.add_argument("--reanalyze-target-positions", type=int, default=256)
     ap.add_argument("--reanalyze-inflight-batches", type=int, default=2)
-    ap.add_argument("--reanalyze-gpu-workers", type=int, default=2)
+    ap.add_argument("--reanalyze-gpu-workers", type=int, default=1)
 
     ap.add_argument("--arena-pairs", type=int, default=20)
     ap.add_argument("--arena-sims", type=int, default=32)
@@ -166,7 +166,7 @@ def main() -> int:
     ap.add_argument("--arena-batch-window-ms", type=float, default=12.0)
     ap.add_argument("--arena-target-positions", type=int, default=192)
     ap.add_argument("--arena-inflight-batches", type=int, default=2)
-    ap.add_argument("--arena-gpu-workers", type=int, default=2)
+    ap.add_argument("--arena-gpu-workers", type=int, default=1)
     ap.add_argument("--arena-seed", type=int, default=42,
                     help="kept fixed across generations for a stable promotion gate")
     ap.add_argument("--arena-candidate", choices=("final", "best"), default="best")
