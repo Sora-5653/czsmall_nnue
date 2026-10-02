@@ -1,15 +1,18 @@
 # サンプル効率 実装計画
 
-最終更新: 2026-08-10
+計画の作成: 2026-08-10 / 状況の更新: 2026-10-02
 
-> この文書は実装順序と実験詳細を保持する作業計画である。原仕様は
-> `SPEC.md`、後続の設計判断は ADR 0014/0015、短い運用契約は
-> `TRAINING_AND_EVALUATION.md` を参照する。`SPEC.md` は後から書き換えない。
+> この文書は実装順序と実験詳細を保持する作業計画です。当初仕様は[SPEC](SPEC.md)、
+> 後続の設計判断は[ADR 0014（目的と補助目標）](adr/0014-objectives-auxiliary-targets-and-vs-score.md)と
+> [ADR 0015（自己対局の由来）](adr/0015-selfplay-provenance-search-mixture-and-timing-curriculum.md)、
+> 運用上の規則は[学習・評価プロトコル](TRAINING_AND_EVALUATION.md)を参照してください。
 >
-> 2026-08-10時点の `main` ではPhase 1とPhase 2a、およびPhase 2bの
-> 基盤（aux schema v2、36補助目標、valid mask、target統計、gradient
-> diagnostics）が実装済み。Phase 3のaction-conditioned target、VS Score
-> の実装・auxiliary ablation、検索強度mixの本格運用は次段階である。
+> **現在の状況:** Phase 1、Phase 2a、Phase 2bの基盤は実装済みです。その後、aux schemaは
+> v4（52 targets。garbageの消去と相殺の区間targetを追加）へ、datasetはv4へ進みました。
+> VS ScoreはGPU Arenaの診断指標として実装済みです。Phase 3のaction-conditioned target、
+> VS Scoreの補助目標ablation、探索強度の混合の本格運用は未着手です。最新の優先順位は
+> [ロードマップ](ROADMAP.md)を参照してください。以下の本文は2026-08-10時点の計画であり、
+> aux schema v2（36 targets）を前提とした記述を含みます。
 
 ## 目的
 

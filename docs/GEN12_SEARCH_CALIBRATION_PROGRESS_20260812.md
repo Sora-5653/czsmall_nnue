@@ -1,5 +1,7 @@
 # Gen12 Search Calibration Progress — 2026-08-12
 
+> この文書は2026-08-12時点の実験記録です。結果は書き換えずに保存しています。現在の優先順位は[ロードマップ](ROADMAP.md)、評価の規則は[学習・評価プロトコル](TRAINING_AND_EVALUATION.md)を参照してください。
+
 ## Current conclusion
 
 The biggest finding is that several apparent model regressions came from the evaluation search regime rather than from the network itself. `docs/adr/0008-search-gumbel-calibration.md` already states that PUCT is unreliable below roughly two simulations per legal action. Current TETR.IO positions have about 42 legal actions on average, so PUCT32 is below that regime and must not be used as the primary strength verdict.
