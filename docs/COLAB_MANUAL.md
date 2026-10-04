@@ -7,8 +7,6 @@ Google Colabを追加の自己対局workerとして使う手順です。次の2�
 
 Colabは追加workerです。ルール、合法手生成、探索、label生成はC++エンジンが担当し、Champion promotion、seed割り当て、datasetの統合方法はローカル側で決めます。Drive、GASは成果物の転送に使えますが、seed、label、統合方法の権威にはしません。
 
-> **既知の問題:** `colab_generate.py` のmanifest validatorは現在dataset v1/v3だけを受け付けます。C++エンジンが書くdatasetはv4のため、生成したshardの検証が失敗する可能性があります。修正までは、検証結果を確認してから学習へ渡してください。
-
 ## Driveを使って手動で実行する
 
 ### Driveにファイルを置く

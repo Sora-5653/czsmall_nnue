@@ -78,10 +78,6 @@ timing actionは現在無効です。固定したclean benchmarkの平均APPが0
 
 解消するまで、`docs/ci.yml` はそのままgreenになるworkflowとして扱いません。
 
-### Colab validatorのdataset version
-
-`trainer/colab_generate.py` のvalidatorはdataset v1/v3だけを受け付け、現在のv4を拒否します。[Colab手順](COLAB_MANUAL.md)を参照してください。
-
 ## エンジンのcorrectnessの未解決事項
 
 ### lock delayと `reset_limit`
