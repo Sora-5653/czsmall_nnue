@@ -1,5 +1,7 @@
 # Stacking / Arena balance handoff — 2026-08-15
 
+> この文書は2026-08-15時点の引き継ぎ記録です。同日の[LC3 handoff](HANDOFF_STACKING_LC3_20260815.md)で置き換えられています。現在の優先順位は[ロードマップ](ROADMAP.md)を参照してください。
+
 ## Executive state
 
 The active objective has changed from timing/cancellation ablation to **static stacking development while preserving competitive Arena strength**.

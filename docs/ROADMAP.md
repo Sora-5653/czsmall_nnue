@@ -1,159 +1,110 @@
 # ロードマップ
 
-この文書は、プロジェクトの**現在の実行状況**を示します。`SPEC.md` は当初仕様として保存し、後の方向変更は `adr/` に記録します。
+プロジェクトの現在の実装状況と、次に進める作業の順序を示します。当初仕様は[SPEC](SPEC.md)に保存し、方向の変更は[ADR](adr/README.md)に記録します。比較実験の規則は[学習・評価プロトコル](TRAINING_AND_EVALUATION.md)で管理します。
 
-## Milestone状況
+Championと個別実験の最新状況は、各実験のhandoffで管理します。直近の記録は[2026-08-15 handoff](HANDOFF_STACKING_LC3_20260815.md)です。
+
+## Milestoneの状況
 
 | 領域 | 状態 |
 |---|---|
-| **M0 — rule core** | **完了。** Board、piece、SRS/SRS+/180 kick、spin、clear、attack、garbage、ruleset versioning、event logを実装済み。 |
-| **M1 — policy input / move generation** | **現行contractでは完了。** Cobra legal placement、action timing/delay bin、masked observation、row/column/global token、bag/opponent-counter token、schema identifier、variable legal-action embeddingを実装済み。 |
-| **M2 — search / self-play / training** | **end-to-end loop実装済み。** batched evaluator、PUCT/Gumbel、determinization、replay/dataset、PyTorch training、C++ weight inference、GPU self-play、GPU Arena、resumable checkpoint、replay mixing、Candidate→Champion guarded iterationが利用可能。 |
-| **M3 — garbage-aware self-play** | **有効。** 二盤面をtimestamp順に進め、search/Arenaと同じevent machineryでattack deliveryを行う。no-attack curriculumも明示的に選択可能。 |
-| **M4 — opponent-aware model** | **core observation pathは有効。** Opponent board/counterをtokenizeし、two-player searchも実装済み。Dedicated opponent-intent modellingとleague trainingは未実装。 |
-| **M5 — multimodal** | **未着手。** image/video inputは現在の優先順位外。 |
+| **M0 — rule core** | 完了。盤面、piece、SRS/SRS+/180 kick、spin、line clear、attack、garbage、ruleset versioning、event logを実装済み。spawn位置はrulesetの設定で、TETR.IO v19とguidelineを区別します。 |
+| **M1 — 方策入力と合法手生成** | 現行の契約では完了。Cobraによる合法配置生成、action timingとdelay bin、mask済み観測、row/column/global token、bagと相手カウンタのtoken、schema識別子、可変長の合法action埋め込みを実装済み。 |
+| **M2 — 探索、自己対局、学習** | end-to-endのloopを実装済み。batch評価、PUCT/Gumbel、determinization、dataset、PyTorch学習、C++推論、GPU自己対局、GPU Arena、再開可能なcheckpoint、replay混合、guard付きiteration、LC3型の探索runtime、Reanalyseを利用できます。 |
+| **M3 — garbageを考慮した自己対局** | 有効。二盤面をtimestamp順に進め、探索およびArenaと同じevent処理でattackを届けます。attackを届けない条件（`--no-attack-delivery`）も明示的に選べます。 |
+| **M4 — 相手を考慮したモデル** | 観測の基本経路は有効。相手の盤面とカウンタをtoken化し、二人用の探索も実装済み。相手の意図のモデル化とleague学習は未実装。 |
+| **M5 — マルチモーダル** | 未着手。画像・動画入力は現在の優先順位外です。 |
 
-## 現在のモデル構造
+## 2026-08-10以降に入った主な実装
 
-TetraFormerをreference/controlとして維持し、CNNとCNN+Transformerを同じsimulator・tensor contract上の実験候補として扱います。
+| 項目 | 内容 | 根拠 |
+|---|---|---|
+| LC3型の探索runtime | 共有の推論queue、`SearchPolicy` の分離、edgeごとの統計、Gather/Eval/Backpropの分離とtelemetry | [ADR 0013（LC3）](adr/0013-lc3-search-runtime.md) |
+| モデルサイズと探索予算 | XS/Sの比較。XSを高速探索の比較基準として維持 | [ADR 0014（サイズと探索予算）](adr/0014-model-size-vs-search-budget.md) |
+| Reanalyse（最小構成） | 履歴の厳密な再生、token/actionの一致確認、KLによる選択、選んだrootの再探索、非破壊の出力 | [ADR 0015（Reanalyse）](adr/0015-reanalyse-historical-target-refresh.md) |
+| source別のsampling | `trainer/train.py` の `--secondary-source-*` で、別sourceを固定比率で混ぜる | [2026-08-15 handoff](HANDOFF_STACKING_LC3_20260815.md#5-source-aware-sampling-is-already-implemented) |
+| VS Score | GPU ArenaでCandidateとChampionのVS Scoreを報告 | `include/tetra/stats.hpp` |
+| aux schema v4 | 52 targets。garbageの消去と相殺の区間targetを追加 | `include/tetra/schema.hpp` |
+| dataset v4 | Reanalyse用に `chosen_action` などの再生情報を保持 | [アーキテクチャ](ARCHITECTURE.md#dataset-version) |
+| 人間リプレイの事前学習 | TETR.IO v19の厳密な再構成、C++による配置検証、`teacher1m` からXSへの蒸留 | [人間リプレイによる事前学習](HUMAN_REPLAY_PRETRAINING.md) |
 
-2026-08-08のablationから、architecture選定方針を次のように変更しました。
+## 優先度1 — サンプル効率と教師targetの質
 
-- TransformerはTransformer由来teacher policyをわずかに良く模倣した。
-- corrected hashed splitではfull CNNがWDL/valueを大幅に良く学習した。
-- CNNの最も安定した優位はraw policy-onlyではなく**search内**に現れた。
-- 小型CNNを付け足したhybridはその優位を再現できず、value late-overfitも起こした。
+2026-08-15時点の次の作業は、元のtargetとReanalyse後のtargetを比較する管理された学習ablationです。構造は固定したまま行います。
 
-したがって次のarchitecture実験は「TransformerをCNNで置換する」でも「CNN headをまた足す」でもありません。
+1. 元のtargetとReanalyse後のtargetを、同じdataset、分割、学習予算、複数seedで比較します。
+2. 方策のみ、WDL、legacy aux、区間auxを、同じ条件で比較します。
+3. VS Scoreを補助目標として試す場合は、Arena reportとは別のablationとして行います。WDL rewardは変更しません。
+4. action-conditionedな結果targetは、エンジンから厳密なlabelを得られ、入力特徴の自己コピーにならないものから追加します。
 
-**具体的な表現仮説**を検証します。最有力候補は、full CNN相当のlocal encoderをpolicy/valueで共有し、その特徴をTransformerのglobal/opponent interactionへ接続するhybridです。
+関連: [ADR 0014（目的と補助目標）](adr/0014-objectives-auxiliary-targets-and-vs-score.md)、[サンプル効率の実装計画](SAMPLE_EFFICIENCY_PLAN.md)。
 
-関連: [ADR 0013](adr/0013-architecture-ablation-and-local-geometry.md)、[CNN_ABLATION_20260808.md](CNN_ABLATION_20260808.md)。
+## 優先度2 — 由来を保った自己対局loopの運用
 
-## 優先度1 — サンプル効率と目的関数の診断
+ローカルとColabでの生成、manifestのvalidator、source別のsamplingは実装済みです。課題は、generation間を正しく比較できる状態を保つことです。
 
-現在 `main` には次が存在します。
+1. すべてのshardを、commit、checkpoint、ruleset、schema、探索設定、重複しないseed区間へ結び付けます。
+2. ローカルだけの生成とローカル+Colabの生成を、同じArena条件で比較してからpromotionします。
+3. 自己対局が安定したら、浅い探索を中心に少量の深い探索を混ぜます。
+4. Championは設定済みのArena gate以外では変更しません。
 
-- tokenizer / observation / action / auxiliary schema identifier
-- dataset contract上の `terminated` / `truncated` 区別
-- bag tokenとopponent-counter token
-- 36 auxiliary targets
-  - legacy 4 targets
-  - real-time 4区間 × attack / garbage received / self top-out / opponent top-out
-  - placement 4区間 × 同じ4 channel
-- unknown future horizon用valid mask
-- trainer-side auxiliary target statistics
-- shared-trunk gradient norm
-- policy/value、policy/aux gradient cosine diagnostics
+関連: [ADR 0015（自己対局の由来）](adr/0015-selfplay-provenance-search-mixture-and-timing-curriculum.md)。
 
-次の実行順:
+## 優先度3 — 基本戦術の後にtimingと相殺外し
 
-1. multi-horizon targetをより大きなmixed-generation datasetで再検証し、split leakage checkを固定する。
-2. policy-only / WDL / legacy aux / multi-horizon auxを、同一dataset・split・training budget・複数seedで比較する。
-3. **VS Scoreをmatch/Arena reportへ実装する。** 計算式とruleset interpretationを文書・testで固定する。
-4. VS Scoreをauxiliary prediction targetとして試す場合は、report実装とは別のablationとして行う。WDL rewardは変更しない。
-5. action-conditioned consequence targetは、engineからexact labelを得られ、入力特徴の自己コピーにならないものから追加する。
+timing actionは現在無効です。固定したclean benchmarkの平均APPが0.5を超えてから、timingのablationを再開します。段階と条件は[学習・評価プロトコル](TRAINING_AND_EVALUATION.md#8-timingと相殺外しのカリキュラム)を参照してください。
 
-関連: [ADR 0014](adr/0014-objectives-auxiliary-targets-and-vs-score.md)、[TRAINING_AND_EVALUATION.md](TRAINING_AND_EVALUATION.md)、[SAMPLE_EFFICIENCY_PLAN.md](SAMPLE_EFFICIENCY_PLAN.md)。
+## その後の構想
 
-## 優先度2 — provenanceを保った自己対局loopの運用
+長期目標は、特定のinterpretability構造ではなく、AIから人間への学習の流れを作ることです。
 
-local/Colab generationとmanifest validatorは実装済みです。次の課題は「sampleを増やせること」から「generation間を正しく比較できること」へ移っています。
+- 最大限強く指す**playing agent**と、その知識を抽出・検証・説明する**teaching agent**を分けます。teaching agentは、trace、探索統計、activation、counterfactual probeなどを使えれば、playing agentと同じ構造である必要はありません。
+- 自然言語は、人間の問いを再現可能なgame/model probeへ落とし、発見を検証可能な説明へ戻す双方向の媒介層として使います。根拠は厳密なシミュレータ、intervention、由来に置きます。
+- Sparse MoEとSparse Autoencoderは候補手法であり、目標そのものではありません。強いdense baselineができるまで延期します。
 
-1. すべてのshardをcommit、checkpoint、ruleset、schema、search setting、non-overlapping seed intervalへ結び付ける。
-2. local-only generationとlocal+Colab generationを、同じArena protocolで比較してからpromotionする。
-3. generationが安定したら、**浅いsearch中心 + 少量の深いsearch**というmixtureを試す。
-4. position-start / recovery curriculumを導入する場合は、manifest上で別provenance classとして記録する。
-5. Championはconfigured Arena gate以外から変更しない。
+関連: [ADR 0016](adr/0016-defer-sparse-moe-and-build-for-interpretability.md)、[ADR 0014（サイズと探索予算）](adr/0014-model-size-vs-search-budget.md)。
 
-Drive/GASのresumable transferは運用上有用ですが、seed・label・dataset mergeの権威にはしません。
+## ToolingとCIの既知の課題
 
-関連: [ADR 0015](adr/0015-selfplay-provenance-search-mixture-and-timing-curriculum.md)。
+### vendored Cobraと `-Werror`
 
-## 優先度3 — 基本戦術の後にtiming / 相殺外し
+通常の `make test` はC++23で成功します。一方、`docs/ci.yml` のwarning-as-error条件をそのまま適用すると、vendored Cobra内部の `#pragma unroll` と `-Wshadow` のwarningがerrorになり失敗します。
 
-move generatorは `WAIT_FOR_EVENT` を含むdelay binをすでに表現できます。しかし初期trained policyはdelay actionをほぼ利用しておらず、**表現可能であることと学習済みであることは別**です。
+これはproject側のcorrectnessの失敗ではなく、third-partyのコードを同じwarning policyでcompileしている範囲の問題です。Cobraのsourceを無条件に書き換えず、次のいずれかを決めます。
 
-段階的に進めます。
+- project側とvendored側でwarning policyを分ける。
+- upstreamと互換な最小patchを用意する。
+- compilerごとのpragmaとwarningの扱いをCI側で明示する。
 
-1. stable stacking、Quad、T-spin、通常attack constructionが明確に成立する状態を先に作る。
-2. Arena、qualitative play、APP、将来のVS Scoreを合わせてreadinessを見る。
-3. 平積みQuadの理論baselineであるAPP約0.5は粗いdiagnosticとしてのみ使い、hard gateにはしない。
-4. その後、delay action・garbage timing・相殺外しのexploration/data coverageを強める。
-5. delayed-action frequency、`WAIT_FOR_EVENT` usage、cancellation interaction、VS Score、paired winsを測り、能力の実在を確認する。
+解消するまで、`docs/ci.yml` はそのままgreenになるworkflowとして扱いません。
 
-「waiting」自体へpositive rewardを与えません。delayの有用性はsearchとgame outcomeから学習させます。
+### Colab validatorのdataset version
 
-## その後 — 強いplaying agent、teaching agent、自然言語媒介
+`trainer/colab_generate.py` のvalidatorはdataset v1/v3だけを受け付け、現在のv4を拒否します。[Colab手順](COLAB_MANUAL.md)を参照してください。
 
-長期目標は、特定のinterpretability architectureそのものではなく、**AI→人間学習pipeline**です。
+## エンジンのcorrectnessの未解決事項
 
-役割を分離します。
+### lock delayと `reset_limit`
 
-- 最大限強く指す**playing agent**
-- 強いagentのknowledgeを抽出・検証・説明する**teaching/analysis agent**
+gravityはreachabilityの制約として実装済みです。一方、stackに接触した後のlock delayの操作猶予と、`reset_limit` による回数制限は合法手生成に反映されていません。
 
-teaching agentはplaying agentと同一architectureである必要はありません。trace、search statistics、activation、learned feature、counterfactual probeなどを利用し、人間にとって有用な戦略概念へ変換できればよいとします。
+高gravityではこの猶予が主な操作時間になるため、本来到達可能な一部の配置を保守的に除外する可能性があります。
 
-自然言語は双方向の媒介層として使います。
+### TETR.IOとの一致
 
-- 人間の問い → reproducible game/model probe
-- engine/model discovery → human-readable explanation / curriculum
+- **kick tableの出典:** SRS+と180のtableは構造テスト済みです。合法に取得した実際のTETR.IO replayとのkick単位の差分テストは未実施です。
+- **高B2Bと高comboの丸め:** 公開されている式に従っていますが、非整数の中間値と極端な組み合わせで差が出る可能性があります。
+- **garbageの乱れ方の定数:** 動作は設定可能ですが、実際の定数は非公開です。
+- **Surgeの派生:** reversedやQUICK PLAY系を完全にはモデル化していません。
 
-exact simulator・intervention・provenanceを根拠として残し、fluentな説明だけで戦略を正しいとみなしません。
+これらはルールの一致の問題であり、決定論的なruleset、hash、schemaの契約を緩める理由にはしません。
 
-### Sparse MoE / Sparse Autoencoder
+## 文書の更新規則
 
-これらは候補手法であり、長期目標そのものではありません。
+方向が変わった場合は、次の順で更新します。
 
-Sparse MoEはstrong dense baselineができるまで延期します。将来試す場合はsmall expert count、shared trunk、observable routingから始めます。
+1. ADRを追加します。
+2. このROADMAPを更新します。
+3. 必要なら運用ガイドを更新します。
 
-Sparse Autoencoderもstrong checkpoint後のfeature extraction候補です。candidate featureをteachingへ使う前に、counterexample・intervention・ablationで検証します。
-
-関連: [ADR 0016](adr/0016-defer-sparse-moe-and-build-for-interpretability.md)。
-
-## Tooling / CIの既知課題
-
-### Vendored Cobraと `-Werror`
-
-通常の `make test` はC++23で通りますが、`docs/ci.yml` のwarning-as-error条件をそのまま適用すると、vendored Cobra内部の `#pragma unroll` と `-Wshadow` warningがerrorへ昇格して失敗します。
-
-これは現在のproject-side sourceのcorrectness failureではなく、third-party codeを同じwarning policyでcompileしていることによるscope問題です。
-
-次に決めるべきなのは、Cobra sourceを無条件に書き換えることではなく、次のいずれかです。
-
-- project codeとvendored codeでwarning policyを分離する。
-- upstream-compatibleな最小patchを用意する。
-- compilerごとのpragma/warning扱いをCI側で明示する。
-
-この問題を解消するまでは `docs/ci.yml` を「そのままgreenになる完成workflow」とは扱いません。
-
-## 残っているengine correctness課題
-
-### Lock delayと `reset_limit`
-
-Gravityはreachability constraintとして実装済みですが、stackへ接触した後のfull lock-delay manoeuvring windowとbounded resetは未完成です。
-
-高gravityではこのwindowが主要な操作時間になるため、現在のmodelは一部の本来到達可能なplacementを保守的にrejectする可能性があります。
-
-### TETR.IO parityに関する未解決事項
-
-- **Kick-table provenance:** SRS+ / 180 tableはstructural test済みだが、合法的に取得したreal TETR.IO replayとのdiff testは未実施。
-- **High B2B × high combo rounding:** documented formulaに従うが、実ゲームの非整数intermediateと極端な組み合わせで差が出る可能性がある。
-- **Garbage messiness constants:** behaviourはconfigurableだがreal constantsは非公開。
-- **Surge variants:** reversed / QUICK PLAY系を完全にはmodelしていない。
-
-これらはrule parityの問題であり、deterministic ruleset/hash/schema contractを緩める理由にはしません。
-
-## ドキュメント更新規則
-
-このROADMAPへ合わせるために `SPEC.md` を書き換えません。
-
-方向が変わった場合は次の順で更新します。
-
-1. ADRを追加する。
-2. ROADMAPを更新する。
-3. 必要ならoperational guideを更新する。
-4. `SPEC.md` は当初仕様のhistorical baselineとして残す。
-
-文書間の役割分担は [docs/README.md](README.md) を参照してください。
+[SPEC](SPEC.md)は当初仕様として残し、このROADMAPに合わせて書き換えません。文書間の役割分担は[文書案内](README.md)を参照してください。

@@ -209,7 +209,7 @@ def main() -> int:
                     help="self-play GPU micro-batch wait window in milliseconds")
     ap.add_argument("--selfplay-target-positions", type=int, default=256)
     ap.add_argument("--selfplay-inflight-batches", type=int, default=2)
-    ap.add_argument("--selfplay-gpu-workers", type=int, default=2)
+    ap.add_argument("--selfplay-gpu-workers", type=int, default=1)
     ap.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="fp16",
                     help="GPU inference arithmetic for self-play and GPU Arena")
     ap.add_argument("--seed", type=int, default=1)
@@ -236,7 +236,7 @@ def main() -> int:
                     help="Reanalyse GPU micro-batch wait window in milliseconds")
     ap.add_argument("--reanalyze-target-positions", type=int, default=256)
     ap.add_argument("--reanalyze-inflight-batches", type=int, default=2)
-    ap.add_argument("--reanalyze-gpu-workers", type=int, default=2)
+    ap.add_argument("--reanalyze-gpu-workers", type=int, default=1)
     ap.add_argument("--reanalyze-secondary-fraction", type=float, default=0.10,
                     help="fraction of each training batch drawn from refreshed rows")
     ap.add_argument("--reset-optimizer", action="store_true",
@@ -277,7 +277,7 @@ def main() -> int:
                     help="GPU Arena micro-batch wait window in milliseconds")
     ap.add_argument("--arena-target-positions", type=int, default=192)
     ap.add_argument("--arena-inflight-batches", type=int, default=2)
-    ap.add_argument("--arena-gpu-workers", type=int, default=2)
+    ap.add_argument("--arena-gpu-workers", type=int, default=1)
     ap.add_argument("--arena-determinizations", type=int, default=0,
                     help="root futures used by Arena; 0 inherits --determinizations")
     ap.add_argument("--arena-seed", type=int, default=42,

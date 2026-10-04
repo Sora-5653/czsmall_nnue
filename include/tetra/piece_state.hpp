@@ -97,8 +97,8 @@ inline int hard_drop_distance(const Board& b, const ActivePiece& p) {
     return d;
 }
 
-// Spawn position for a piece (guideline: horizontally centred, sitting just
-// above the visible field so that it is fully inside the internal field).
+// Spawn position for a piece, horizontally centred at the ruleset's occupied
+// spawn row.
 inline ActivePiece spawn_piece(Piece type, const RulesetConfig& cfg) {
     ActivePiece p;
     p.type = type;
@@ -109,11 +109,7 @@ inline ActivePiece spawn_piece(Piece type, const RulesetConfig& cfg) {
     // Guideline: pieces spawn in the two columns left of centre for 3-wide
     // boxes, and columns 3..6 for the I piece on a 10-wide field.
     p.x = (cfg.geometry.width - s.box) / 2;
-    // TETR.IO v19 spawns at client y=B-2.04.  In our bottom-up integer
-    // placement coordinates this puts the lowest occupied spawn row one row
-    // above the visible-field boundary (row visible_height + 1), not directly
-    // on the boundary.
-    p.y = cfg.geometry.visible_height + 1;
+    p.y = cfg.geometry.visible_height + cfg.movement.spawn_row_offset;
     // Pull the bounding box down so the lowest *filled* row of the piece rests
     // on the spawn row (empty rows in the box must not add height).
     int lowest = s.box;

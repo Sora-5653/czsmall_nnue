@@ -182,7 +182,7 @@ int cmd_selfplay(int argc, char** argv) {
     for (int i = 0; i < pieces && p.alive(); ++i) {
         const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
                                        p.visible_next().empty() ? Piece::None : p.visible_next()[0],
-                                       cfg);
+                                       cfg, p.attack_state().combo >= 0);
         if (acts.empty()) break;
         const size_t pick = greedy_pick(acts, p.board(), cfg);
         if (acts[pick].use_hold && !p.do_hold()) continue;
@@ -340,7 +340,7 @@ int cmd_record(int argc, char** argv) {
         const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
                                        p.visible_next().empty() ? Piece::None
                                                                 : p.visible_next()[0],
-                                       cfg);
+                                       cfg, p.attack_state().combo >= 0);
         if (acts.empty()) break;
         const size_t pick = greedy_pick(acts, p.board(), cfg);
         if (acts[pick].use_hold && !p.do_hold()) continue;
@@ -456,7 +456,7 @@ int cmd_search(int argc, char** argv) {
 
     const auto acts = gen.generate(p.board(), p.active().type, p.hold(),
                                    p.visible_next().empty() ? Piece::None : p.visible_next()[0],
-                                   cfg);
+                                   cfg, p.attack_state().combo >= 0);
     std::printf("mode            %s\n", gumbel ? "gumbel" : "puct");
     std::printf("simulations     %d (ran %d)\n", sims, r.simulations_run);
     std::printf("elapsed         %.1f ms\n", ms);

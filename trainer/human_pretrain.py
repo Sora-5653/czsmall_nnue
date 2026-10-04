@@ -9,7 +9,9 @@ auxiliary heads remain the job of self-play/Reanalyze after bootstrap.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +23,21 @@ def run(command: list[str], root: Path, dry_run: bool) -> None:
         subprocess.run(command, cwd=str(root), check=True)
 
 
-def manifest_shards(output_dir: Path) -> list[Path]:
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def manifest_shards(
+    output_dir: Path,
+    required_mode: str | None = None,
+) -> list[Path]:
     """Return exactly the shards selected by the latest import manifest.
 
     Old shard files are intentionally not deleted: a changed sharding target can
@@ -31,24 +47,49 @@ def manifest_shards(output_dir: Path) -> list[Path]:
     """
     manifest_path = output_dir / "manifest.json"
     if not manifest_path.exists():
+        if required_mode is not None:
+            raise SystemExit(f"missing exact human replay manifest: {manifest_path}")
         return sorted(output_dir.glob("*.tetradat")) if output_dir.exists() else []
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise SystemExit(f"invalid human replay manifest: {manifest_path}")
+    if required_mode is not None and manifest.get("normalization_mode") != required_mode:
+        raise SystemExit(
+            f"human replay training requires a {required_mode} import manifest"
+        )
     items = manifest.get("shards", []) if isinstance(manifest, dict) else []
     if not isinstance(items, list):
         raise SystemExit(f"invalid shard list in {manifest_path}")
     shards: list[Path] = []
     seen: set[Path] = set()
+    expected_hashes: dict[Path, str] = {}
     for item in items:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            if required_mode is not None:
+                raise SystemExit(f"invalid shard entry in {manifest_path}")
             continue
         name = Path(item["path"].replace("\\", "/")).name
         candidate = output_dir / name
-        if candidate not in seen:
-            shards.append(candidate)
-            seen.add(candidate)
+        expected_hash = item.get("dataset_sha256")
+        if required_mode is not None and (
+            not isinstance(expected_hash, str)
+            or not SHA256_RE.fullmatch(expected_hash)
+        ):
+            raise SystemExit(f"manifest lacks a valid hash for human replay shard: {candidate}")
+        if candidate in seen:
+            if required_mode is not None:
+                raise SystemExit(f"duplicate human replay shard in manifest: {candidate}")
+            continue
+        shards.append(candidate)
+        seen.add(candidate)
+        if isinstance(expected_hash, str) and SHA256_RE.fullmatch(expected_hash):
+            expected_hashes[candidate] = expected_hash
     missing = [path for path in shards if not path.exists()]
     if missing:
         raise SystemExit(f"manifest references missing human replay shard: {missing[0]}")
+    for path, expected_hash in expected_hashes.items():
+        if sha256_file(path) != expected_hash:
+            raise SystemExit(f"human replay shard hash mismatch: {path}")
     return shards
 
 
@@ -64,6 +105,11 @@ def main() -> int:
     ap.add_argument("--model-version", type=int, default=0)
     ap.add_argument("--force-import", action="store_true")
     ap.add_argument("--strict-source", action="store_true")
+    ap.add_argument(
+        "--exact",
+        action="store_true",
+        help="require fail-closed TETR.IO v19 replay reconstruction",
+    )
     ap.add_argument(
         "--min-import-fraction",
         type=float,
@@ -124,6 +170,8 @@ def main() -> int:
             import_cmd.append("--force")
         if args.strict_source:
             import_cmd.append("--strict-source")
+        if args.exact:
+            import_cmd.append("--exact")
         run(import_cmd, root, args.dry_run)
 
     if not args.dry_run and args.min_import_fraction > 0.0:
@@ -140,7 +188,8 @@ def main() -> int:
             )
         print(f"human replay quality gate: import_fraction={fraction:.1%}", flush=True)
 
-    shards = manifest_shards(output_dir)
+    required_mode = "exact-v19" if args.exact and not args.dry_run else None
+    shards = manifest_shards(output_dir, required_mode)
     if args.dry_run and not shards:
         shards = [output_dir / "human_*.tetradat"]
     if not shards:

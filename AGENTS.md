@@ -1,227 +1,28 @@
-# AGENTS.md
-このリポジトリでGPU学習・GPU推論を行うときの標準手順。別セッションで
-学習を再開する場合も、まずこの手順を確認すること。
+# リポジトリでの作業指針
 
-## 重要な前提
+このリポジトリは、C++のTetrisシミュレータとPython/PyTorchの学習基盤です。
 
-- RX 9070 XTはAMD GPUなので、PyTorchはROCm版を使う。ROCm版PyTorchでも
-  GPU指定は `cuda` と書く。
-- `python trainer/train.py` は、GPUが見えないとデフォルトではCPUへ
-  フォールバックする。GPU学習では必ず `--device cuda --require-gpu` を付ける。
-- 学習・GPU self-play・GPU Arenaが読むのはPyTorch checkpointの `.pt`。
-  C++のCPUエンジンが読むのは `export_weights.py` で作る `.tetrawts`。
-- ルール、Cobra movegen、探索、dataset serializationの権威はC++側。
-  Python/ROCm側はモデル評価と学習を担当する。
-- 実行するcommitを、ローカル・Colab・checkpoint・datasetで揃える。
+## 作業を進める
 
-## 1. GPU環境を確認する
+- 作業開始時にGitの状態と対象ファイルを確認し、既存の未コミット変更を保護します。無関係な変更を戻したり、成果物を上書きしたりしません。
+- ユーザーの依頼と会話の条件から作業範囲を判断し、通常の実装判断は進めます。結果を左右する不足情報だけを確認します。途中の質問に答えた後も元の作業を継続します。
+- スキルのガイドラインよりユーザーの明示的な指示を優先します。スキルが停止や承認待ちの原因になる場合は、該当ファイルと指示を示します。実験の停止条件は通常の実装判断で解除しません。
+- 関係するコード、テスト、文書だけを読みます。[文書案内](docs/README.md)で参照先を選び、全手順や過去レポートを一括で読み込みません。
 
-ROCmはLinuxまたはWSL2側で実行する。リポジトリのルートで次を行う。
+## 設計と実験の契約を守る
 
-```sh
-python -m venv .venv
-source .venv/bin/activate
-pip install --index-url https://download.pytorch.org/whl/rocm7.2 torch
-pip install -r trainer/requirements.txt
+- ルール、Cobra合法手生成、探索、観測の秘匿情報マスク、dataset serializationはC++が担当します。Python/ROCmはモデル評価と学習を担当します。
+- 実装済みの挙動はコードとテストで確認します。設計変更は関連ADRで確認し、当初仕様や過去の実験結果を現在の事実に書き換えません。
+- [利用ポリシー](docs/POLICY.md)のローカル・オフライン構成を維持します。
+- GPU作業では[GPU手順](docs/GPU_WORKFLOW.md)を読みます。学習には `--device cuda --require-gpu` を指定し、GPUが見えない状態で学習を開始しません。
+- `.pt` はPyTorch用、`.tetrawts` はC++推論用です。engine、checkpoint、datasetのcommitとschemaの互換性を確認します。
+- 学習・比較では[評価プロトコル](docs/TRAINING_AND_EVALUATION.md)と対象実験のplan/handoffを読み、seed、計算予算、停止条件、成果物の由来を維持します。Championの置き換えには設定済みArena gateを使います。
 
-rocminfo | grep gfx
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
-```
+## 検証して引き継ぐ
 
-期待値は `gfx1201`、`True`、`AMD Radeon RX 9070 XT`。GPUが見えないまま
-学習を開始してはいけない。
-
-RDNA 4のarchitecture検出で失敗する場合だけ、次を試す。
-
-```sh
-export PYTORCH_ROCM_ARCH=gfx1201
-export HSA_OVERRIDE_GFX_VERSION=12.0.1
-```
-
-`HSA_OVERRIDE_GFX_VERSION` は常用設定ではなく、通常の検出が失敗した場合
-だけ使う。ROCm 7.2以上、`render` / `video` group、ROCm用wheelを先に確認する。
-
-## 2. C++エンジンをビルドして確認する
-
-```sh
-make test
-make tools
-```
-
-`make test` が失敗したら学習を開始しない。特に
-`cpp_matches_pytorch_exactly`、feature width mismatch、Tokenizerのテストが
-失敗している場合は、checkpointやfixtureと現在のcommitが不一致の可能性がある。
-
-Linuxでは `build/tetra_cli`、Windowsでは `build/tetra_cli.exe` が生成される。
-GPU bridgeへ渡す場合は、必要に応じて `--engine` でその絶対パスを指定する。
-
-## 3. 初回checkpointを作る
-
-まだ学習済みcheckpointがない場合は、C++ self-playで初期datasetを作り、GPUで
-bootstrap学習する。
-
-```sh
-mkdir -p data models
-./build/tetra_cli export data/bootstrap.tetradat 50 200 32
-
-python trainer/train.py data/bootstrap.tetradat \
-    --steps 2000 --model s --batch 256 \
-    --device cuda --require-gpu \
-    --save models/gen1.pt
-```
-
-必要なら最初は `--model dev --batch 32` で接続確認を行い、その後 `--model s`
-へ移る。学習ログにGPU名が表示されることを確認する。
-
-## 4. checkpointをC++形式へ変換する
-
-```sh
-python trainer/export_weights.py models/gen1.pt models/gen1.tetrawts
-./build/tetra_cli play models/gen1.tetrawts 200 64
-```
-
-`.pt` を `.tetrawts` に変換するだけであり、逆方向の変換はない。Tokenizerや
-モデルのfeature widthを変更した場合は、古いcheckpointを無理に使わず、同じ
-commitのdatasetから再学習する。
-
-## 5. GPU self-playで次のdatasetを生成する
-
-GPU self-playではC++ childがルール・Cobra movegen・探索・dataset出力を担当し、
-Python processがPyTorch/ROCmでbatched inferenceを返す。
-
-```sh
-python trainer/gpu_selfplay.py models/gen1.pt data/gen2.tetradat \
-    --engine build/tetra_cli \
-    --device cuda --require-gpu \
-    --games 32 --pieces 300 --sims 64 --batch 16 \
-    --determinizations 2 --precision fp16 --model-version 2
-```
-
-Windowsの場合は `--engine build/tetra_cli.exe` とする。出力にはdatasetの
-sample数とGPU inference位置数が出る。self-playのdatasetは二盤面・両プレイヤー
-視点を含むため、Compact Replay形式へ変換せずrectangular datasetとして扱う。
-
-## 6. GPUで継続学習する
-
-過去generationをreplay mixし、最後のdatasetを新データとして扱う。`--resume`
-はモデルだけでなくoptimizerとsampling RNGも復元する。
-
-```sh
-python trainer/train.py \
-    data/gen1.tetradat data/gen2.tetradat \
-    --resume models/gen1.pt \
-    --new-data-repeat 1 \
-    --steps 5000 --batch 256 --model s \
-    --device cuda --require-gpu --value-weight 1.0 \
-    --checkpoint-every 1000 \
-    --best-save models/gen2.best.pt \
-    --save models/gen2.pt
-```
-
-新データを意図的に重くする実験では `--new-data-repeat 4` などを使うが、
-sample-efficiencyの比較では条件を固定し、まず `1` を基準にする。WDL value head
-は標準で学習されるので、通常は `--value-weight 1.0` を維持する。
-
-## 7. GPU推論とTetr.io風スタッツを確認する
-
-`gpu_match.py` はC++のゲーム・探索を起動し、評価だけをPyTorch/ROCm GPUで処理する。
-APM、APP、PPSを出力する。
-
-```sh
-python trainer/gpu_match.py models/gen2.pt \
-    --engine build/tetra_cli \
-    --device cuda --games 4 --pieces 200 --sims 32 \
-    --batch 16 --precision fp16 --workers 4
-```
-
-比較実験では `--seed` 相当の条件、games、pieces、sims、precision、checkpointを
-固定する。APM/APPだけで強さを判断せず、Arenaの勝率と95% CI、PPS、平均生存時間、
-top outまでの手数も記録する。
-
-## 8. GPU ArenaでCandidateを評価する
-
-```sh
-python trainer/export_weights.py models/gen2.pt models/gen2.tetrawts
-python trainer/gpu_arena.py models/gen2.pt models/gen1.pt \
-    --engine build/tetra_cli \
-    --device cuda --pairs 20 --pieces 300 --sims 32 \
-    --batch 16 --determinizations 1 --precision fp16 --seed 42
-```
-
-Candidate checkpointがChampionを上回っても、Arenaのpromotion thresholdを
-満たすまではChampionを置き換えない。CPU Arenaを使う場合だけ
-`trainer/iterate.py --cpu-arena` を指定する。
-
-## 9. 1 generationを自動実行する
-
-通常の継続学習は、self-play、replay mix、GPU train、weight export、GPU Arena、
-条件付きpromotionを一つのdriverで行う。
-
-```sh
-python trainer/iterate.py \
-    --champion models/champion.pt \
-    --replay data/gen1.tetradat \
-    --generation 2 \
-    --champion-output models/champion \
-    --engine build/tetra_cli \
-    --device cuda \
-    --games 16 --pieces 300 --sims 64 --inference-batch 16 \
-    --determinizations 2 --train-steps 5000 --train-batch 256 \
-    --new-data-repeat 4 --arena-pairs 10 --arena-sims 32 --arena-pieces 300
-```
-
-`--champion-output models/champion` を指定した場合、Arenaが通ったときだけ
-`models/champion.pt` と `models/champion.tetrawts` が更新される。Arenaが通らない
-場合はcandidateを保存したままChampionを保持する。
-
-## 10. Colabを局面生成に使う
-
-Colabは追加self-play局面の生成に使い、checkpointのpromotionと最終学習条件の
-管理はローカル側で行う。全instanceで同じcommit、同じcheckpoint、同じruleset、
-同じsearch設定を使う。
-
-Colab上でROCmではなくCUDA GPUが見えることを確認した後、直接shardを生成する。
-
-```sh
-python trainer/colab_generate.py generate models/champion.pt \
-    data/colab/shard-0.tetradat \
-    --repo-root . --build-engine --device cuda \
-    --base-seed 100000 --shard-id 0 --shard-count 4 \
-    --games 32 --pieces 300 --sims 64 --model-version 4
-```
-
-shard `i` では `--shard-id i` だけを変える。同じbase seed、games、shard countを
-使うことでseed intervalが重ならない。生成された `.tetradat` と
-`.tetradat.manifest.json` をローカルへ戻す。
-
-```sh
-python trainer/colab_generate.py validate \
-    data/colab/shard-0.tetradat.manifest.json \
-    data/colab/shard-1.tetradat.manifest.json \
-    data/colab/shard-2.tetradat.manifest.json \
-    data/colab/shard-3.tetradat.manifest.json \
-    --checkpoint models/champion.pt --require-complete
-
-python trainer/train.py \
-    data/colab/shard-0.tetradat data/colab/shard-1.tetradat \
-    data/local.tetradat --resume models/champion.pt \
-    --device cuda --require-gpu --value-weight 1.0 \
-    --steps 5000 --save models/candidate.pt
-```
-
-datasetをバイト連結しない。各shardを個別の入力として渡し、validatorでcommit、
-checkpoint hash、ruleset/model version、search設定、sample数、seed重複を検査する。
-GAS/Driveはファイル移動の補助であり、seed・label・mergeの権威にはしない。
-
-## 11. 失敗時の確認順
-
-1. `python -c "import torch; print(torch.cuda.is_available())"` が `True` か。
-2. PyTorchがROCm wheelか。AMDでもAPI名は `torch.cuda` で正しい。
-3. 学習コマンドに `--device cuda --require-gpu` があるか。
-4. `make tools`を実行済みか。engine pathが `build/tetra_cli(.exe)` と一致するか。
-5. `.pt` と `.tetrawts` を取り違えていないか。
-6. checkpoint、dataset、engineが同じcommit由来か。
-7. `make test`、特にPyTorch parityとfeature width mismatchを確認する。
-8. OOMなら、まず `--batch`、次に `--inference-batch`、self-playの`--games`を下げる。
-
-GPUが見えない状態でCPUへ黙って切り替わる実行は、GPU学習の成功とはみなさない。
+- 文書・設定だけの変更は、構文、リンク、参照関係、差分を確認します。
+- C++、ルール、探索、serializationの変更は `make test` を実行します。CLIを変更した場合は `make tools` と変更対象の動作確認も行います。
+- Pythonの変更は関連テストを実行します。C++/PyTorch境界を変更した場合はparityとschema互換性を確認します。GPU学習を開始する前には `make test` を通します。
+- 必要な確認が通った後は、新しい変更、失敗、未解決の懸念がある場合に検証を追加します。GPU検出、推論実行、対戦強度の証拠を区別し、未実行の確認を成功と報告しません。
+- 長い作業の引き継ぎには、目的、確定した制約、変更ファイル、実行済み検証、成果物のパスと由来、未解決事項、次の操作を残します。再開時にはGitと成果物の状態を確認します。
+- 報告は結果から始め、変更理由、検証結果、残る制約を簡潔に説明します。[Googleの文書スタイルガイド](https://developers.google.com/style)に従います。

@@ -43,6 +43,7 @@ std::uint64_t RulesetConfig::hash() const {
 
     h.i32(static_cast<int>(movement.kick_table));
     h.b(movement.allow_180);
+    h.i32(movement.spawn_row_offset);
     h.i32(movement.gravity_num);
     h.i32(movement.gravity_den);
     h.i64(movement.lock_delay);
@@ -129,6 +130,7 @@ RulesetConfig RulesetConfig::guideline() {
     c.version = 1;
     c.movement.kick_table = KickTableId::SRS;
     c.movement.allow_180 = false;
+    c.movement.spawn_row_offset = 0;
     c.movement.spawn_above_stack = false;
     c.clear_rules.spin_detection = SpinDetection::TSpin;
     c.attack.b2b_mode = B2BMode::Chaining;

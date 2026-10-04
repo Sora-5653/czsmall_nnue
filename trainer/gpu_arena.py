@@ -285,7 +285,7 @@ def _evaluate_parallel(candidate: torch.nn.Module, champion: torch.nn.Module,
                        protocol: ArenaProtocolConfig, precision: str,
                        seed: int, workers: int,
                        batch_window_ms: float, target_positions: int = 512,
-                       inflight_batches: int = 2, gpu_workers: int = 2
+                       inflight_batches: int = 2, gpu_workers: int = 1
                        ) -> tuple[dict[str, int | float], float]:
     """Run independent factorial Arena pairs concurrently through one GPU queue."""
     total_pairs = max(1, pairs)
@@ -429,7 +429,7 @@ def evaluate(candidate: torch.nn.Module, champion: torch.nn.Module, device: torc
              champion_gumbel_noise_scale: float = -1.0,
              workers: int = 1, batch_window_ms: float = 12.0,
              target_positions: int = 192, inflight_batches: int = 2,
-             gpu_workers: int = 2
+             gpu_workers: int = 1
              ) -> tuple[dict[str, int | float], float]:
     protocol = ArenaProtocolConfig(
         sims=sims,
@@ -601,7 +601,7 @@ def main() -> int:
                     help="cap the shared GPU batch target for asynchronous queueing")
     ap.add_argument("--inflight-batches", type=int, default=2,
                     help="GPU batches allowed to queue ahead of the active batch")
-    ap.add_argument("--gpu-workers", type=int, default=2,
+    ap.add_argument("--gpu-workers", type=int, default=1,
                     help="concurrent ROCm/CUDA streams for independent Arena batches")
     ap.add_argument("--determinizations", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42,

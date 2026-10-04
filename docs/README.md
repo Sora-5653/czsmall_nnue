@@ -11,7 +11,7 @@
 3. **コードとテスト — 実装済み挙動。** ADRが将来方針を記録している場合もあります。「実装済み」と断定できるのはコードとテストで確認できる事項だけです。
 4. **`ROADMAP.md` — 現在地と次の実行順。** `main` に存在するもの、評価中のもの、意図的に延期しているものを追跡します。
 5. **実験レポート — 判断材料。** `CNN_ABLATION_20260808.md` のような文書は測定結果や失敗仮説を保存します。実験そのものは方針ではなく、方針変更に至った場合にADRから引用します。
-6. **運用ガイド — 実行方法。** `SETUP.md`、`COLAB_MANUAL.md`、リポジトリ直下の `AGENTS.md` がbuild、GPU学習、自己対局、shard運用を扱います。
+6. **運用ガイド — 実行方法。** `SETUP.md`、`GPU_WORKFLOW.md`、`COLAB_MANUAL.md` が環境、GPU学習、自己対局、shard運用を扱います。直下の `AGENTS.md` はエージェントの作業指針です。
 7. **`POLICY.md` — 利用範囲。** 本プロジェクトはローカルシミュレータであり、TETR.IOへ接続しません。
 
 新しい構造上の判断を行う場合、古いADRや `SPEC.md` を現在形へ書き換えるより、**新しいADRを追加してROADMAPを更新する**ことを優先します。既存ADRへ追記する場合は、過去の判断を消さず「追補」として新しいADRへのリンクを追加します。
@@ -78,7 +78,8 @@
 | 現在の優先順位 | `ROADMAP.md` |
 | サンプル効率の実装詳細 | `SAMPLE_EFFICIENCY_PLAN.md` |
 | CNN/CNN+Transformerの測定結果 | `CNN_ABLATION_20260808.md` |
-| GPU・ローカル環境 | `SETUP.md`、直下 `AGENTS.md` |
+| GPU・ローカル環境 | [セットアップ](SETUP.md)、[GPU手順](GPU_WORKFLOW.md) |
+| エージェント設定の監査 | [Astra監査記録](ASTRA_AGENT_AUDIT.md) |
 | Colab shard生成 | `COLAB_MANUAL.md` |
 | 利用範囲 | `POLICY.md` |
 

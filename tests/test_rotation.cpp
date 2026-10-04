@@ -735,3 +735,15 @@ TEST(srs_plus_mirroring_is_sound_for_every_piece) {
     }
     CHECK(checked > 500);
 }
+
+TEST(guideline_spawn_uses_visible_field_boundary) {
+    const RulesetConfig cfg = RulesetConfig::guideline();
+    for (int pi = 0; pi < PIECE_COUNT; ++pi) {
+        const ActivePiece piece = spawn_piece(static_cast<Piece>(pi), cfg);
+        Offset cells[4];
+        piece_cells(piece, cells);
+        int min_y = Board::MAX_HEIGHT;
+        for (const Offset& cell : cells) min_y = std::min(min_y, cell.y);
+        CHECK_EQ(min_y, cfg.geometry.visible_height);
+    }
+}

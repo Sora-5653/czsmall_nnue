@@ -21,3 +21,4 @@ build-*/
 .venv-rocm*/
 __pycache__/
 trainer/__pycache__/
+.codex-remote-attachments/

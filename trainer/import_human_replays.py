@@ -63,6 +63,7 @@ class ShardReport:
     invalid: int = 0
     execution: int = 0
     unmatched: int = 0
+    dataset_sha256: str = ""
     cache_hit: bool = False
 
 
@@ -88,12 +89,20 @@ def discover(inputs: Sequence[Path]) -> list[Path]:
     return sorted(found)
 
 
-def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[list[CachedGame], SourceReport]:
+def _normalize_one(
+    path_text: str,
+    cache_dir_text: str,
+    force: bool,
+    require_exact: bool,
+) -> tuple[list[CachedGame], SourceReport]:
     path = Path(path_text)
     cache_dir = Path(cache_dir_text)
     raw = path.read_bytes()
     source_hash = sha256_bytes(raw)
-    cache_base = cache_dir / "normalized" / f"v{CACHE_VERSION}_{source_hash}"
+    normalization_mode = "exact-v19" if require_exact else "legacy-keydown"
+    cache_base = cache_dir / "normalized" / (
+        f"v{CACHE_VERSION}_{normalization_mode}_{source_hash}"
+    )
     replay_cache = cache_base.with_suffix(".replay.json")
     meta_cache = cache_base.with_suffix(".meta.json")
     report = SourceReport(str(path), source_hash=source_hash, errors=[])
@@ -103,7 +112,13 @@ def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[li
             payload = json.loads(replay_cache.read_text(encoding="utf-8"))
             meta = json.loads(meta_cache.read_text(encoding="utf-8"))
             games = [
-                CachedGame(str(path), source_hash, int(item["round_index"]), int(item["samples"]), str(item["text"]))
+                CachedGame(
+                    str(path),
+                    source_hash,
+                    int(item["round_index"]),
+                    int(item["samples"]),
+                    str(item["text"]),
+                )
                 for item in payload
             ]
             report.games = len(games)
@@ -114,8 +129,17 @@ def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[li
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             pass
 
-    games, errors, _source_id = normalize_file(path, require_exact=True)
-    cached = [CachedGame(str(path), source_hash, game.round_index, game.samples, render_game(game)) for game in games]
+    games, errors, _source_id = normalize_file(path, require_exact=require_exact)
+    cached = [
+        CachedGame(
+            str(path),
+            source_hash,
+            game.round_index,
+            game.samples,
+            render_game(game),
+        )
+        for game in games
+    ]
     report.games = len(cached)
     report.turns = sum(game.samples for game in cached)
     report.errors = errors
@@ -135,7 +159,7 @@ def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[li
                 "cache_version": CACHE_VERSION,
                 "source": str(path),
                 "source_hash": source_hash,
-                "exact_replay_required": True,
+                "normalization_mode": normalization_mode,
                 "errors": errors,
             },
             ensure_ascii=False,
@@ -146,12 +170,27 @@ def _normalize_one(path_text: str, cache_dir_text: str, force: bool) -> tuple[li
     return cached, report
 
 
-def normalize_sources(paths: Sequence[Path], cache_dir: Path, workers: int, force: bool) -> tuple[list[CachedGame], list[SourceReport]]:
+def normalize_sources(
+    paths: Sequence[Path],
+    cache_dir: Path,
+    workers: int,
+    force: bool,
+    require_exact: bool,
+) -> tuple[list[CachedGame], list[SourceReport]]:
     games: list[CachedGame] = []
     reports: list[SourceReport] = []
     worker_count = max(1, min(workers, len(paths) or 1))
     with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = [pool.submit(_normalize_one, str(path), str(cache_dir), force) for path in paths]
+        futures = [
+            pool.submit(
+                _normalize_one,
+                str(path),
+                str(cache_dir),
+                force,
+                require_exact,
+            )
+            for path in paths
+        ]
         for future in concurrent.futures.as_completed(futures):
             cached, report = future.result()
             games.extend(cached)
@@ -216,6 +255,8 @@ def build_shards(
     protocol_dir.mkdir(parents=True, exist_ok=True)
     reports: list[ShardReport] = []
 
+    engine_hash = sha256_file(engine)
+
     for index, shard in enumerate(shards):
         protocol = "".join(game.text for game in shard)
         protocol_hash = sha256_bytes(protocol.encode("utf-8"))
@@ -229,15 +270,23 @@ def build_shards(
         if not force and output_path.exists() and sidecar.exists():
             try:
                 old = json.loads(sidecar.read_text(encoding="utf-8"))
+                stored_hash = old.get("dataset_sha256")
                 if (
                     old.get("protocol_hash") == protocol_hash
+                    and old.get("engine_sha256") == engine_hash
                     and int(old.get("model_version", -1)) == model_version
                     and old.get("ruleset") == ruleset
+                    and int(old.get("requested_turns", -1)) == requested
+                    and int(old.get("games", -1)) == len(shard)
+                    and isinstance(stored_hash, str)
+                    and len(stored_hash) == 64
+                    and sha256_file(output_path) == stored_hash
                 ):
                     report.imported = int(old.get("imported", 0))
                     report.invalid = int(old.get("invalid", 0))
                     report.execution = int(old.get("execution", 0))
                     report.unmatched = int(old.get("unmatched", 0))
+                    report.dataset_sha256 = stored_hash
                     report.cache_hit = True
                     reports.append(report)
                     continue
@@ -259,10 +308,12 @@ def build_shards(
         report.invalid = stats.get("invalid", 0)
         report.execution = stats.get("execution", 0)
         report.unmatched = stats.get("unmatched", 0)
+        report.dataset_sha256 = sha256_file(output_path)
         sidecar.write_text(
             json.dumps(
                 {
                     "protocol_hash": protocol_hash,
+                    "engine_sha256": engine_hash,
                     "model_version": model_version,
                     "ruleset": ruleset,
                     "requested_turns": requested,
@@ -271,7 +322,7 @@ def build_shards(
                     "invalid": report.invalid,
                     "execution": report.execution,
                     "unmatched": report.unmatched,
-                    "dataset_sha256": sha256_file(output_path),
+                    "dataset_sha256": report.dataset_sha256,
                     "sources": sorted({game.source for game in shard}),
                 },
                 indent=2,
@@ -293,6 +344,11 @@ def main() -> int:
     parser.add_argument("--model-version", type=int, default=0)
     parser.add_argument("--ruleset", choices=("league", "quickplay", "guideline"), default="league")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--exact",
+        action="store_true",
+        help="require fail-closed TETR.IO v19 replay reconstruction",
+    )
     parser.add_argument("--strict-source", action="store_true", help="fail if any source/round cannot be normalized")
     args = parser.parse_args()
 
@@ -305,7 +361,13 @@ def main() -> int:
     engine = resolve_engine(args.engine)
     print(f"discovered {len(paths)} .ttrm files; engine={engine}")
 
-    games, source_reports = normalize_sources(paths, args.cache_dir, args.workers, args.force)
+    games, source_reports = normalize_sources(
+        paths,
+        args.cache_dir,
+        args.workers,
+        args.force,
+        args.exact,
+    )
     source_errors = sum(len(report.errors or []) for report in source_reports)
     total_turns = sum(game.samples for game in games)
     cache_hits = sum(report.cache_hit for report in source_reports)
@@ -331,6 +393,7 @@ def main() -> int:
     manifest = {
         "format": "tetra-human-replay-manifest-v1",
         "normalizer_cache_version": CACHE_VERSION,
+        "normalization_mode": "exact-v19" if args.exact else "legacy-keydown",
         "ruleset": args.ruleset,
         "model_version": args.model_version,
         "sources": [asdict(report) for report in source_reports],

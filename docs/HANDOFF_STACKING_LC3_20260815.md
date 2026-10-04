@@ -1,5 +1,7 @@
 # TetraFormer stacking / LC3 runtime handoff — 2026-08-15
 
+> この文書は2026-08-15時点の引き継ぎ記録です。結果と制約は当時の記述のまま保存しています。現在の優先順位は[ロードマップ](ROADMAP.md)、評価の規則は[学習・評価プロトコル](TRAINING_AND_EVALUATION.md)を参照してください。
+
 This document supersedes `docs/HANDOFF_STACKING_BALANCE_20260815.md` for the current state.
 
 ## 0. One-line status

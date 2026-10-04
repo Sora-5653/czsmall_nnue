@@ -1,10 +1,12 @@
-# Human replay pretraining
+# 人間リプレイによる事前学習
 
-Tetra can bootstrap its policy/value network from consented TETR.IO multiplayer replay files before continuing with the normal self-play and Reanalyze loop.
+同意を得たTETR.IOのマルチプレイリプレイから方策/価値networkを初期化し、その後は通常の自己対局とReanalyseのloopへ移る手順です。
 
-The implementation follows the useful high-level shape of MochBot/fusion's public training pipeline: rank cohort -> replay corpus -> preprocessing -> policy/value data -> training. No MochBot source code is vendored here. The adapter was implemented independently against the public replay data contract and Tetra's existing engine interfaces. MochBot/fusion currently exposes recovered collector/preprocessor source without a repository license declaration, so this repository copies the architecture of the workflow, not its code.
+実装は、MochBot/fusionが公開している学習pipelineの大まかな流れ（rankで絞った集団 → リプレイcorpus → 前処理 → 方策/価値データ → 学習）を参考にしています。MochBotのsource codeは取り込んでいません。MochBot/fusionが公開している収集・前処理のsourceにはlicenseの宣言がないため、このリポジトリでは処理の流れだけを参考にし、公開されているリプレイのデータ形式とTetraの既存のエンジンinterfaceに対して独自に実装しました。
 
-## Data flow
+ネットワークアクセスの範囲は[利用ポリシー](POLICY.md#tetra-channel-apiと学習データ収集)を参照してください。
+
+## データの流れ
 
 ```text
 TETRA CHANNEL X+ cohort or consented .ttrm files
@@ -21,11 +23,14 @@ TETRA CHANNEL X+ cohort or consented .ttrm files
   -> self-play -> Reanalyze -> train -> Arena gate
 ```
 
-Python normalizes the JSON surface and reconstructs TETR.IO v19 frame and subframe state, including the seeded 7-bag, handling, locking, line clears, and garbage interaction. The exact importer verifies both players' reconstructed end states and rejects a round on any mismatch or warning. C++ remains authoritative for legal placement generation, model-facing tokenization, action embeddings, and dataset serialization. It independently matches every demonstrated placement against the production action space before writing a sample.
+責務は次のように分かれます。
 
-## X+ corpus collection
+- **Python:** JSONを正規化し、TETR.IO v19のframeとsubframeの状態（seed付き7-bag、handling、lock、line clear、garbageの応酬を含む）を再構成します。厳密な取り込みでは、両プレイヤーの再構成後の終了状態を検証し、不一致または警告があればそのroundを除外します。
+- **C++:** 合法配置の生成、model向けのtoken化、action埋め込み、dataset serializationを担当します。sampleを書き出す前に、実演された各配置がproductionのaction空間と一致するかを独立に照合します。
 
-The X+ collector is resumable and rate-limit friendly. It discovers the current X+ cohort through the documented TETRA CHANNEL league leaderboard, fetches each player's recent league record IDs, deduplicates replay IDs globally, and keeps append-only ledgers under `data/xplus_replays/_meta/`.
+## X+ corpusを収集する
+
+X+ collectorは中断から再開でき、rate limitを守ります。文書化されたTETRA CHANNELのleague leaderboardから現在のX+ cohortを取得し、各playerの最近のleague記録IDを取得します。replay IDを全体で重複排除し、`data/xplus_replays/_meta/` に追記専用のledgerを保持します。
 
 ```sh
 python trainer/collect_xplus_replays.py \
@@ -34,9 +39,11 @@ python trainer/collect_xplus_replays.py \
   --request-interval 1.05
 ```
 
-The collector uses `https://ch.tetr.io/api` only for player/record discovery and carries `X-Session-ID` across paginated datasets. It does **not** use the undocumented main-game API and does not rotate proxies. Replay bodies are fetched through a configurable `{replayid}` URL template because TETRA CHANNEL exposes replay IDs but does not document a replay-file download endpoint. The default is the same public replay mirror referenced by MochBot's recovered collector; set `TETRA_REPLAY_URL_TEMPLATE` or `--replay-url-template` to use a consented/private source instead.
+- `https://ch.tetr.io/api` は、playerと記録の検索に使います。ページ送りされるdatasetの間では `X-Session-ID` を引き継ぎます。
+- 文書化されていない本体ゲームのAPIは使わず、proxyの切り替えも行いません。
+- TETRA CHANNELはreplay IDを公開していますが、リプレイファイルのdownload endpointは文書化していません。そのためリプレイ本体は、`{replayid}` を含む設定可能なURL templateから取得します。既定値は、MochBotの収集コードが参照している公開ミラーです。同意済みまたは私的なsourceを使う場合は、`TETRA_REPLAY_URL_TEMPLATE` または `--replay-url-template` で指定します。
 
-Useful bounded smoke run:
+範囲を絞った動作確認の例です。
 
 ```sh
 python trainer/collect_xplus_replays.py \
@@ -47,25 +54,25 @@ python trainer/collect_xplus_replays.py \
   --strict
 ```
 
-`players.jsonl`, `records_status.jsonl`, `replay_index.jsonl`, and `downloads.jsonl` make interrupted runs resumable. `--refresh-cohort` and `--refresh-records` deliberately invalidate the corresponding discovery ledgers; downloaded replay files are never deleted by those flags.
+`players.jsonl`、`records_status.jsonl`、`replay_index.jsonl`、`downloads.jsonl` により、中断したrunを再開できます。`--refresh-cohort` と `--refresh-records` は対応する検索ledgerを意図的に無効化します。これらのflagで、download済みのリプレイファイルが削除されることはありません。
 
-## Build
+## エンジンをビルドする
 
-Use the normal engine build:
+通常のビルドを使います。
 
 ```sh
 make tools
 ```
 
-If `build/` already contains objects from another platform, use an isolated directory instead of deleting existing artifacts:
+`build/` に別プラットフォームのobjectが残っている場合は、既存の成果物を削除せず、別のディレクトリを使います。
 
 ```sh
 make BUILD=build-human tools
 ```
 
-Then pass that executable with `--engine`.
+その実行ファイルを `--engine` に渡します。
 
-## Bulk import
+## リプレイを一括で取り込む
 
 ```sh
 python trainer/import_human_replays.py /path/to/consented/replays \
@@ -75,16 +82,18 @@ python trainer/import_human_replays.py /path/to/consented/replays \
   --samples-per-shard 4096 \
   --workers 16 \
   --ruleset league \
-  --strict-source
+  --strict-source \
+  --exact
 ```
 
-Inputs may be files or directories; directory discovery is recursive. The importer produces validated `.tetradat` shards, a content-addressed cache, and `manifest.json` with per-source and per-shard counts and hashes.
+- 入力にはファイルとディレクトリを指定できます。ディレクトリは再帰的に探索します。
+- 出力は、検証済みの `.tetradat` shard、content-addressedなcache、sourceごととshardごとの件数とhashを含む `manifest.json` です。
+- 実演された配置は、C++の合法手生成が出すmacro actionと一致した場合だけ採用します。不正な状態、リプレイの実行失敗、一致する合法手がない場合は、推測でdatasetへ入れず、それぞれ別に集計します。
+- `--exact` を指定すると、fail-closedなTETR.IO v19の再構成器を必須にします。X+ bootstrapは常にこれを指定します。`--exact` なしの汎用importerは、以前から対応しているリプレイexport向けの旧keydown adapterを使います。
 
-A demonstrated placement is accepted only when it matches a legal macro action generated by Tetra's C++ move generator. Invalid state, replay-execution failure, and no-legal-match cases are counted separately rather than guessed into the dataset.
+## X+からXSまでを1コマンドで作る
 
-## One-command X+ -> XS bootstrap
-
-For the small inference evaluator used in the size/search ablations, use the named `xs` preset (64 width, 2 Transformer layers, 4 heads, FFN 192):
+サイズと探索のablationで使う小型の推論用モデルには、`xs` preset（width 64、Transformer 2層、4 heads、FFN 192）を使います。
 
 ```sh
 python3 trainer/xplus_bootstrap.py \
@@ -97,13 +106,16 @@ python3 trainer/xplus_bootstrap.py \
   --save models/xplus_xs_bootstrap.pt
 ```
 
-This performs collection -> exact import/sharding -> `teacher1m` supervised training -> XS distillation. Collection and C++ import run under the wrapper's Python. `--train-python` may point at a different interpreter for training. This split supports a WSL-hosted ELF `tetra_cli` and the Windows ROCm environment in `.venv-rocm714`.
+このコマンドは、収集、厳密な取り込みとshard化、`teacher1m` の教師あり学習、XSへの蒸留を順に実行します。
 
-The default path is fail-closed. Every source round must pass exact replay reconstruction, and every normalized placement must pass C++ validation, so `totals.import_fraction` must equal `1.0`. `--skip-collect` and `--skip-import` reuse completed data phases. Use `--teacher-resume` to resume teacher training. `--allow-partial-exact` and `--min-import-fraction` are explicit diagnostic or ablation options; don't use them for the production bootstrap.
+- 収集とC++の取り込みはwrapperを起動したPythonで実行し、学習は `--train-python` で別のinterpreterを指定できます。これにより、WSL上のELF形式の `tetra_cli` と、Windowsの `.venv-rocm714` のROCm環境を組み合わせられます。
+- 処理はfail-closedです。すべてのsource roundが厳密な再構成を通過し、正規化したすべての配置がC++の検証を通過し、manifestが `exact-v19` normalizerを記録している必要があります。
+- `--skip-collect` と `--skip-import` は完了済みのデータ段階を再利用しますが、上記の検証は緩めません。教師モデルの学習の再開には `--teacher-resume` を使います。
+- 一部のcorpusでの診断やXSを直接学習する比較では、`import_human_replays.py --exact` または `trainer/train.py` を個別に実行します。production用のwrapperは、検証を弱めるmodeを持ちません。
 
-Training reads the exact shard list from the latest `manifest.json`, rather than globbing every `.tetradat` left in the shard directory. Old generated shards can therefore remain for cache/debug purposes without being silently mixed into a newer sharding run.
+学習は、shardディレクトリ内の `.tetradat` をすべて拾うのではなく、最新の `manifest.json` に記録されたshardの一覧を読みます。古いshardをcacheやdebug用に残しても、新しいshard化のrunへ暗黙に混ざりません。
 
-For an already-owned/consented replay directory, the generic entry point remains:
+同意済みのリプレイディレクトリが手元にある場合は、汎用の入口を使います。
 
 ```sh
 python trainer/human_pretrain.py /path/to/consented/replays \
@@ -116,11 +128,11 @@ python trainer/human_pretrain.py /path/to/consented/replays \
   --save models/human_pretrain.pt
 ```
 
-The generic human-data path defaults to policy weight `1.0`, value weight `0.25`, and zero weight for local auxiliary and timing objectives. The X+ distillation path instead defaults to policy-only teacher training and policy-only student distillation. Human keyboard timing is not the same target as Tetra's strategic delay action, so timing and local auxiliary targets remain the responsibility of self-play/Reanalyze.
+- 汎用の人間データ経路の既定値は、方策weight `1.0`、価値weight `0.25`、局所補助目標とtiming目的のweight 0です。X+の蒸留経路は、教師の学習と生徒の蒸留の両方で方策だけを既定とします。人間のキー入力のtimingは、Tetraの戦略的なdelay actionとは別のtargetのため、timingと局所補助目標は自己対局とReanalyseが担当します。
+- 既存のcheckpointから始める場合は `--resume` を使います。
+- `--exact` で厳密なv19再構成を選びます。`--skip-import --exact` は、manifestにその由来が記録されたshardだけを受け付けます。
 
-Use `--resume` to start from an existing checkpoint. Use `--skip-import` to train from existing human shards without rebuilding them.
-
-## Continue self-improvement
+## 自己改善を続ける
 
 ```sh
 python trainer/auto_improve.py \
@@ -130,25 +142,35 @@ python trainer/auto_improve.py \
   --device cuda
 ```
 
-`--bootstrap-replay-dir` adds every `.tetradat` file below that directory to the fixed replay set, deduplicates paths also named through `--bootstrap-replay`, and keeps them outside the rolling fresh-self-play window.
+`--bootstrap-replay-dir` は、そのディレクトリ以下のすべての `.tetradat` を固定のreplay集合に加えます。`--bootstrap-replay` で指定したパスとの重複は除き、新しい自己対局のrolling windowとは別に保持します。
 
-## Replay reconstruction contract
+## リプレイ再構成の契約
 
-The normalizer accepts canonical top-level replay-set data and older collector-style `replay.rounds` data. Exact reconstruction uses the common replay seed, verifies the visible first-bag prefix, processes input at TETR.IO's serialized subframe resolution, applies v19 handling and gravity, and reconciles interaction events between the two player streams. It compares the reconstructed board, active and held pieces, queue, combo, back-to-back state, garbage state, and game-over state with each serialized end snapshot.
+normalizerは、正規形のtop-levelのreplay-setデータと、以前のcollector形式の `replay.rounds` データを受け付けます。
 
-The importer rejects the complete round if reconstruction produces a warning or end-state mismatch. It doesn't guess a placement or preserve a valid prefix from a divergent round. After Python certification, C++ rebuilds each pre-placement state, generates legal macro actions with the league ruleset, and accepts only the action whose placement and post-clear state match the exact replay record.
+`--exact` を指定すると、再構成は次のように行います。
 
-Exact reconstruction is a data-integrity gate, not a strength result. Compare the resulting XS checkpoint with the non-human XS baseline in Arena before promotion.
+1. 共通のreplay seedを使い、見えている最初のbagの先頭部分を検証します。
+2. TETR.IOがserializeしたsubframeの解像度で入力を処理し、v19のhandlingとgravityを適用します。
+3. 2人のプレイヤーのstream間で、相互作用のeventを照合します。
+4. 再構成した盤面、操作中とholdのpiece、queue、combo、B2B、garbageの状態、game overの状態を、serializeされた各終了snapshotと比較します。
 
-## Validation
+再構成で警告または終了状態の不一致が出た場合、importerはそのround全体を除外します。配置を推測したり、ずれたroundの有効な前半だけを残したりしません。Pythonで検証した後、C++がleague rulesetで各配置前の状態を再構築して合法なmacro actionを生成し、配置とline clear後の状態が厳密なリプレイ記録と一致するactionだけを採用します。
+
+厳密な再構成はデータの完全性を保証するgateであり、強さの結果ではありません。promotionの前に、得られたXS checkpointを人間データを使わないXSの基準とArenaで比較してください。
+
+## 検証する
 
 ```sh
 python -m unittest \
   trainer.test_ttrm_ingest \
   trainer.test_ttrm_exact_replay \
+  trainer.test_import_human_replays \
+  trainer.test_human_pretrain \
   trainer.test_xplus_replay_collector \
+  trainer.test_xplus_bootstrap \
   trainer.test_distill
 make test
 ```
 
-`tests/data/human_replay_sample.ttrm` is a small canonical-format fixture for the generic parser and C++ importer. For the exact path, validate representative TETR.IO v19 files and inspect `manifest.json`, especially source errors, `totals.import_fraction`, and the separate `invalid`, `execution`, and `unmatched` counts. A production X+ bootstrap requires no source errors, no skipped C++ validations, and an import fraction of `1.0`.
+`tests/data/human_replay_sample.ttrm` は、汎用parserとC++ importer用の小さな正規形のfixtureです。厳密な経路では、代表的なTETR.IO v19のファイルで検証し、`manifest.json` のsource error、`totals.import_fraction`、および `invalid`、`execution`、`unmatched` の件数を確認します。productionのX+ bootstrapでは、source errorがなく、C++の検証のskipがなく、import fractionが `1.0` である必要があります。

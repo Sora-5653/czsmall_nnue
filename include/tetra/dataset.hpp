@@ -504,7 +504,7 @@ inline DatasetReadResult deserialize_compact_dataset(
             const auto actions = gen.generate(
                 p.board(), p.active().type, p.hold(),
                 p.visible_next().empty() ? Piece::None : p.visible_next()[0],
-                rules);
+                rules, p.attack_state().combo >= 0);
             if (actions.empty() || r.chosen_action < 0 ||
                 r.chosen_action >= static_cast<int>(actions.size())) {
                 res.error = "reconstruction divergence at move " +

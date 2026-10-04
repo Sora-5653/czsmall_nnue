@@ -1,23 +1,30 @@
-# Colab手動実行手順
+# Colabで自己対局shardを生成する
 
-`trainer/colab_manual.py` は、Google Driveをartifact受け渡しに使う半自動runnerです。Colabのcellから一段ずつ実行し、失敗した段階のoutputをそのまま診断へ返せるようにしています。
+Google Colabを追加の自己対局workerとして使う手順です。次の2つの入口があります。
 
-この手順でも、ルール・Cobra合法手生成・探索・label生成の権威はC++ engineです。Colabは追加workerであり、Champion promotion、seed allocation、dataset merge semanticsの第二の権威にはしません。生成datasetは現行schema付きrectangular version 3です。
+- `trainer/colab_manual.py`: Google Driveで成果物を受け渡す半自動runner。Colabのcellから1段階ずつ実行します。
+- `trainer/colab_generate.py`: shardの生成とmanifestの検証を行うCLI。ローカルでもColabでも使えます。
 
-## 1. Driveに置くファイル
+Colabは追加workerです。ルール、合法手生成、探索、label生成はC++エンジンが担当し、Champion promotion、seed割り当て、datasetの統合方法はローカル側で決めます。Drive、GASは成果物の転送に使えますが、seed、label、統合方法の権威にはしません。
+
+> **既知の問題:** `colab_generate.py` のmanifest validatorは現在dataset v1/v3だけを受け付けます。C++エンジンが書くdatasetはv4のため、生成したshardの検証が失敗する可能性があります。修正までは、検証結果を確認してから学習へ渡してください。
+
+## Driveを使って手動で実行する
+
+### Driveにファイルを置く
 
 同じDriveフォルダに次の2ファイルを置きます。
 
 - `colab_bundle_sample_eff_manual.zip`
 - `baseline_gpu_gen_20260805_v2.best.pt`
 
-既定のフォルダ名は `czsmall_nnue_colab_20260806` です。別名にした場合は、以下の各コマンドに `--drive-folder フォルダ名` を追加してください。
+既定のフォルダ名は `czsmall_nnue_colab_20260806` です。別名にした場合は、各コマンドに `--drive-folder フォルダ名` を追加します。
 
-ZIPはWindowsで作成したものでも構いません。スクリプト側でメンバー名のバックスラッシュをColab向けに変換します。
+Windowsで作成したZIPも使えます。スクリプトがメンバー名のバックスラッシュを変換します。
 
-## 2. Colabセル
+### セットアップする
 
-ランタイムはGPUに設定します。最初のセルでは、Drive上のスクリプトを直接起動します。
+ランタイムをGPUに設定し、最初のcellでDrive上のスクリプトを起動します。
 
 ```python
 from google.colab import drive
@@ -25,48 +32,27 @@ drive.mount('/content/drive')
 !python "/content/drive/MyDrive/czsmall_nnue_colab_20260806/colab_manual.py" setup
 ```
 
-`setup` はDriveをマウントし、ZIPを `/content/czsmall_nnue` に展開し、チェックポイントを配置します。その後、C++23機能プローブを通ったコンパイラを選び、必要ならColab内でg++を追加インストールして `make tools` を実行します。GPUと `tetra_cli` が確認できたら生成へ進みます。
+`setup` は次の処理を行います。
 
-setup後は、展開されたスクリプトを使えます。
+1. Driveをマウントし、ZIPを `/content/czsmall_nnue` に展開してcheckpointを配置します。
+2. C++23の機能プローブを通るコンパイラを選びます。必要な場合はColab内でg++を追加インストールします。
+3. `make tools` を実行し、GPUと `tetra_cli` を確認します。
+
+### shardを生成して確認する
+
+setup後は、展開されたスクリプトを使います。
 
 ```python
 !python /content/czsmall_nnue/trainer/colab_manual.py generate
+!python /content/czsmall_nnue/trainer/colab_manual.py inspect
 ```
 
-既定値は、1 shard・32ゲーム・1ゲーム最大200 pieces・search 32 sims・固定base seed `2026080600`・FP16です。生成後、次の2ファイルがDriveへ戻されます。
+既定値は、1 shard、32ゲーム、1ゲーム最大200 pieces、探索32 sims、base seed `2026080600`、FP16です。生成後、次の2ファイルがDriveへ戻されます。
 
 - `colab_shard_2026080600.tetradat`
 - `colab_shard_2026080600.tetradat.manifest.json`
 
-生成物を確認します。
-
-```python
-!python /content/czsmall_nnue/trainer/colab_manual.py inspect
-```
-
-## 3. 補助目標の比較学習
-
-同じseedで `aux` と `noaux` を別々に実行します。両方とも同じデータ分割・初期化seedを使うため、paired ablationになります。`aux` 条件の既定weightは0.1、`noaux` は0.0です。これは補助目標の有無を切り分ける実験であり、WDL reward自体は変更しません。
-
-```python
-!python /content/czsmall_nnue/trainer/colab_manual.py train --condition aux --seed 0
-!python /content/czsmall_nnue/trainer/colab_manual.py train --condition noaux --seed 0
-```
-
-複数seedで比較する場合は `0, 1, 2` などを同じ順序で繰り返します。
-
-```python
-!python /content/czsmall_nnue/trainer/colab_manual.py train --condition aux --seed 1
-!python /content/czsmall_nnue/trainer/colab_manual.py train --condition noaux --seed 1
-```
-
-チェックポイントは `aux_seed0.pt` / `aux_seed0.best.pt` のような名前でDriveへ保存されます。既存の出力を置き換える場合だけ `--overwrite` を付けます。
-
-## 4. Errorを診断するとき
-
-自動で次の段階へ進めず、各コマンドが失敗した時点で停止します。`error:` 行だけでなく、直前のGPU情報、実行した `$ ...` 行、Python/C++のtracebackを含むセル出力をそのまま渡してください。
-
-設定を変える例:
+条件を変える場合の例です。
 
 ```python
 !python /content/czsmall_nnue/trainer/colab_manual.py generate --games 64 --pieces 300 --sims 64 --overwrite
@@ -78,3 +64,70 @@ shardを分ける場合は、全shardで `--base-seed`、`--games`、`--shard-co
 !python /content/czsmall_nnue/trainer/colab_manual.py generate --shard-id 0 --shard-count 4 --output-name shard-0.tetradat
 !python /content/czsmall_nnue/trainer/colab_manual.py generate --shard-id 1 --shard-count 4 --output-name shard-1.tetradat
 ```
+
+### 補助目標の有無を比較する
+
+同じseedで `aux` と `noaux` を実行します。両方とも同じデータ分割と初期化seedを使うため、paired ablationになります。補助目標のweightは `aux` が0.1、`noaux` が0.0です。WDLの目的は変更しません。
+
+```python
+!python /content/czsmall_nnue/trainer/colab_manual.py train --condition aux --seed 0
+!python /content/czsmall_nnue/trainer/colab_manual.py train --condition noaux --seed 0
+```
+
+複数seedで比較する場合は、`--seed 1`、`--seed 2` と同じ順序で繰り返します。checkpointは `aux_seed0.pt` / `aux_seed0.best.pt` のような名前でDriveへ保存されます。既存の出力を置き換える場合だけ `--overwrite` を付けます。
+
+### エラーを報告する
+
+各コマンドは失敗した時点で停止し、次の段階へ進みません。診断を依頼する場合は、`error:` 行だけでなく、直前のGPU情報、実行した `$ ...` 行、Python/C++のtracebackを含むcellの出力をそのまま渡してください。
+
+## colab_generate.pyでshardを生成・検証する
+
+### shardを生成する
+
+```sh
+python trainer/colab_generate.py generate models/champion.pt \
+    data/colab/shard-0.tetradat \
+    --base-seed 100000 \
+    --shard-id 0 --shard-count 4 \
+    --games 32 --pieces 300 --sims 64 \
+    --model-version 4 --device cuda --build-engine
+```
+
+shardごとに変えるのは `--shard-id` だけです。同じ `base_seed` と `games` のとき、shard `i` のseed区間は次のとおりです。
+
+```text
+[base_seed + i * games, base_seed + (i + 1) * games)
+```
+
+manifestには、repository commit、checkpoint hash、ruleset、model、探索設定、seed区間、sample数、datasetとschemaの情報が記録されます。
+
+### manifestを検証する
+
+```sh
+python trainer/colab_generate.py validate \
+    data/colab/shard-0.tetradat.manifest.json \
+    data/colab/shard-1.tetradat.manifest.json \
+    data/colab/shard-2.tetradat.manifest.json \
+    data/colab/shard-3.tetradat.manifest.json \
+    --checkpoint models/champion.pt --require-complete
+```
+
+validatorは、seed区間の重複や、互換でないruleset、checkpoint、探索設定、schemaを拒否します。
+
+### 検証済みshardを学習へ渡す
+
+shardをバイト連結せず、各パスを個別の入力として渡します。
+
+```sh
+python trainer/train.py \
+    data/colab/shard-0.tetradat \
+    data/colab/shard-1.tetradat \
+    data/local.tetradat \
+    --resume models/champion.pt \
+    --device cuda --require-gpu \
+    --value-weight 1.0 \
+    --steps 5000 \
+    --save models/candidate.pt
+```
+
+ローカルだけで生成したgenerationと、ローカル+Colabで生成したgenerationは、同じArena条件で比較してからpromotionします。詳細は[学習・評価プロトコル](TRAINING_AND_EVALUATION.md#4-datasetの由来)を参照してください。
